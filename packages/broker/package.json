@@ -1,0 +1,25 @@
+{
+  "name": "@mpctl/broker",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "build": "bun build src/main.ts --target=bun --outdir=dist",
+    "lint": "oxlint --no-error-on-unmatched-pattern .",
+    "format": "oxfmt --write .",
+    "format:check": "oxfmt --check .",
+    "typecheck": "tsgo --noEmit -p tsconfig.json",
+    "test": "bun test --pass-with-no-tests"
+  },
+  "dependencies": {
+    "@mpctl/contracts": "workspace:*",
+    "@nexus-js/core": "2.0.0-alpha.1",
+    "@nexus-js/node-ipc": "0.7.0-alpha.1",
+    "@nexus-js/websocket": "0.1.0-alpha.2",
+    "better-result": "3.0.1",
+    "valibot": "1.5.0",
+    "ws": "8.18.3"
+  },
+  "devDependencies": {
+    "@types/ws": "8.18.1"
+  }
+}

@@ -1,0 +1,5 @@
+{
+  "$schema": "https://oxc.rs/oxfmt/config.schema.json",
+  "semi": true,
+  "singleQuote": false
+}

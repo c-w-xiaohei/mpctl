@@ -1,0 +1,15 @@
+/tmp/
+
+# Bun and generated build output
+/node_modules/
+/.turbo/
+/packages/*/node_modules/
+/packages/*/.turbo/
+/.cache/
+/packages/*/.cache/
+/packages/*/dist/
+/packages/extension/.output/
+/packages/extension/.wxt/
+/packages/extension/.data/
+/packages/extension/test-results/
+/packages/extension/playwright-report/

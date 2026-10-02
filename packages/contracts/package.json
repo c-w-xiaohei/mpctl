@@ -1,0 +1,24 @@
+{
+  "name": "@mpctl/contracts",
+  "private": true,
+  "type": "module",
+  "exports": {
+    ".": {
+      "types": "./src/index.ts",
+      "import": "./src/index.ts"
+    }
+  },
+  "scripts": {
+    "build": "bun --eval 'console.log(\"@mpctl/contracts has no standalone build artifact\")'",
+    "lint": "oxlint --no-error-on-unmatched-pattern .",
+    "format": "oxfmt --write .",
+    "format:check": "oxfmt --check .",
+    "typecheck": "tsgo --noEmit -p tsconfig.json",
+    "test": "bun test --pass-with-no-tests"
+  },
+  "dependencies": {
+    "@nexus-js/core": "2.0.0-alpha.1",
+    "better-result": "3.0.1",
+    "valibot": "1.5.0"
+  }
+}

@@ -1,0 +1,31 @@
+{
+  "name": "mpctl",
+  "private": true,
+  "workspaces": [
+    "packages/cli",
+    "packages/broker",
+    "packages/contracts",
+    "packages/extension"
+  ],
+  "type": "module",
+  "scripts": {
+    "build": "turbo run build",
+    "lint": "turbo run lint",
+    "format": "oxfmt --write package.json turbo.json tsconfig.base.json .oxlintrc.json .oxfmtrc.json 'packages/*/package.json' 'packages/*/tsconfig.json' packages/extension/wxt.config.ts",
+    "format:check": "oxfmt --check package.json turbo.json tsconfig.base.json .oxlintrc.json .oxfmtrc.json 'packages/*/package.json' 'packages/*/tsconfig.json' packages/extension/wxt.config.ts",
+    "typecheck": "turbo run typecheck",
+    "test": "turbo run test",
+    "test:browser": "bun run --cwd packages/extension test:browser"
+  },
+  "devDependencies": {
+    "@playwright/test": "1.56.1",
+    "@types/bun": "1.3.8",
+    "@types/node": "24.10.2",
+    "@typescript/native-preview": "7.0.0-dev.20260707.2",
+    "oxfmt": "0.63.0",
+    "oxlint": "1.78.0",
+    "turbo": "2.8.10",
+    "typescript": "7.0.2"
+  },
+  "packageManager": "bun@1.3.14"
+}

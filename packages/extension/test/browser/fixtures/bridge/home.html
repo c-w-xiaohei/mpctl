@@ -1,0 +1,30 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <title>mpctl synthetic authenticated home fixture</title>
+  </head>
+  <body>
+    <nav>
+      <a
+        class="weui-desktop-menu__link menu_report"
+        href="/cgi-bin/appmsg?begin=0&count=10&type=77&action=list_card&token=synthetic-token&lang=synthetic-list-language"
+        >草稿箱</a
+      >
+    </nav>
+    <div id="new-article" class="new-creation__menu-item">文章</div>
+    <script>
+      document.getElementById("new-article").addEventListener("click", () => {
+        const target =
+          localStorage.getItem("mpctl-fixture-new-editor-without-context") === "yes"
+            ? "/cgi-bin/appmsg?t=media/appmsg_edit_v2&action=edit&isNew=1&type=77"
+            : "/cgi-bin/appmsg?t=media/appmsg_edit_v2&action=edit&isNew=1&type=77&createType=synthetic-new-create-type&token=synthetic-new-token&lang=synthetic-new-language&timestamp=synthetic-new-timestamp";
+        window.open(target, "_blank");
+      });
+      document.querySelector(".menu_report").addEventListener("click", (event) => {
+        event.preventDefault();
+        window.open(event.currentTarget.href, "_blank");
+      });
+    </script>
+  </body>
+</html>

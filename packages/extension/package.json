@@ -1,0 +1,33 @@
+{
+  "name": "@mpctl/extension",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "build": "wxt build",
+    "lint": "oxlint --no-error-on-unmatched-pattern .",
+    "format": "oxfmt --write .",
+    "format:check": "oxfmt --check .",
+    "typecheck": "wxt prepare && tsgo --noEmit -p tsconfig.json",
+    "test": "bun test test/background-startup.test.ts test/bridge-injection.test.ts test/bridge.test.ts test/connection.test.ts test/connection-page.test.ts test/reload.test.ts test/content-order.test.ts test/content-relay.test.ts test/list-stability.test.ts test/native-draft-target.test.ts test/group-lock.test.ts test/drafts.test.ts test/editor.test.ts test/jsapi.test.ts test/pages.test.ts test/popup-control.test.ts test/workspace.test.ts test/body-hash.test.ts test/main-world.test.ts test/connect-page-close.test.ts",
+    "test:browser": "wxt build && wxt build --config test/browser/fixtures/wxt.config.ts && playwright test --config playwright.config.ts"
+  },
+  "dependencies": {
+    "@mpctl/contracts": "workspace:*",
+    "@nexus-js/chrome": "0.6.0-alpha.1",
+    "@nexus-js/core": "2.0.0-alpha.1",
+    "@nexus-js/websocket": "0.1.0-alpha.2",
+    "better-result": "3.0.1",
+    "react": "19.2.3",
+    "react-dom": "19.2.3",
+    "valibot": "1.5.0"
+  },
+  "devDependencies": {
+    "@playwright/test": "1.56.1",
+    "@types/chrome": "0.1.36",
+    "@types/react": "19.2.7",
+    "@types/react-dom": "19.2.3",
+    "@wxt-dev/module-react": "1.2.2",
+    "wxt": "0.21.4"
+  }
+}

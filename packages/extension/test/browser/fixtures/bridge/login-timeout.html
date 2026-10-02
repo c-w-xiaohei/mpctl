@@ -1,0 +1,22 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <title>登录超时 fixture</title>
+  </head>
+  <body>
+    <main id="fixture">Synthetic delayed status fixture</main>
+    <script>
+      setTimeout(() => {
+        document.body.classList.add("page_error", "page_timeout");
+        const info = document.createElement("div");
+        info.id = "info";
+        info.textContent = "登录超时，请重新登录";
+        const login = document.createElement("a");
+        login.id = "jumpUrl";
+        login.href = "/cgi-bin/loginpage?url=synthetic-secret";
+        document.body.append(info, login);
+      }, 2300);
+    </script>
+  </body>
+</html>
