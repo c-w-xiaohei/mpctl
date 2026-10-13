@@ -1,4 +1,4 @@
-import { expect, test } from "bun:test";
+import { expect, test, spyOn } from "bun:test";
 import { Result } from "better-result";
 import { createReloadControl } from "../src/reload";
 
@@ -44,6 +44,46 @@ function fixture() {
     },
   };
 }
+
+test("F0 scheduled reload awaits asynchronous native admission and reports a later refusal without reload", async () => {
+  let scheduled!: () => Promise<void>;
+  const timer = spyOn(globalThis, "setTimeout").mockImplementation(((
+    handler: () => Promise<void>,
+  ) => {
+    scheduled = handler;
+    return 1;
+  }) as typeof setTimeout);
+  let release!: (result: Result<void, { code: "reload_failed" }>) => void;
+  const gate = new Promise<Result<void, { code: "reload_failed" }>>((done) => {
+    release = done;
+  });
+  let removed = 0;
+  const reports: unknown[] = [];
+  const control = createReloadControl({
+    storage: {
+      get: async () => ({}),
+      set: async () => {},
+      remove: async () => {
+        removed++;
+      },
+    } as never,
+    connect: async () => Result.ok(undefined),
+    reload: async () => gate,
+    report: (result) => reports.push(result),
+  });
+  try {
+    expect(await control.reload()).toEqual(Result.ok(undefined));
+    const native = scheduled();
+    expect(reports).toEqual([]);
+    expect(removed).toBe(0);
+    release(Result.err({ code: "reload_failed" }));
+    await native;
+    expect(reports).toEqual([Result.err({ code: "reload_failed" })]);
+    expect(removed).toBe(1);
+  } finally {
+    timer.mockRestore();
+  }
+});
 
 test("reload persists intent before scheduling runtime reload and consumes it only once", async () => {
   const f = fixture();

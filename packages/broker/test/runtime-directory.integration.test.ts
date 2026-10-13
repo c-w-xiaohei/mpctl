@@ -5,7 +5,7 @@ import { describe, expect, test } from "bun:test";
 import { Nexus } from "@nexus-js/core";
 import { usingNodeIpcClient } from "@nexus-js/node-ipc";
 import type { NodeIpcAdapterModel } from "@nexus-js/node-ipc";
-import { connectionToken } from "@mpctl/contracts";
+import { connectionToken, protocolVersion } from "@mpctl/contracts";
 import { connectionStatusResultCodec } from "@mpctl/contracts";
 import { Result } from "better-result";
 import { ensureSocketDirectory } from "../src/main";
@@ -99,7 +99,7 @@ describe("broker runtime directory", () => {
         await connectionStatusResultCodec.deserialize(
           await connection.get(connectionToken).getStatus(),
         ),
-      ).toEqual(Result.ok({ connected: false, brokerVersion: "0.3.0" }));
+      ).toEqual(Result.ok({ connected: false, brokerVersion: protocolVersion }));
       connection.disconnect();
     } finally {
       if (broker.pid) {

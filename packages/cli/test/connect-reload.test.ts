@@ -43,7 +43,12 @@ test.each([true, false])(
                 connectionStatusResultCodec,
                 Result.ok({
                   connected,
-                  ...(connected ? { sessionId: reloaded ? "new-session" : "old-session" } : {}),
+                  ...(connected
+                    ? {
+                        sessionId: reloaded ? "new-session" : "old-session",
+                        ledgerId: "58c8ce06-f7bd-4a5e-8c2e-1b3e9d103975",
+                      }
+                    : {}),
                 }),
               );
             },
@@ -132,7 +137,11 @@ test("control rejection does not trigger a reload page or replay the command", a
           getStatus: async () =>
             encode(
               connectionStatusResultCodec,
-              Result.ok({ connected: true, sessionId: "old-session" }),
+              Result.ok({
+                connected: true,
+                sessionId: "old-session",
+                ledgerId: "58c8ce06-f7bd-4a5e-8c2e-1b3e9d103975",
+              }),
             ),
         },
       },

@@ -12,9 +12,9 @@
   },
   "dependencies": {
     "@mpctl/contracts": "workspace:*",
-    "@nexus-js/core": "2.0.0-alpha.1",
-    "@nexus-js/node-ipc": "0.7.0-alpha.1",
-    "@nexus-js/websocket": "0.1.0-alpha.2",
+    "@nexus-js/core": "2.0.0-alpha.2",
+    "@nexus-js/node-ipc": "0.7.0-alpha.2",
+    "@nexus-js/websocket": "0.1.0-alpha.3",
     "better-result": "3.0.1",
     "valibot": "1.5.0",
     "ws": "8.18.3"

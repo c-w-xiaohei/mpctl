@@ -9,6 +9,8 @@ import {
   workspaceToken,
   protocolVersion,
   reloadResultCodec,
+  ledgerIdSchema,
+  hasProtocolVersion,
 } from "@mpctl/contracts";
 import {
   backgroundControlToken,
@@ -17,6 +19,7 @@ import {
 } from "@mpctl/contracts";
 import { WebSocketClientEndpoint } from "@nexus-js/websocket";
 import type { WebSocketAdapterModel } from "@nexus-js/websocket";
+import * as v from "valibot";
 
 export type ConnectionSettings = { websocketUrl: string; pairingCredential: string };
 export type ConnectionSocket = {
@@ -62,20 +65,16 @@ export async function encodeControlResult<T, E>(
   return { status: "error", error: encoded.error };
 }
 
-export async function decodeControlResult<T, E>(
-  codec: {
-    deserialize(value: unknown): Promise<BetterResult<T, E>>;
-  },
-  wire: unknown,
-) {
-  return codec.deserialize(wire);
-}
 type ConnectionOptions = {
+  ledger?: Promise<
+    BetterResult<{ ledgerId: string }, { failure?: { code: string }; code?: string }>
+  >;
   dial?: (
     url: string,
     protocols: string[],
     workspace?: WorkspaceService,
     control?: BackgroundControlService,
+    ledgerId?: string,
   ) => Promise<BetterResult<ConnectionSocket & { protocol: string }, ConnectionError>>;
   loadSettings?: () => Promise<BetterResult<ConnectionSettings, ConnectionError>>;
   saveSettings?: (settings: ConnectionSettings) => Promise<BetterResult<void, ConnectionError>>;
@@ -126,7 +125,7 @@ export function createConnectionController(
   return {
     async connect(
       credential?: string,
-      websocketUrl = connectionConfig.websocketUrl,
+      websocketUrl: string = connectionConfig.websocketUrl,
     ): Promise<BetterResult<void, ConnectionError>> {
       if (connected) return Result.ok(undefined);
       if (currentAttempt) return currentAttempt.promise;
@@ -139,6 +138,14 @@ export function createConnectionController(
       return result;
 
       async function connectAttempt(): Promise<BetterResult<void, ConnectionError>> {
+        const ledger = options.ledger ? await options.ledger : undefined;
+        if (
+          !ledger ||
+          ledger.isErr() ||
+          !v.safeParse(ledgerIdSchema, ledger.value.ledgerId).success
+        )
+          return err("settings_failed");
+        if (!isCurrent()) return err("cancelled");
         const settingsResult =
           credential === undefined && options.loadSettings
             ? Result.flatten(
@@ -167,7 +174,8 @@ export function createConnectionController(
         if (save.isErr()) return save;
         if (!isCurrent()) return err("cancelled");
         const dialed = await Result.tryPromise({
-          try: () => dial(url, pairing.value, options.workspace, options.control),
+          try: () =>
+            dial(url, pairing.value, options.workspace, options.control, ledger.value.ledgerId),
           catch: () => ({ code: "dial_failed" as const }),
         });
         if (dialed.isErr()) return isCurrent() ? dialed : err("cancelled");
@@ -254,6 +262,7 @@ export function createConnectionController(
 /** Published service boundary: lifecycle throws are converted to compact domain Results here. */
 export function createBackgroundControl(options: {
   controller: () => ConnectionController;
+  ledger?: Promise<BetterResult<{ keyLedger(): Promise<BetterResult<string, unknown>> }, unknown>>;
   reload(): Promise<BetterResult<void, { code: string }>>;
 }): BackgroundControlService {
   return {
@@ -285,7 +294,14 @@ export function createBackgroundControl(options: {
       );
       if (status.isErr())
         return encodeControlResult(controlStatusResultCodec, Result.err({ code: "status_failed" }));
-      return encodeControlResult(controlStatusResultCodec, Result.ok(status.value));
+      const initialized = options.ledger ? await options.ledger : undefined;
+      const epoch = initialized?.isOk() ? await initialized.value.keyLedger() : undefined;
+      if (options.ledger && !epoch?.isOk())
+        return encodeControlResult(controlStatusResultCodec, Result.err({ code: "status_failed" }));
+      return encodeControlResult(
+        controlStatusResultCodec,
+        Result.ok({ ...status.value, ...(epoch?.isOk() ? { keyLedgerId: epoch.value } : {}) }),
+      );
     },
     async reload() {
       const reloadResult = Result.flatten(
@@ -317,6 +333,7 @@ async function dialWithNexus(
   protocols: string[],
   workspace?: WorkspaceService,
   control?: BackgroundControlService,
+  ledgerId?: string,
 ): Promise<BetterResult<ConnectionSocket & { protocol: string }, ConnectionError>> {
   const endpointResult = Result.try({
     try: () => new WebSocketClientEndpoint({ protocols }),
@@ -328,9 +345,13 @@ async function dialWithNexus(
     try: () => {
       const brokerNexus = new Nexus<WebSocketAdapterModel>();
       brokerNexus.configure({
+        policy: {
+          canConnect: ({ remoteIdentity }) => hasProtocolVersion(remoteIdentity),
+          canCall: ({ remoteIdentity }) => hasProtocolVersion(remoteIdentity),
+        },
         endpoint: {
           implementation: endpoint,
-          meta: { context: "websocket-client", app: { protocolVersion } },
+          meta: { context: "websocket-client", app: { protocolVersion, ledgerId } },
         },
         providers: [
           ...(workspace ? [{ token: workspaceToken, service: workspace }] : []),
@@ -352,7 +373,7 @@ async function dialWithNexus(
   const connectionResult = await Result.tryPromise({
     try: async () => {
       await brokerNexus.ready();
-      return brokerNexus.connect({ target: { context: "websocket-server", url } });
+      return brokerNexus.connect({ target: { context: "websocket-server", url }, timeout: 2_000 });
     },
     catch: () => ({ code: "dial_failed" as const }),
   });

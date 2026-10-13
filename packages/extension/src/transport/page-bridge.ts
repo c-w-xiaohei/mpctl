@@ -4,7 +4,7 @@ import { injectScript } from "wxt/utils/inject-script";
 
 type Side = "isolated" | "main";
 export interface PageBridgeAdapterModel {
-  contextMeta: object;
+  contextMeta: { app: { protocolVersion: string } };
   connectionMeta: object;
   connectionTarget: object;
 }
@@ -17,6 +17,7 @@ interface PageBridgeOptions {
   maxMessageBytes?: number;
   maxQueuedMessages?: number;
   maxQueuedBytes?: number;
+  onClose?(): void;
 }
 
 const defaultMessageBytes = 4 * 1024 * 1024;
@@ -45,6 +46,8 @@ function byteLength(value: unknown, seen = new Set<object>()): BridgeConversion<
   if (seen.has(value)) return Result.err({ code: "cyclic_value" });
   if (value instanceof ArrayBuffer) return Result.ok(value.byteLength + 8);
   if (ArrayBuffer.isView(value)) return Result.ok(value.byteLength + 8);
+  if (value instanceof Blob)
+    return Result.ok(value.size + new TextEncoder().encode(value.type).byteLength + 16);
 
   seen.add(value);
   let bytes = 8;
@@ -504,6 +507,7 @@ export function createPageEndpoint(options: PageBridgeOptions): IEndpoint<PageBr
           failure = result.error;
         }
       };
+      attempt(() => options.onClose?.());
       acceptedRequests.clear();
       for (const cancel of [...pendingConnects]) attempt(cancel);
       if (connectListener) {

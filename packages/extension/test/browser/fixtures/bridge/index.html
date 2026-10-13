@@ -3,6 +3,67 @@
   <head>
     <meta charset="utf-8" />
     <title>mpctl bridge fixture</title>
+    <style>
+      #js_cover_area {
+        display: block;
+        min-height: 90px;
+      }
+      #js_cover_area .js_cover_preview_new {
+        width: 320px;
+        height: 180px;
+      }
+      #js_cover_area .js_chooseCoverWrap {
+        display: none;
+      }
+      #js_cover_area .js_cover_preview_new:hover .js_chooseCoverWrap {
+        display: block;
+      }
+      #js_cover_area .js_chooseCoverWrap > .weui-desktop-tooltip__wrp.launcher-hidden,
+      #js_cover_area .js_chooseCoverWrap > .cover-dropdown.presentation-hidden {
+        display: none;
+      }
+      #js_cover_area .js_cover_preview_new:hover .js_chooseCoverWrap .weui-desktop-tooltip__wrp,
+      #js_cover_area
+        .js_cover_preview_new:hover
+        .js_chooseCoverWrap:hover
+        > .cover-dropdown.presentation-hidden,
+      #js_cover_area .js_cover_preview_new:hover .js_chooseCoverWrap:hover > .cover-dropdown {
+        display: block;
+      }
+      /* Only for ordinary bridge coverage of the already-visible-menu path; not hover evidence. */
+      #js_cover_area .js_chooseCoverWrap.fixture-menu-visible {
+        display: block;
+      }
+      #js_cover_area .js_chooseCoverWrap.fixture-menu-visible > .cover-dropdown {
+        display: block;
+      }
+      #js_cover_area .js_cover_preview_square {
+        display: none;
+      }
+      #js_cover_area .cover-reveal:not([hidden]) {
+        display: block;
+        min-height: 32px;
+      }
+      #js_cover_area a.pop-opr__button {
+        display: inline-block;
+        padding: 8px;
+      }
+      .weui-desktop-dialog:not([hidden]) {
+        display: block;
+        min-width: 320px;
+        min-height: 140px;
+      }
+      .weui-desktop-img-picker__item {
+        display: inline-block;
+        min-width: 180px;
+        min-height: 80px;
+      }
+      .weui-desktop-img-picker__img-thumb {
+        display: block;
+        width: 160px;
+        height: 60px;
+      }
+    </style>
   </head>
   <body>
     <main id="fixture">Synthetic page bridge test fixture; not a WeChat DOM claim.</main>
@@ -29,7 +90,105 @@
     <section id="saved-editor" hidden>
       <div class="js_appmsg_item appmsg_item_wrp current" data-msgindex="0"></div>
     </section>
+    <div contenteditable="true" data-placeholder="请在这里输入标题">Fixture title 🌱</div>
+    <textarea id="title" hidden>Fixture title 🌱</textarea>
+    <input id="author" name="author" type="text" maxlength="8" value="Fixture" />
+    <textarea id="js_description" name="digest" maxlength="120"></textarea>
     <button id="trusted-interaction" type="button">Interact with editor fixture</button>
+    <ul>
+      <li id="js_editor_insertimage">
+        图片
+        <ul>
+          <li class="js_img_from_local" hidden>从图片库选择</li>
+        </ul>
+      </li>
+    </ul>
+    <div id="synthetic-image-library" class="weui-desktop-dialog" role="dialog" hidden>
+      <div class="weui-desktop-dialog__title"><span>选择图片</span></div>
+      <section class="weui-desktop-img-picker__list"></section>
+      <div class="weui-desktop-upload_global-media">
+        <input
+          type="file"
+          multiple
+          hidden
+          accept="image/bmp,image/png,image/jpeg,image/jpg,image/gif,image/webp"
+        />
+      </div>
+      <button class="weui-desktop-dialog__close-btn" type="button" aria-label="关闭">×</button>
+      <footer>
+        <button type="button" data-library-action="confirm">确定</button
+        ><button type="button" data-library-action="cancel">取消</button>
+      </footer>
+    </div>
+    <section id="js_cover_area">
+      <div class="cover-mask"><span class="btn-text js_share_type_none_image">无封面</span></div>
+      <div
+        class="js_cover_preview_new select-cover__preview first_appmsg_cover"
+        style="
+          display: block;
+          background-image: url(&quot;https://mmbiz.qpic.cn/mmbiz_png/current/0&quot;);
+        "
+      >
+        <div class="cover-hover-link-group">
+          <div class="js_chooseCoverWrap">
+            <span class="weui-desktop-popover__target">
+              <div class="weui-desktop-tooltip__wrp launcher-hidden">
+                <a class="js_chooseCover">更换封面</a>
+              </div>
+            </span>
+            <div class="cover-dropdown presentation-hidden">
+              <a class="pop-opr__button js_imagedialog">从图片库选择</a>
+            </div>
+          </div>
+        </div>
+      </div>
+      <div class="js_cover_preview_square select-cover__preview preview-square">
+        <div class="cover-hover-link-group">
+          <div class="js_chooseCoverWrap preview-square">
+            <span class="weui-desktop-popover__target">
+              <div class="weui-desktop-tooltip__wrp launcher-hidden">
+                <a class="js_chooseCover">更换封面</a>
+              </div>
+            </span>
+            <div class="cover-dropdown presentation-hidden">
+              <a class="pop-opr__button js_imagedialog">从图片库选择</a>
+            </div>
+          </div>
+        </div>
+      </div>
+    </section>
+    <div id="synthetic-cover-library" class="weui-desktop-dialog" role="dialog" hidden>
+      <h2>选择图片</h2>
+      <section class="weui-desktop-img-picker__list"></section>
+      <footer><button type="button">下一步</button><button type="button">取消</button></footer>
+    </div>
+    <section id="article-save-area">
+      <div id="js_editor_history_bar" class="appmsg_history_container">
+        <div id="history_bt" class="appmsg_history_new"><p>历史版本</p></div>
+      </div>
+      <button id="synthetic-native-save" type="button">保存为草稿</button>
+    </section>
+    <table id="synthetic-unrelated-table">
+      <tbody>
+        <tr>
+          <td>unrelated</td>
+        </tr>
+      </tbody>
+    </table>
+    <div id="synthetic-history-portal-host"></div>
+    <div id="synthetic-cover-crop" class="weui-desktop-dialog" role="dialog" hidden>
+      <h2>编辑封面</h2>
+      <img
+        class="crop-img"
+        src="https://mmbiz.qpic.cn/mmbiz_png/current/0"
+        width="640"
+        height="360"
+      />
+      <footer>
+        <button type="button">上一步</button><button type="button">确认</button
+        ><button class="weui-desktop-dialog__close-btn" type="button">×</button>
+      </footer>
+    </div>
     <script src="https://mp.weixin.qq.com/cgi-bin/jsapi.js"></script>
   </body>
 </html>

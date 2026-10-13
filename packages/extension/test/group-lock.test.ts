@@ -44,9 +44,6 @@ function browser() {
     async setSession(values: Record<string, unknown>) {
       Object.assign(session, values);
     },
-    async removeSession(key: string) {
-      delete session[key];
-    },
     async getLocal(key: string) {
       return { [key]: local[key] };
     },
@@ -56,6 +53,51 @@ function browser() {
   };
   return { api, groups, local, session, created: () => created };
 }
+
+test("restore ignores legacy document hints without deleting them; observe writes no hint", async () => {
+  const b = browser();
+  b.local.managedGroupId = 22;
+  b.groups.set(22, { id: 22, title: "mpctl" });
+  const binding = {
+    tabId: 1,
+    documentId: "legacy-document",
+    url: "https://mp.weixin.qq.com/cgi-bin/appmsg?t=media/appmsg_edit_v2&action=edit&isNew=1&type=77",
+  };
+  b.session["document:1"] = binding;
+  const reads: Array<string | null | undefined> = [];
+  const writes: Record<string, unknown>[] = [];
+  const manager = createPageManager({
+    ...b.api,
+    async getSession(key) {
+      reads.push(key);
+      return b.api.getSession(key);
+    },
+    async setSession(values) {
+      writes.push(values);
+      await b.api.setSession(values);
+    },
+    async getTab(id) {
+      return { id, url: binding.url };
+    },
+  });
+  try {
+    expect(await manager.restore()).toEqual(Result.ok(undefined));
+    expect(await manager.managedGroup()).toEqual(Result.ok(22));
+    expect(await manager.isCurrent(binding)).toEqual(Result.ok(false));
+    expect(reads).not.toContain(null);
+    expect(reads).not.toContain(undefined);
+    expect(b.session["document:1"]).toEqual(binding);
+    const before = writes.length;
+    manager.observe({ ...binding, documentId: "fresh-document" });
+    await Promise.resolve();
+    await Promise.resolve();
+    expect(writes).toHaveLength(before);
+    expect(b.session["document:1"]).toEqual(binding);
+    expect(b.created()).toBe(0);
+  } finally {
+    manager.dispose();
+  }
+});
 
 test("reuses the durable group lock after extension session storage is lost", async () => {
   const b = browser();
@@ -172,4 +214,31 @@ test("failed durable lock migration retains the group instead of choosing anothe
   const group = await manager.managedGroup();
   expect(Result.isOk(group) && group.value).toBe(22);
   expect(b.local.managedGroupId).toBe(22);
+});
+
+test("cleanup refuses to import a duplicate saved article without moving or closing either tab", async () => {
+  const b = browser();
+  b.local.managedGroupId = 22;
+  b.groups.set(22, { id: 22, title: "mpctl" });
+  b.groups.set(23, { id: 23, title: "mpctl" });
+  const url =
+    "https://mp.weixin.qq.com/cgi-bin/appmsg?t=media/appmsg_edit&action=edit&type=77&appmsgid=same";
+  let moved = 0;
+  const manager = createPageManager({
+    ...b.api,
+    async getTab(id: number) {
+      return { id, url };
+    },
+    async queryGroup(group: number) {
+      return [{ id: group === 22 ? 1 : 2, url }];
+    },
+    async groupTabs() {
+      moved++;
+      return 22;
+    },
+  } as never);
+  expect(await manager.cleanupWorkspace()).toMatchObject({ error: { code: "target_ambiguous" } });
+  expect(moved).toBe(0);
+  expect(b.groups.size).toBe(2);
+  expect(b.created()).toBe(0);
 });

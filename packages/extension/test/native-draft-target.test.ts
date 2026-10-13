@@ -32,7 +32,7 @@ async function withNativeLink(
   };
   const card = {
     getAttribute: (name: string) => (name === "data-appid" ? "synthetic-draft" : null),
-    querySelector: () => link,
+    querySelectorAll: () => [link],
     hidden: false,
     ownerDocument: {
       defaultView: { getComputedStyle: () => ({ display: "block", visibility: "visible" }) },
@@ -64,16 +64,16 @@ test("opens a supported native saved Edit href without requiring a click handler
     await withNativeLink(target, () => {
       clicks++;
     }),
-  ).toEqual({ kind: "captured", url: target });
+  ).toEqual({ kind: "captured", url: target, notDispatched: true, ended: true });
   expect(clicks).toBe(0);
 });
 
-test("captures an asynchronous native saved target from a placeholder Edit control", async () => {
+test("unreviewed asynchronous placeholder DOM handler is refused without invoking it", async () => {
   expect(
     await withNativeLink("javascript:;", (page) => {
       setTimeout(() => page.open(target), 20);
     }),
-  ).toEqual({ kind: "captured", url: target });
+  ).toEqual({ kind: "control_unavailable", ended: true });
 });
 
 test("reads the native href on a visible card with a hidden hover toolbar", async () => {
@@ -85,7 +85,7 @@ test("reads the native href on a visible card with a hidden hover toolbar", asyn
       },
       false,
     ),
-  ).toEqual({ kind: "captured", url: target });
+  ).toEqual({ kind: "captured", url: target, notDispatched: true, ended: true });
 });
 
 test("rejects multiple native saved targets and restores the temporary hook", async () => {
@@ -94,5 +94,5 @@ test("rejects multiple native saved targets and restores the temporary hook", as
       page.open(target);
       page.open(target.replace("token=fixture", "token=other"));
     }),
-  ).toEqual({ kind: "ambiguous" });
+  ).toEqual({ kind: "control_unavailable", ended: true });
 });

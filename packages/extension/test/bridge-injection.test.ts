@@ -1,5 +1,6 @@
 import { expect, mock, test } from "bun:test";
 import { Result } from "better-result";
+import { CountingTarget, TrackingTarget, CleanupFailingTarget } from "./listener-target-fixture";
 
 let injectScript: () => Promise<{ script: { remove(): void } }>;
 
@@ -13,32 +14,7 @@ test("failed WXT injection returns Err and closes the prepared endpoint", async 
   injectScript = async () => {
     throw new Error("injection failure");
   };
-  class CountingTarget extends EventTarget {
-    readonly listeners = new Map<string, Set<EventListenerOrEventListenerObject>>();
-    override addEventListener(
-      type: string,
-      callback: EventListenerOrEventListenerObject | null,
-      options?: boolean | AddEventListenerOptions,
-    ) {
-      if (callback) {
-        const listeners = this.listeners.get(type) ?? new Set();
-        listeners.add(callback);
-        this.listeners.set(type, listeners);
-      }
-      super.addEventListener(type, callback, options);
-    }
-    override removeEventListener(
-      type: string,
-      callback: EventListenerOrEventListenerObject | null,
-      options?: boolean | EventListenerOptions,
-    ) {
-      if (callback) this.listeners.get(type)?.delete(callback);
-      super.removeEventListener(type, callback, options);
-    }
-    count() {
-      return [...this.listeners.values()].reduce((total, listeners) => total + listeners.size, 0);
-    }
-  }
+
   const target = new CountingTarget();
   const result = await injectMainWorldBridge(target, undefined, (endpoint) =>
     endpoint.listen?.(() => {}),
@@ -52,26 +28,8 @@ test("preparation failure returns Err and closes endpoint listeners", async () =
   injectScript = async () => {
     throw new Error("must not inject");
   };
-  class CountingTarget extends EventTarget {
-    readonly listeners = new Set<EventListenerOrEventListenerObject>();
-    override addEventListener(
-      type: string,
-      callback: EventListenerOrEventListenerObject | null,
-      options?: boolean | AddEventListenerOptions,
-    ) {
-      if (callback) this.listeners.add(callback);
-      super.addEventListener(type, callback, options);
-    }
-    override removeEventListener(
-      type: string,
-      callback: EventListenerOrEventListenerObject | null,
-      options?: boolean | EventListenerOptions,
-    ) {
-      if (callback) this.listeners.delete(callback);
-      super.removeEventListener(type, callback, options);
-    }
-  }
-  const target = new CountingTarget();
+
+  const target = new TrackingTarget();
   const result = await injectMainWorldBridge(target, undefined, (endpoint) => {
     endpoint.listen?.(() => {});
     throw new Error("prepare failure");
@@ -86,16 +44,7 @@ test("cleanup failure returns a typed Err with the original bootstrap stage", as
   injectScript = async () => {
     throw new Error("injection failure");
   };
-  class CleanupFailingTarget extends EventTarget {
-    override removeEventListener(
-      type: string,
-      callback: EventListenerOrEventListenerObject | null,
-      options?: boolean | EventListenerOptions,
-    ) {
-      super.removeEventListener(type, callback, options);
-      throw new Error("cleanup failure");
-    }
-  }
+
   const result = await injectMainWorldBridge(new CleanupFailingTarget(), undefined, (endpoint) =>
     endpoint.listen?.(() => {}),
   );
@@ -115,26 +64,8 @@ test("prepares the receive listener before injection and removes script on inval
     listenersAtInjection = target.listeners.size;
     return { script: { remove: () => (removed = true) } };
   };
-  class CountingTarget extends EventTarget {
-    readonly listeners = new Set<EventListenerOrEventListenerObject>();
-    override addEventListener(
-      type: string,
-      callback: EventListenerOrEventListenerObject | null,
-      options?: boolean | AddEventListenerOptions,
-    ) {
-      if (callback) this.listeners.add(callback);
-      super.addEventListener(type, callback, options);
-    }
-    override removeEventListener(
-      type: string,
-      callback: EventListenerOrEventListenerObject | null,
-      options?: boolean | EventListenerOptions,
-    ) {
-      if (callback) this.listeners.delete(callback);
-      super.removeEventListener(type, callback, options);
-    }
-  }
-  const target = new CountingTarget();
+
+  const target = new TrackingTarget();
   const result = await injectMainWorldBridge(
     target,
     { onInvalidated: (callback) => (invalidated = callback) },
@@ -154,16 +85,7 @@ test("disposal returns the same cleanup Err and still removes the injected scrip
   let invalidated: (() => void) | undefined;
   let removed = false;
   injectScript = async () => ({ script: { remove: () => (removed = true) } });
-  class CleanupFailingTarget extends EventTarget {
-    override removeEventListener(
-      type: string,
-      callback: EventListenerOrEventListenerObject | null,
-      options?: boolean | EventListenerOptions,
-    ) {
-      super.removeEventListener(type, callback, options);
-      throw new Error("endpoint cleanup failed");
-    }
-  }
+
   const result = await injectMainWorldBridge(
     new CleanupFailingTarget(),
     { onInvalidated: (callback) => (invalidated = callback) },

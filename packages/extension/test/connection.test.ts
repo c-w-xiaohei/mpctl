@@ -1,5 +1,8 @@
 import { describe, expect, test } from "bun:test";
 import { Result } from "better-result";
+
+const ledgerId = crypto.randomUUID();
+const initializedLedger = { ledger: Promise.resolve(Result.ok({ ledgerId })) };
 import {
   connectResultCodec,
   connectionConfig,
@@ -7,15 +10,34 @@ import {
   disconnectResultCodec,
   reloadResultCodec,
 } from "@mpctl/contracts";
-import {
-  createBackgroundControl,
-  createConnectionController,
-  decodeControlResult,
-} from "../src/connection";
+import { createBackgroundControl, createConnectionController } from "../src/connection";
 
 describe("explicit plugin connection", () => {
+  test("G1 ledger initialization must finish before a WS dial publishes metadata", async () => {
+    let release!: (result: Result<{ ledgerId: string }, { code: string }>) => void;
+    const ledger = new Promise<Result<{ ledgerId: string }, { code: string }>>((done) => {
+      release = done;
+    });
+    let dials = 0;
+    let published: string | undefined;
+    const controller = createConnectionController({
+      ledger,
+      dial: async (_url, protocols, _workspace, _control, ledgerId) => {
+        dials++;
+        published = ledgerId;
+        return Result.ok(new FakeSocket(protocols));
+      },
+    });
+    const connecting = controller.connect("credential");
+    expect(dials).toBe(0);
+    const ledgerId = crypto.randomUUID();
+    release(Result.ok({ ledgerId }));
+    expect((await connecting).isOk()).toBe(true);
+    expect({ dials, published }).toEqual({ dials: 1, published: ledgerId });
+  });
   test("published controls encode expected connection failures and explicit status", async () => {
     const controller = createConnectionController({
+      ...initializedLedger,
       dial: async () => {
         throw new Error("dial failed");
       },
@@ -25,12 +47,12 @@ describe("explicit plugin connection", () => {
       reload: async () => Result.ok(undefined),
     });
 
-    const failed = await decodeControlResult(connectResultCodec, await service.connect());
+    const failed = await connectResultCodec.deserialize(await service.connect());
     expect(failed).toEqual(Result.err({ code: "connect_failed" }));
-    expect(await decodeControlResult(controlStatusResultCodec, await service.getStatus())).toEqual(
+    expect(await controlStatusResultCodec.deserialize(await service.getStatus())).toEqual(
       Result.ok({ connected: false }),
     );
-    expect(await decodeControlResult(disconnectResultCodec, await service.disconnect())).toEqual(
+    expect(await disconnectResultCodec.deserialize(await service.disconnect())).toEqual(
       Result.ok({ connected: false }),
     );
   });
@@ -38,6 +60,7 @@ describe("explicit plugin connection", () => {
   test("maps invalid pairing credentials to the published connect failure without dialing", async () => {
     let dialCount = 0;
     const controller = createConnectionController({
+      ...initializedLedger,
       dial: async () => {
         dialCount++;
         return Result.ok(new FakeSocket([connectionConfig.selectedSubprotocol]));
@@ -51,7 +74,7 @@ describe("explicit plugin connection", () => {
       controller: () => controller,
       reload: async () => Result.ok(undefined),
     });
-    expect(await decodeControlResult(connectResultCodec, await service.connect())).toEqual(
+    expect(await connectResultCodec.deserialize(await service.connect())).toEqual(
       Result.err({ code: "connect_failed" }),
     );
     expect(dialCount).toBe(0);
@@ -59,22 +82,22 @@ describe("explicit plugin connection", () => {
 
   test("published reload control returns a void wire envelope", async () => {
     const service = createBackgroundControl({
-      controller: () => createConnectionController(),
+      controller: () => createConnectionController(initializedLedger),
       reload: async () => Result.ok(undefined),
     });
-    expect(await decodeControlResult(reloadResultCodec, await service.reload())).toEqual(
+    expect(await reloadResultCodec.deserialize(await service.reload())).toEqual(
       Result.ok(undefined),
     );
   });
 
   test("published reload control converts a rejected adapter into the schema error", async () => {
     const service = createBackgroundControl({
-      controller: () => createConnectionController(),
+      controller: () => createConnectionController(initializedLedger),
       reload: async () => {
         throw new Error("reload adapter rejected");
       },
     });
-    expect(await decodeControlResult(reloadResultCodec, await service.reload())).toEqual(
+    expect(await reloadResultCodec.deserialize(await service.reload())).toEqual(
       Result.err({ code: "reload_failed" }),
     );
   });
@@ -82,6 +105,7 @@ describe("explicit plugin connection", () => {
   test("dials only on connect and does not recreate a client after disconnect", async () => {
     const sockets: FakeSocket[] = [];
     const controller = createConnectionController({
+      ...initializedLedger,
       dial(_url, protocols) {
         const socket = new FakeSocket(protocols);
         sockets.push(socket);
@@ -104,7 +128,10 @@ describe("explicit plugin connection", () => {
   test("closes a connection when the server did not select the fixed protocol", async () => {
     const socket = new FakeSocket(["mpctl.v1"]);
     socket.selectedProtocol = "wrong";
-    const controller = createConnectionController({ dial: async () => Result.ok(socket) });
+    const controller = createConnectionController({
+      ...initializedLedger,
+      dial: async () => Result.ok(socket),
+    });
     expect(await controller.connect("test-pairing-secret")).toEqual(
       Result.err({ code: "protocol_mismatch" }),
     );
@@ -117,6 +144,7 @@ describe("explicit plugin connection", () => {
     let dialPromise: Promise<ReturnType<typeof Result.ok<FakeSocket>>> | undefined;
     let calls = 0;
     const controller = createConnectionController({
+      ...initializedLedger,
       dial(_url, _protocols) {
         calls++;
         dialPromise ??= new Promise((resolve) => {
@@ -137,6 +165,7 @@ describe("explicit plugin connection", () => {
   test("disconnect cancels a pending dial and closes its late socket once", async () => {
     let resolveDial!: (socket: FakeSocket) => void;
     const controller = createConnectionController({
+      ...initializedLedger,
       dial: () => new Promise((resolve) => (resolveDial = (socket) => resolve(Result.ok(socket)))),
     });
     const pending = controller.connect("test-pairing-secret");
@@ -153,6 +182,7 @@ describe("explicit plugin connection", () => {
   test("reports cleanup failure while preserving the cancellation cause", async () => {
     let resolveDial!: (socket: FakeSocket) => void;
     const controller = createConnectionController({
+      ...initializedLedger,
       dial: () => new Promise((resolve) => (resolveDial = (socket) => resolve(Result.ok(socket)))),
     });
     const pending = controller.connect("test-pairing-secret");
@@ -168,7 +198,10 @@ describe("explicit plugin connection", () => {
 
   test("disconnect returns cleanup failure instead of a false success", async () => {
     const socket = new FakeSocket([connectionConfig.selectedSubprotocol]);
-    const controller = createConnectionController({ dial: async () => Result.ok(socket) });
+    const controller = createConnectionController({
+      ...initializedLedger,
+      dial: async () => Result.ok(socket),
+    });
     await controller.connect("test-pairing-secret");
     socket.failClose = true;
 
@@ -179,7 +212,10 @@ describe("explicit plugin connection", () => {
 
   test("captures a thrown socket close without changing the disconnect Result contract", async () => {
     const socket = new FakeSocket([connectionConfig.selectedSubprotocol]);
-    const controller = createConnectionController({ dial: async () => Result.ok(socket) });
+    const controller = createConnectionController({
+      ...initializedLedger,
+      dial: async () => Result.ok(socket),
+    });
     await controller.connect("test-pairing-secret");
     socket.throwOnClose = true;
 
@@ -191,7 +227,10 @@ describe("explicit plugin connection", () => {
   test("listener registration failure closes the candidate and never leaves stale connected state", async () => {
     const socket = new FakeSocket([connectionConfig.selectedSubprotocol]);
     socket.failListener = true;
-    const controller = createConnectionController({ dial: async () => Result.ok(socket) });
+    const controller = createConnectionController({
+      ...initializedLedger,
+      dial: async () => Result.ok(socket),
+    });
 
     expect(await controller.connect("test-pairing-secret")).toEqual(
       Result.err({ code: "dial_failed" }),
@@ -203,6 +242,7 @@ describe("explicit plugin connection", () => {
   test("converts rejected settings adapters to Results without dialing", async () => {
     let dials = 0;
     const loadFailure = createConnectionController({
+      ...initializedLedger,
       loadSettings: async () => {
         throw new Error("settings read failed");
       },
@@ -214,6 +254,7 @@ describe("explicit plugin connection", () => {
     expect(await loadFailure.connect()).toEqual(Result.err({ code: "settings_failed" }));
 
     const saveFailure = createConnectionController({
+      ...initializedLedger,
       saveSettings: async () => {
         throw new Error("settings write failed");
       },
@@ -234,9 +275,18 @@ describe("explicit plugin connection", () => {
     ) => void;
     let dialCount = 0;
     let loadCount = 0;
+    let signalSettings!: () => void;
+    const settingsStarted = new Promise<void>((resolve) => {
+      signalSettings = resolve;
+    });
     const controller = createConnectionController({
+      ...initializedLedger,
       loadSettings: () => {
-        if (++loadCount === 1) return new Promise((resolve) => (resolveLoad = resolve));
+        if (++loadCount === 1)
+          return new Promise((resolve) => {
+            resolveLoad = resolve;
+            signalSettings();
+          });
         return Promise.resolve(
           Result.ok({ websocketUrl: "ws://new.invalid", pairingCredential: "new" }),
         );
@@ -247,6 +297,7 @@ describe("explicit plugin connection", () => {
       },
     });
     const old = controller.connect();
+    await settingsStarted;
     controller.disconnect();
     await controller.connect("new-explicit-credential");
     const newStatus = await controller.status();
@@ -263,6 +314,7 @@ describe("explicit plugin connection", () => {
     let dialCount = 0;
     let saveCount = 0;
     const controller = createConnectionController({
+      ...initializedLedger,
       saveSettings: () => {
         if (++saveCount === 1)
           return new Promise((resolve) => (resolveSave = () => resolve(Result.ok(undefined))));
@@ -289,6 +341,7 @@ describe("explicit plugin connection", () => {
     const sockets: FakeSocket[] = [];
     let dialCount = 0;
     const controller = createConnectionController({
+      ...initializedLedger,
       dial: (_url, protocols) => {
         if (++dialCount === 1)
           return new Promise((resolve) => (resolveOld = (socket) => resolve(Result.ok(socket))));
@@ -316,6 +369,7 @@ describe("explicit plugin connection", () => {
   test("a stale failure is replaced by a generic cancellation error", async () => {
     let rejectDial!: (error: Error) => void;
     const controller = createConnectionController({
+      ...initializedLedger,
       dial: () =>
         new Promise((resolve) => (rejectDial = () => resolve(Result.err({ code: "dial_failed" })))),
     });
@@ -330,6 +384,7 @@ describe("explicit plugin connection", () => {
   test("a stale wrong-protocol socket is closed once without exposing its protocol", async () => {
     let resolveDial!: (socket: FakeSocket) => void;
     const controller = createConnectionController({
+      ...initializedLedger,
       dial: () => new Promise((resolve) => (resolveDial = (socket) => resolve(Result.ok(socket)))),
     });
     const pending = controller.connect("private-secret");
@@ -348,6 +403,7 @@ describe("explicit plugin connection", () => {
     const resolvers: Array<(socket: FakeSocket) => void> = [];
     let dialCount = 0;
     const controller = createConnectionController({
+      ...initializedLedger,
       dial: (_url, _protocols) => {
         dialCount++;
         return new Promise((resolve) => resolvers.push((socket) => resolve(Result.ok(socket))));

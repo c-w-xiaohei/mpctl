@@ -1,6 +1,20 @@
 import { defineUnlistedScript } from "wxt/utils/define-unlisted-script";
-import { createPageEndpoint } from "../../../../src/transport/page-bridge";
+import { Nexus, Token } from "@nexus-js/core";
+import { protocolVersion } from "@mpctl/contracts";
+import {
+  createPageEndpoint,
+  type PageBridgeAdapterModel,
+} from "../../../../src/transport/page-bridge";
 import type { IPort } from "@nexus-js/core";
+
+const binaryToken = new Token<{
+  echo(input: { blob: Blob; bytes: Uint8Array; nested: { blob: Blob } }): Promise<{
+    blob: Blob;
+    bytes: Uint8Array;
+    nested: { blob: Blob };
+  }>;
+  echoImage(input: { blob: Blob; fileName: string }): Promise<{ blob: Blob; nativeBlob: boolean }>;
+}>("mpctl.browser.binary-fixture");
 
 export default defineUnlistedScript(() => {
   const script = document.currentScript;
@@ -19,6 +33,22 @@ export default defineUnlistedScript(() => {
     side: "main",
     eventNames: { fromIsolated, fromMain },
   });
+  const rpcEndpoint = createPageEndpoint({
+    target: document,
+    channelId: `${channelId}-rpc`,
+    side: "main",
+    eventNames: {
+      fromIsolated: `${fromIsolated}:rpc`,
+      fromMain: `${fromMain}:rpc`,
+    },
+  });
+  const nexus = new Nexus<PageBridgeAdapterModel>()
+    .provide(binaryToken, {
+      echo: async (input) => input,
+      echoImage: async (input) => ({ blob: input.blob, nativeBlob: input.blob instanceof Blob }),
+    })
+    .configure({ endpoint: { implementation: rpcEndpoint, meta: { app: { protocolVersion } } } });
+  void nexus.ready();
   let activePort: IPort | undefined;
   endpoint.listen?.((port: IPort) => {
     activePort = port;

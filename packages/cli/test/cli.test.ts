@@ -1,6 +1,16 @@
-import { afterEach, describe, expect, test } from "bun:test";
+// This actual workspace/CLI regression consumes browser-domain production code.
+// oxlint-disable-next-line typescript/triple-slash-reference
+/// <reference lib="dom" />
+// oxlint-disable-next-line typescript/triple-slash-reference
+/// <reference path="../../extension/node_modules/@types/chrome/index.d.ts" />
+import { afterEach, describe, expect, test, spyOn } from "bun:test";
 import { Nexus } from "@nexus-js/core";
-import { usingNodeIpcDaemon, UnixSocketServerEndpoint } from "@nexus-js/node-ipc";
+import {
+  usingNodeIpcDaemon,
+  usingNodeIpcClient,
+  UnixSocketServerEndpoint,
+} from "@nexus-js/node-ipc";
+import { assetCommand } from "../src/asset";
 import {
   connectionToken,
   workspaceToken,
@@ -8,12 +18,21 @@ import {
   listArticlesResultCodec,
   articleResultCodec,
   workspaceResultCodec,
-  writeBodyResultCodec,
+  articleFieldsResultCodec,
+  articleCheckResultCodec,
+  assetListResultCodec,
+  operationResultCodec,
+  articleCoverResultCodec,
+  protocolVersion,
   connectionStatusResultCodec,
   type ServiceError,
   type WorkspaceService,
+  createOperationId,
 } from "@mpctl/contracts";
 import { Result } from "better-result";
+import { installIdbFixture } from "../../extension/test/idb-fixture";
+import { navigationFixture } from "../../extension/test/browser/fixtures/navigation-workspace";
+const fixtureLedgerId = crypto.randomUUID();
 import type { SerializedResult } from "better-result";
 import type { NodeIpcSocketAddress } from "@nexus-js/node-ipc";
 import { spawn } from "node:child_process";
@@ -28,6 +47,8 @@ import {
   CliError,
   ownsStartupBroker,
   withStartupReadinessPipe,
+  withConnection,
+  operationOutcome,
 } from "../src/connection.js";
 
 const activeServers: Array<{ dispose(): void }> = [];
@@ -60,6 +81,1560 @@ afterEach(async () => {
 });
 
 describe("CLI over Nexus Node IPC", () => {
+  test("F1 actual cleanup CLI retains original committed placement/cause/key and status adds zero effects", async () => {
+    const restore = installIdbFixture();
+    const f = await navigationFixture();
+    const directory = await tempDir();
+    const socket = path.join(directory, "cleanup-evidence.sock");
+    f.manager.cleanupWorkspace = async (progress) => {
+      await progress!.dispatch("tab_group", async () => {
+        f.counters.group++;
+      });
+      await progress!.placed!();
+      return Result.err({
+        code: "page_failed",
+        observedFailure: { kind: "runtime", causeCode: "tab_group_failed" },
+      });
+    };
+    const nexus = new Nexus();
+    let wire: any;
+    const config = usingNodeIpcDaemon({
+      appId: "mpctl",
+      address: { kind: "path", path: socket },
+      configure: false,
+      providers: [
+        {
+          token: workspaceToken,
+          service: {
+            ...f.workspace,
+            cleanupWorkspace: async () => {
+              wire = await f.workspace.cleanupWorkspace();
+              return wire;
+            },
+          },
+        },
+        {
+          token: connectionToken,
+          service: {
+            getStatus: async () => ({
+              status: "ok" as const,
+              value: {
+                connected: true,
+                brokerVersion: protocolVersion,
+                extensionVersion: protocolVersion,
+                ledgerId: f.operations.ledgerId,
+              },
+            }),
+          },
+        },
+      ],
+    });
+    nexus.configure(config);
+    await nexus.ready();
+    try {
+      const result = await runCli(["workspace", "cleanup"], socket);
+      expect(result.exitCode).toBe(1);
+      const terminal = JSON.parse(result.stderr.trim()).error;
+      expect(terminal).toMatchObject({
+        code: "page_failed",
+        snapshot: {
+          operationId: wire.error.snapshot.operationId,
+          state: "settled",
+          effect: { maintenance: true, placements: 1 },
+          result: {
+            error: { cause: { at: "bg.navigation", kind: "runtime", code: "tab_group_failed" } },
+          },
+        },
+      });
+      const counts = { ...f.counters };
+      const status = await runCli(["operation", "status", terminal.snapshot.operationId], socket);
+      expect(status.exitCode).toBe(0);
+      expect(JSON.parse(status.stdout).snapshot).toEqual(wire.error.snapshot);
+      expect(f.counters).toEqual(counts);
+      expect(counts.group).toBe(1);
+      // The same decoded error also carries validated diagnostics/blocking facts;
+      // the terminal must not reconstruct them.
+      const cleanup = f.workspace.cleanupWorkspace;
+      f.workspace.cleanupWorkspace = async () => {
+        const response = await cleanup();
+        if (
+          response.status !== "error" ||
+          !("snapshot" in response.error) ||
+          !response.error.snapshot
+        )
+          throw new Error("missing maintenance snapshot");
+        return {
+          status: "error",
+          error: {
+            ...response.error,
+            blockingOperationId: terminal.snapshot.operationId,
+            issue: {
+              operationId: response.error.snapshot.operationId,
+              failure: {
+                code: "storage_failed",
+                cause: { at: "bg.persistence", kind: "runtime", code: "storage_failed" },
+              },
+            },
+          },
+        };
+      };
+      // Provider's forwarding wrapper uses the current production service slot.
+      const detailed = await runCli(["workspace", "cleanup"], socket);
+      expect(detailed.exitCode).toBe(1);
+      const facts = JSON.parse(detailed.stderr.trim()).error;
+      expect(facts).toMatchObject({
+        snapshot: { effect: { placements: 1 } },
+        blockingOperationId: terminal.snapshot.operationId,
+        issue: { failure: { code: "storage_failed" } },
+      });
+    } finally {
+      (config.endpoint!.implementation as UnixSocketServerEndpoint).close();
+      f.dispose();
+      restore();
+    }
+  });
+  test("F2/G0 actual spawned CLI consumes admitted status epoch with no key RPC; explicit old key never gets replacement", async () => {
+    const directory = await tempDir();
+    const socket = path.join(directory, "epoch.sock");
+    const epoch = crypto.randomUUID();
+    let keys = 0;
+    let native = 0;
+    const provider = encodeWorkspaceProvider({
+      newArticle: async () => Result.ok({ article: "unused", title: "", bodyHash: "a".repeat(64) }),
+    });
+    provider.newArticle = async (input) => {
+      if (!input.operationId.startsWith(`op:${epoch}:`))
+        return {
+          status: "error",
+          error: { operationId: input.operationId, failure: { code: "ledger_mismatch" } },
+        };
+      native++;
+      return (
+        await operationResultCodec.serialize(
+          Result.ok({
+            snapshot: {
+              operationId: input.operationId,
+              operation: "new",
+              state: "settled",
+              effect: {
+                navigation: true,
+                outcome: "confirmed",
+                pageCreated: true,
+                auxiliaryCreated: [],
+                targetBound: true,
+              },
+              result: { status: "ok", value: {} },
+            },
+          }),
+        )
+      ).unwrap();
+    };
+    const forbidden = {
+      ...provider,
+      getKeyLedger: async () => {
+        keys++;
+        throw new Error("no new handshake permitted");
+      },
+    };
+    const nexus = new Nexus();
+    const config = usingNodeIpcDaemon({
+      appId: "mpctl",
+      address: { kind: "path", path: socket },
+      configure: false,
+      providers: [
+        { token: workspaceToken, service: forbidden },
+        {
+          token: connectionToken,
+          service: {
+            getStatus: async () => ({
+              status: "ok" as const,
+              value: {
+                connected: true,
+                brokerVersion: protocolVersion,
+                extensionVersion: protocolVersion,
+                ledgerId: fixtureLedgerId,
+                keyLedgerId: epoch,
+              },
+            }),
+          },
+        },
+      ],
+    });
+    nexus.configure(config);
+    await nexus.ready();
+    activeServers.push({
+      dispose: () => (config.endpoint!.implementation as UnixSocketServerEndpoint).close(),
+    });
+    const first = await runCli(["article", "new"], socket);
+    expect(first.exitCode).toBe(0);
+    expect(JSON.parse(first.stdout).snapshot.operationId).toStartWith(`op:${epoch}:`);
+    const old = createOperationId(fixtureLedgerId);
+    const failed = await runCli(["article", "new", "--operation", old], socket);
+    expect(failed.exitCode).not.toBe(0);
+    expect(JSON.parse(failed.stderr.trim().split("\n").at(-1)!).error).toMatchObject({
+      operationId: old,
+      code: "ledger_mismatch",
+    });
+    expect({ keys, native }).toEqual({ keys: 0, native: 1 });
+  });
+  test("E3 BODY cleanup is an interaction diagnostic and cannot replace a committed success", async () => {
+    const directory = await tempDir();
+    const socket = path.join(directory, "body-cleanup.sock");
+    activeServers.push(
+      await startProvider(socket, {
+        writeBody: async () => Result.ok({ bodyHash: "a".repeat(64) }),
+      }),
+    );
+    const client = new Nexus().configure(
+      usingNodeIpcClient({
+        appId: "body-cleanup-test",
+        resolveAddress: () => ({ kind: "path", path: socket }),
+        configure: false,
+      }),
+    );
+    await client.ready();
+    const connection = await client.connect({
+      target: { context: "node-ipc-daemon", appId: "mpctl", instance: "default" },
+    });
+    const prototype = Object.getPrototypeOf(connection);
+    const original = prototype.disconnect;
+    const disconnect = spyOn(prototype, "disconnect").mockImplementation(
+      function (this: import("@nexus-js/core").Connection) {
+        original.call(this);
+        throw new Error("private cleanup");
+      },
+    );
+    const previous = process.env.MPCTL_BROKER_SOCKET;
+    process.env.MPCTL_BROKER_SOCKET = socket;
+    try {
+      const result = await withConnection(async ({ workspace, keyLedgerId }) =>
+        workspace.writeBody({
+          article: "ref",
+          html: "next",
+          expectedHash: "b".repeat(64),
+          operationId: `op:${keyLedgerId}:${crypto.randomUUID()}`,
+        }),
+      );
+      expect(result).toMatchObject(
+        Result.ok({
+          snapshot: {
+            state: "settled",
+            effect: { outcome: "confirmed", bodyHash: "a".repeat(64) },
+            result: { status: "ok" },
+          },
+          issue: {
+            failure: {
+              code: "cleanup_failed",
+              cause: { at: "cli.cleanup", code: "broker_disconnect_failed" },
+            },
+          },
+        }),
+      );
+    } finally {
+      disconnect.mockRestore();
+      connection.disconnect();
+      if (previous === undefined) delete process.env.MPCTL_BROKER_SOCKET;
+      else process.env.MPCTL_BROKER_SOCKET = previous;
+    }
+  });
+  test("E3 operation status succeeds for failed business snapshots, push does not", () => {
+    const snapshot = {
+      operationId: `op:${crypto.randomUUID()}:${crypto.randomUUID()}`,
+      operation: "body" as const,
+      state: "settled" as const,
+      effect: { outcome: "not_dispatched" as const },
+      result: { status: "error" as const, error: { code: "content_conflict" as const } },
+    };
+    expect(operationOutcome({ snapshot }, true).isOk()).toBe(true);
+    const pushed = operationOutcome({ snapshot }, false);
+    expect(pushed.isErr()).toBe(true);
+    expect(pushed.isErr() && pushed.error.details?.snapshot).toEqual(snapshot);
+  });
+  test.each(["read-legacy", "read-enriched", "set-legacy", "set-enriched"] as const)(
+    "W2 correction cover %s retains primary code and received read facts over IPC",
+    async (mode) => {
+      const directory = await tempDir();
+      const socket = path.join(directory, "cover-domain.sock");
+      const readFailure = {
+        stage: "native_read",
+        kind: "runtime",
+        causeCode: "cover_read_failed",
+        component: "cover",
+      } as const;
+      const error = {
+        code: "cover_unavailable" as const,
+        ...(mode.endsWith("enriched") ? { readFailure } : {}),
+      };
+      activeServers.push(
+        await startProvider(socket, {
+          readArticleCover: async () => Result.err(error),
+          setArticleCover: async () =>
+            Result.err({
+              code: "cover_unavailable",
+              cause: {
+                at: "bg.preflight",
+                kind: mode.endsWith("enriched") ? "runtime" : "domain",
+                code: mode.endsWith("enriched") ? "cover_read_failed" : "cover_unavailable",
+              },
+            }),
+        }),
+      );
+      const previous = process.env.MPCTL_BROKER_SOCKET;
+      process.env.MPCTL_BROKER_SOCKET = socket;
+      try {
+        const result = await withConnection<unknown>(({ workspace }) =>
+          mode.startsWith("read")
+            ? workspace.readArticleCover("ref")
+            : workspace.setArticleCover({
+                article: "ref",
+                asset: "asset",
+                expectedCoverHash: "0".repeat(64),
+                operationId: `op:${fixtureLedgerId}:${crypto.randomUUID()}`,
+              }),
+        );
+        if (mode.startsWith("set")) {
+          expect(result.isOk()).toBe(true);
+          if (result.isOk())
+            expect(result.value).toMatchObject({
+              snapshot: {
+                effect: { cover: true, outcome: "not_dispatched" },
+                result: {
+                  status: "error",
+                  error: {
+                    code: "cover_unavailable",
+                    cause: {
+                      at: "bg.preflight",
+                      kind: mode.endsWith("enriched") ? "runtime" : "domain",
+                      code: mode.endsWith("enriched") ? "cover_read_failed" : "cover_unavailable",
+                    },
+                  },
+                },
+              },
+            });
+          return;
+        }
+        expect(result.isErr()).toBe(true);
+        if (result.isOk()) throw new Error("expected cover failure");
+        expect(result.error.code).toBe("cover_unavailable");
+        expect(result.error.details?.readFailure).toEqual(
+          mode.endsWith("enriched") ? readFailure : undefined,
+        );
+        expect(result.error.details).not.toHaveProperty("coverFailure");
+      } finally {
+        if (previous === undefined) delete process.env.MPCTL_BROKER_SOCKET;
+        else process.env.MPCTL_BROKER_SOCKET = previous;
+      }
+    },
+  );
+  test.each(["fields", "cover", "save"] as const)(
+    "W2 correction received %s preflight readFailure survives genuine IPC",
+    async (operation) => {
+      const directory = await tempDir();
+      const socket = path.join(directory, "preflight-read.sock");
+      activeServers.push(
+        await startProvider(socket, {
+          updateArticleFields: async () =>
+            Result.err({
+              code: "page_failed",
+              cause: { at: "content.readback", kind: "runtime", code: "dom_read_failed" },
+              cleanup: { at: "cli.cleanup", kind: "runtime", code: "library_cleanup_failed" },
+            }),
+          setArticleCover: async () =>
+            Result.err({
+              code: "page_failed",
+              cause: { at: "bg.preflight", kind: "runtime", code: "dom_read_failed" },
+              cleanup: {
+                at: "content.cover_cleanup",
+                kind: "runtime",
+                code: "library_cleanup_failed",
+              },
+            }),
+          saveArticle: async () =>
+            Result.err({
+              code: "page_failed",
+              cause: { at: "bg.preflight", kind: "runtime", code: "dom_read_failed" },
+              cleanup: {
+                at: "content.history_cleanup",
+                kind: "runtime",
+                code: "library_cleanup_failed",
+              },
+            }),
+        }),
+      );
+      const previous = process.env.MPCTL_BROKER_SOCKET;
+      process.env.MPCTL_BROKER_SOCKET = socket;
+      try {
+        const result = await withConnection<unknown>(({ workspace }) =>
+          operation === "fields"
+            ? workspace.updateArticleFields({
+                article: "ref",
+                fields: { title: "next" },
+                expectedHash: "0".repeat(64),
+                operationId: `op:${fixtureLedgerId}:${crypto.randomUUID()}`,
+              })
+            : operation === "cover"
+              ? workspace.setArticleCover({
+                  article: "ref",
+                  asset: "asset",
+                  expectedCoverHash: "0".repeat(64),
+                  operationId: `op:${fixtureLedgerId}:${crypto.randomUUID()}`,
+                })
+              : workspace.saveArticle({
+                  article: "ref",
+                  expectedBodyHash: "0".repeat(64),
+                  expectedFieldsHash: "0".repeat(64),
+                  expectedCoverHash: "0".repeat(64),
+                  operationId: `op:${fixtureLedgerId}:${crypto.randomUUID()}`,
+                }),
+        );
+        if (operation === "fields") {
+          expect(result.isOk()).toBe(true);
+          if (result.isOk())
+            expect(result.value).toMatchObject({
+              snapshot: {
+                operation: "fields",
+                effect: { outcome: "not_dispatched", attempted: [] },
+                result: {
+                  status: "error",
+                  error: {
+                    code: "page_failed",
+                    cause: { code: "dom_read_failed" },
+                    cleanup: { code: "library_cleanup_failed" },
+                  },
+                },
+              },
+            });
+          return;
+        }
+        expect(result.isOk()).toBe(true);
+        if (result.isOk())
+          expect(result.value).toMatchObject({
+            snapshot: {
+              operation,
+              effect: { outcome: "not_dispatched" },
+              result: {
+                status: "error",
+                error: {
+                  code: "page_failed",
+                  cause: { at: "bg.preflight", kind: "runtime", code: "dom_read_failed" },
+                  cleanup: { code: "library_cleanup_failed" },
+                },
+              },
+            },
+          });
+      } finally {
+        if (previous === undefined) delete process.env.MPCTL_BROKER_SOCKET;
+        else process.env.MPCTL_BROKER_SOCKET = previous;
+      }
+    },
+  );
+  test.each(["first-cleanup", "later-broker-cleanup"] as const)(
+    "W2 received cover first cause and %s survive IPC disconnect failure",
+    async (mode) => {
+      const directory = await tempDir();
+      const socket = path.join(directory, "cover-cleanup-seam.sock");
+      activeServers.push(
+        await startProvider(socket, {
+          async setArticleCover() {
+            return Result.err({
+              code: "content_conflict",
+              cause: { at: "content.preflight", kind: "domain", code: "content_conflict" },
+              ...(mode === "first-cleanup"
+                ? {
+                    cleanup: {
+                      at: "content.cover_cleanup",
+                      kind: "runtime",
+                      code: "dialog_cleanup_failed",
+                    },
+                  }
+                : {}),
+            });
+          },
+        }),
+      );
+      const client = new Nexus().configure(
+        usingNodeIpcClient({
+          appId: "cleanup-test",
+          resolveAddress: () => ({ kind: "path", path: socket }),
+          configure: false,
+        }),
+      );
+      await client.ready();
+      const connection = await client.connect({
+        target: { context: "node-ipc-daemon", appId: "mpctl", instance: "default" },
+      });
+      const prototype = Object.getPrototypeOf(connection);
+      const original = prototype.disconnect;
+      const disconnect = spyOn(prototype, "disconnect").mockImplementation(
+        function (this: import("@nexus-js/core").Connection) {
+          original.call(this);
+          throw new Error("private cleanup");
+        },
+      );
+      const previous = process.env.MPCTL_BROKER_SOCKET;
+      process.env.MPCTL_BROKER_SOCKET = socket;
+      try {
+        const result = await withConnection(({ workspace }) =>
+          workspace.setArticleCover({
+            article: "ref",
+            asset: "asset",
+            expectedCoverHash: "0".repeat(64),
+            operationId: `op:${fixtureLedgerId}:${crypto.randomUUID()}`,
+          }),
+        );
+        expect(result.isOk()).toBe(true);
+        if (result.isOk())
+          expect(result.value).toMatchObject({
+            snapshot: {
+              result: {
+                status: "error",
+                error: {
+                  code: "content_conflict",
+                  cause: { at: "content.preflight", kind: "domain", code: "content_conflict" },
+                  ...(mode === "first-cleanup"
+                    ? {
+                        cleanup: {
+                          at: "content.cover_cleanup",
+                          kind: "runtime",
+                          code: "dialog_cleanup_failed",
+                        },
+                      }
+                    : {}),
+                },
+              },
+            },
+            issue: {
+              failure: {
+                code: "cleanup_failed",
+                cause: { at: "cli.cleanup", kind: "runtime", code: "broker_disconnect_failed" },
+              },
+            },
+          });
+      } finally {
+        disconnect.mockRestore();
+        connection.disconnect();
+        if (previous === undefined) delete process.env.MPCTL_BROKER_SOCKET;
+        else process.env.MPCTL_BROKER_SOCKET = previous;
+      }
+    },
+  );
+  test.each(["body", "cover", "save", "read"] as const)(
+    "W2 %s real remote exception keeps observed boundary cause",
+    async (operation) => {
+      const directory = await tempDir();
+      const socket = path.join(directory, "cause-seam.sock");
+      activeServers.push(
+        await startProvider(socket, {
+          async writeBody() {
+            throw new Error("private");
+          },
+          async setArticleCover() {
+            throw new Error("private");
+          },
+          async saveArticle() {
+            throw new Error("private");
+          },
+          async readBody() {
+            throw new Error("private");
+          },
+        }),
+      );
+      const previous = process.env.MPCTL_BROKER_SOCKET;
+      process.env.MPCTL_BROKER_SOCKET = socket;
+      try {
+        const result = await withConnection<unknown>(({ workspace }) =>
+          operation === "body"
+            ? workspace.writeBody({
+                article: "ref",
+                html: "next",
+                expectedHash: "0".repeat(64),
+                operationId: `op:${crypto.randomUUID()}:${crypto.randomUUID()}`,
+              })
+            : operation === "cover"
+              ? workspace.setArticleCover({
+                  article: "ref",
+                  asset: "asset",
+                  expectedCoverHash: "0".repeat(64),
+                  operationId: `op:${fixtureLedgerId}:${crypto.randomUUID()}`,
+                })
+              : operation === "save"
+                ? workspace.saveArticle({
+                    article: "ref",
+                    expectedBodyHash: "0".repeat(64),
+                    expectedFieldsHash: "0".repeat(64),
+                    expectedCoverHash: "0".repeat(64),
+                    operationId: `op:${fixtureLedgerId}:${crypto.randomUUID()}`,
+                  })
+                : workspace.readBody("ref"),
+        );
+        expect(result.isErr()).toBe(true);
+        if (result.isOk()) return;
+        const detail =
+          operation !== "read"
+            ? result.error.details?.issue?.failure.cause
+            : result.error.details?.readFailure;
+        expect(detail).toMatchObject(
+          operation !== "read"
+            ? { at: "cli.call", kind: "nexus", code: "E_REMOTE_EXCEPTION" }
+            : {
+                stage: "workspace_call",
+                kind: "nexus",
+                causeCode: "E_REMOTE_EXCEPTION",
+                ...(operation === "read" ? {} : { outcome: "unknown" }),
+              },
+        );
+        if (operation === "read") expect(detail).not.toHaveProperty("outcome");
+      } finally {
+        if (previous === undefined) delete process.env.MPCTL_BROKER_SOCKET;
+        else process.env.MPCTL_BROKER_SOCKET = previous;
+      }
+    },
+  );
+  test.each(["remote", "provider"] as const)(
+    "W2 typed field boundary %s retains cause and observed facts",
+    async (mode) => {
+      const directory = await tempDir();
+      const socket = path.join(directory, "field-seam.sock");
+      activeServers.push(
+        await startProvider(socket, {
+          async updateArticleFields() {
+            if (mode === "remote") throw new Error("private remote error");
+            return Result.err({
+              code: "field_update_unknown",
+              cause: { at: "content.field_edit", kind: "runtime", code: "field_setter_failed" },
+              effect: {
+                outcome: "partial",
+                requested: ["title", "author", "summary"],
+                attempted: ["title", "author"],
+                confirmed: ["title"],
+                unknown: ["author"],
+              },
+            });
+          },
+        }),
+      );
+      const previous = process.env.MPCTL_BROKER_SOCKET;
+      process.env.MPCTL_BROKER_SOCKET = socket;
+      try {
+        const result = await withConnection(({ workspace }) =>
+          workspace.updateArticleFields({
+            operationId: createOperationId(fixtureLedgerId),
+            article: "ref",
+            fields: { title: "new", author: "new", summary: "never attempted" },
+            expectedHash: "0".repeat(64),
+          }),
+        );
+        if (mode === "remote") {
+          expect(result.isErr()).toBe(true);
+          if (result.isErr())
+            expect(result.error.details?.issue?.failure.cause).toMatchObject({
+              at: "cli.call",
+              kind: "nexus",
+              code: "E_REMOTE_EXCEPTION",
+            });
+        } else {
+          expect(result.isOk()).toBe(true);
+          if (result.isOk())
+            expect(result.value.snapshot).toMatchObject({
+              effect: { confirmed: ["title"], unknown: ["author"] },
+              result: { status: "error", error: { cause: { code: "field_setter_failed" } } },
+            });
+        }
+      } finally {
+        if (previous === undefined) delete process.env.MPCTL_BROKER_SOCKET;
+        else process.env.MPCTL_BROKER_SOCKET = previous;
+      }
+    },
+  );
+  test.each([
+    "missing-broker",
+    "missing-extension",
+    "empty-broker",
+    "empty-extension",
+    "wrong-broker",
+    "wrong-extension",
+    "matched",
+  ])("W2 exact metadata admission: %s before workspace acquisition/callback", async (mode) => {
+    const directory = await tempDir();
+    const socket = path.join(directory, "admission.sock");
+    let callbacks = 0;
+    activeServers.push(
+      await startProvider(
+        socket,
+        {},
+        {
+          async getStatus() {
+            return Result.ok({
+              connected: true,
+              ledgerId: fixtureLedgerId,
+              keyLedgerId: fixtureLedgerId,
+              ...(mode === "missing-broker"
+                ? {}
+                : {
+                    brokerVersion:
+                      mode === "empty-broker"
+                        ? ""
+                        : mode === "wrong-broker"
+                          ? "0.9.0"
+                          : protocolVersion,
+                  }),
+              ...(mode === "missing-extension"
+                ? {}
+                : {
+                    extensionVersion:
+                      mode === "empty-extension"
+                        ? ""
+                        : mode === "wrong-extension"
+                          ? "0.9.0"
+                          : protocolVersion,
+                  }),
+            });
+          },
+        },
+      ),
+    );
+    const previous = process.env.MPCTL_BROKER_SOCKET;
+    process.env.MPCTL_BROKER_SOCKET = socket;
+    const probe = new Nexus().configure(
+      usingNodeIpcClient({
+        appId: "admission-probe",
+        resolveAddress: () => ({ kind: "path", path: socket }),
+        configure: false,
+      }),
+    );
+    await probe.ready();
+    const probeConnection = await probe.connect({
+      target: { context: "node-ipc-daemon", appId: "mpctl", instance: "default" },
+    });
+    const prototype = Object.getPrototypeOf(probeConnection);
+    const originalGet = prototype.safeGet;
+    let workspaceAcquisitions = 0;
+    const acquisition = spyOn(prototype, "safeGet").mockImplementation(function (
+      this: import("@nexus-js/core").Connection,
+      token: Parameters<import("@nexus-js/core").Connection["safeGet"]>[0],
+      options: Parameters<import("@nexus-js/core").Connection["safeGet"]>[1],
+    ) {
+      if (token === workspaceToken) workspaceAcquisitions++;
+      return originalGet.call(this, token, options);
+    });
+    try {
+      const result = await withConnection(async () => {
+        callbacks++;
+        return Result.ok("called");
+      });
+      if (mode === "matched") expect(result).toEqual(Result.ok("called"));
+      else
+        expect(Result.isError(result) && result.error.details).toMatchObject({
+          connectionFailure: {
+            action: "connect",
+            stage: "version_check",
+            kind: "protocol",
+            causeCode: "version_mismatch",
+          },
+        });
+      expect(callbacks).toBe(mode === "matched" ? 1 : 0);
+      expect(workspaceAcquisitions).toBe(mode === "matched" ? 1 : 0);
+    } finally {
+      acquisition.mockRestore();
+      probeConnection.disconnect();
+      if (previous === undefined) delete process.env.MPCTL_BROKER_SOCKET;
+      else process.env.MPCTL_BROKER_SOCKET = previous;
+    }
+  });
+  test.each(["asset_ambiguous", "asset_upload_unknown", "known-created"] as const)(
+    "R3 legacy %s upload preserves received domain evidence",
+    async (mode) => {
+      const directory = await tempDir();
+      const socket = path.join(directory, "legacy.sock");
+      const file = path.join(directory, "legacy.png");
+      await writeFile(file, Uint8Array.from([137, 80, 78, 71, 13, 10, 26, 10]));
+      let calls = 0;
+      activeServers.push(
+        await startProvider(
+          socket,
+          {
+            async uploadAsset() {
+              calls++;
+              return Result.err(
+                mode === "known-created"
+                  ? {
+                      code: "asset_upload_unknown",
+                      effect: {
+                        outcome: "confirmed",
+                        filename: "legacy.png",
+                        thumbnailUrl: "https://mmbiz.qpic.cn/test/300",
+                      },
+                    }
+                  : { code: mode },
+              );
+            },
+          },
+          {
+            async getStatus() {
+              return Result.ok({
+                connected: true,
+                brokerVersion: protocolVersion,
+                extensionVersion: protocolVersion,
+                ledgerId: fixtureLedgerId,
+                keyLedgerId: fixtureLedgerId,
+              });
+            },
+          },
+        ),
+      );
+      const result = await runCli(["asset", "upload", "ref", "--file", file], socket);
+      expect(JSON.parse(result.stderr.trim().split("\n").at(-1)!).error).toMatchObject({
+        code: mode === "known-created" ? "asset_upload_unknown" : mode,
+        snapshot: {
+          operation: "upload",
+          effect: { outcome: mode === "known-created" ? "confirmed" : "unknown" },
+        },
+      });
+      expect(calls).toBe(1);
+    },
+  );
+
+  test.each(["malformed", "remote", "missing-status", "missing-workspace"] as const)(
+    "R3 %s status/acquisition failure never dispatches upload",
+    async (mode) => {
+      const directory = await tempDir();
+      const socket = path.join(directory, "status.sock");
+      const file = path.join(directory, "input.png");
+      await writeFile(file, Uint8Array.from([137, 80, 78, 71, 13, 10, 26, 10]));
+      let calls = 0;
+      const config = usingNodeIpcDaemon({
+        appId: "mpctl",
+        address: { kind: "path", path: socket },
+        configure: false,
+        providers: [
+          ...(mode === "missing-status"
+            ? []
+            : [
+                {
+                  token: connectionToken,
+                  service: {
+                    async getStatus() {
+                      if (mode === "remote") throw new Error("private provider exception");
+                      if (mode === "malformed")
+                        return { status: "ok", value: { connected: "bad" } } as never;
+                      return encodeResult(
+                        connectionStatusResultCodec,
+                        Result.ok({
+                          connected: true,
+                          brokerVersion: protocolVersion,
+                          extensionVersion: protocolVersion,
+                          ledgerId: fixtureLedgerId,
+                          keyLedgerId: fixtureLedgerId,
+                        }),
+                      );
+                    },
+                  },
+                },
+              ]),
+          ...(mode === "missing-workspace"
+            ? []
+            : [
+                {
+                  token: workspaceToken,
+                  service: encodeWorkspaceProvider({
+                    async uploadAsset() {
+                      calls++;
+                      return Result.err({ code: "asset_ambiguous" });
+                    },
+                  }),
+                },
+              ]),
+        ],
+      });
+      const provider = new Nexus().configure(config);
+      await provider.ready();
+      activeServers.push({
+        dispose: () => (config.endpoint!.implementation as UnixSocketServerEndpoint).close(),
+      });
+      const result = await runCli(["asset", "upload", "ref", "--file", file], socket);
+      expect(JSON.parse(result.stderr).error.code).toBe(
+        mode === "malformed"
+          ? "invalid_result_envelope"
+          : mode === "remote"
+            ? "E_REMOTE_EXCEPTION"
+            : "E_SERVICE_UNAVAILABLE",
+      );
+      if (mode !== "missing-workspace")
+        expect(JSON.parse(result.stderr).error.connectionFailure).toMatchObject({
+          action: "status",
+          stage:
+            mode === "missing-status"
+              ? "status_acquire"
+              : mode === "malformed"
+                ? "status_decode"
+                : "status_call",
+          kind: mode === "malformed" ? "protocol" : "nexus",
+          causeCode:
+            mode === "malformed"
+              ? "invalid_result_envelope"
+              : mode === "remote"
+                ? "E_REMOTE_EXCEPTION"
+                : "E_SERVICE_UNAVAILABLE",
+        });
+      expect(calls).toBe(0);
+    },
+  );
+
+  test.each(["success", "error", "status-error"] as const)(
+    "R3 actual broker disconnect failure after %s preserves effect and first error",
+    async (mode) => {
+      const directory = await tempDir();
+      const socket = path.join(directory, "cleanup.sock");
+      const file = path.join(directory, "cleanup.png");
+      await writeFile(file, Uint8Array.from([137, 80, 78, 71, 13, 10, 26, 10]));
+      let calls = 0;
+      activeServers.push(
+        await startProvider(
+          socket,
+          {
+            async uploadAsset() {
+              calls++;
+              return mode === "success"
+                ? Result.ok({ asset: "asset-ref", filename: "cleanup.png" })
+                : Result.err({
+                    code: "asset_upload_unknown",
+                    effect: {
+                      outcome: "confirmed",
+                      filename: "cleanup.png",
+                      thumbnailUrl: "https://mmbiz.qpic.cn/test/300",
+                    },
+                    cause: { at: "bg.preflight", kind: "nexus", code: "E_CONN_CLOSED" },
+                  });
+            },
+          },
+          {
+            async getStatus() {
+              if (mode === "status-error") throw new Error("private status failure");
+              return Result.ok({
+                connected: true,
+                brokerVersion: protocolVersion,
+                extensionVersion: protocolVersion,
+                ledgerId: fixtureLedgerId,
+                keyLedgerId: fixtureLedgerId,
+              });
+            },
+          },
+        ),
+      );
+      const client = new Nexus().configure(
+        usingNodeIpcClient({
+          appId: "cleanup-fixture",
+          configure: false,
+          resolveAddress: () => ({ kind: "path", path: socket }),
+        }),
+      );
+      await client.ready();
+      const acquired = await client.safeConnect({
+        target: { context: "node-ipc-daemon", appId: "mpctl", instance: "default" },
+      });
+      if (Result.isError(acquired)) throw acquired.error;
+      const prototype = Object.getPrototypeOf(acquired.value);
+      const original = prototype.disconnect;
+      const disconnect = spyOn(prototype, "disconnect").mockImplementation(
+        function (this: import("@nexus-js/core").Connection) {
+          original.call(this);
+          throw new Error("private disconnect failure");
+        },
+      );
+      const previous = process.env.MPCTL_BROKER_SOCKET;
+      process.env.MPCTL_BROKER_SOCKET = socket;
+      try {
+        const result = await assetCommand("upload", "ref", { file });
+        expect(Result.isError(result)).toBe(true);
+        if (Result.isError(result))
+          expect(result.error).toMatchObject({
+            code:
+              mode === "success"
+                ? "cleanup_failed"
+                : mode === "status-error"
+                  ? "E_REMOTE_EXCEPTION"
+                  : "asset_upload_unknown",
+            details:
+              mode === "status-error"
+                ? { cleanupFailed: true }
+                : {
+                    snapshot: { effect: { outcome: "confirmed" } },
+                    issue: {
+                      failure: { cause: { at: "cli.cleanup", code: "broker_disconnect_failed" } },
+                    },
+                  },
+          });
+        expect(calls).toBe(mode === "status-error" ? 0 : 1);
+      } finally {
+        disconnect.mockRestore();
+        acquired.value.disconnect();
+        if (previous === undefined) delete process.env.MPCTL_BROKER_SOCKET;
+        else process.env.MPCTL_BROKER_SOCKET = previous;
+      }
+    },
+  );
+  test("asset upload rejects invalid local image bytes without starting a broker", async () => {
+    const directory = await tempDir();
+    const socket = path.join(directory, "must-not-connect.sock");
+    const file = path.join(directory, "not-image.png");
+    await writeFile(file, "not an image");
+    const result = await runCli(["asset", "upload", "article-ref", "--file", file], socket);
+    expect(result.exitCode).toBe(1);
+    expect(JSON.parse(result.stderr).error.code).toBe("invalid_asset");
+    expect(result.stderr).not.toContain("broker_start_failed");
+  });
+
+  test("article cover reads and sets only with complete flags; save returns native-confirmed unverified snapshot", async () => {
+    const directory = await tempDir();
+    const socket = path.join(directory, "article-actions.sock");
+    const calls: string[] = [];
+    const server = await startProvider(socket, {
+      async readArticleCover() {
+        calls.push("read-cover");
+        return Result.ok({ coverHash: "a".repeat(64) });
+      },
+      async setArticleCover(article, asset, hash) {
+        calls.push(`set:${article}:${asset}:${hash}`);
+        return Result.ok({ coverHash: "b".repeat(64) });
+      },
+      async saveArticle(article, body, fields, cover) {
+        calls.push(`save:${article}`);
+        expect([body, fields, cover]).toEqual(["a", "b", "c"].map((x) => x.repeat(64)));
+        return Result.ok({
+          article: "fresh-ref",
+          title: "Persisted title",
+          bodyHash: "d".repeat(64),
+        });
+      },
+    });
+    activeServers.push(server);
+    const read = await runCli(["article", "cover", "old-ref"], socket);
+    expect(JSON.parse(read.stdout)).toEqual({ coverHash: "a".repeat(64) });
+    const incomplete = await runCli(
+      ["article", "cover", "old-ref", "--asset", "asset-ref"],
+      socket,
+    );
+    expect(incomplete.exitCode).toBe(1);
+    expect(calls).toEqual(["read-cover"]);
+    const set = await runCli(
+      ["article", "cover", "old-ref", "--asset", "asset-ref", "--expected-hash", "a".repeat(64)],
+      socket,
+    );
+    expect(JSON.parse(set.stdout)).toMatchObject({
+      snapshot: {
+        operation: "cover",
+        state: "settled",
+        effect: { cover: true, outcome: "confirmed", coverHash: "b".repeat(64) },
+      },
+    });
+    const save = await runCli(
+      [
+        "article",
+        "save",
+        "old-ref",
+        "--expected-body-hash",
+        "a".repeat(64),
+        "--expected-fields-hash",
+        "b".repeat(64),
+        "--expected-cover-hash",
+        "c".repeat(64),
+      ],
+      socket,
+    );
+    expect(JSON.parse(save.stdout)).toMatchObject({
+      snapshot: {
+        operation: "save",
+        state: "settled",
+        effect: {
+          outcome: "confirmed",
+          persistence: "unverified",
+        },
+      },
+    });
+    expect(JSON.parse(save.stdout).snapshot.result.value).toEqual({});
+    expect(save.exitCode).toBe(0);
+    expect(set.stderr).toMatch(/^operation op:/);
+    expect(save.stderr).toMatch(/^operation op:/);
+    const beforeInvalid = [...calls];
+    for (const flags of [
+      ["--from-body", "0"],
+      ["--from-body", "1.5"],
+      ["--from-body", "1"],
+      ["--from-body", "1", "--asset", "asset-ref", "--expected-body-hash", "a".repeat(64)],
+      ["--expected-body-hash", "a".repeat(64)],
+    ]) {
+      expect(
+        (
+          await runCli(
+            ["article", "cover", "old-ref", ...flags, "--expected-hash", "a".repeat(64)],
+            socket,
+          )
+        ).exitCode,
+      ).toBe(1);
+    }
+    expect(calls).toEqual(beforeInvalid);
+    const bodyCover = await runCli(
+      [
+        "article",
+        "cover",
+        "old-ref",
+        "--from-body",
+        "1",
+        "--expected-body-hash",
+        "a".repeat(64),
+        "--expected-hash",
+        "a".repeat(64),
+      ],
+      socket,
+    );
+    expect(bodyCover.exitCode).toBe(0);
+    expect(JSON.parse(bodyCover.stdout).snapshot.operation).toBe("cover");
+    expect(calls.at(-1)).toBe(`set:old-ref:body:1:${"a".repeat(64)}`);
+  });
+
+  test("cover/save mutation IPC preserves known facts and maps lost replies to mutation unknown", async () => {
+    const directory = await tempDir();
+    const socket = path.join(directory, "article-mutation-errors.sock");
+    let mode: "facts" | "lost" | "malformed" = "facts";
+    const provider = await startProvider(socket, {
+      async setArticleCover() {
+        if (mode === "lost") throw new Error("fixture lost response after dispatch");
+        if (mode === "malformed") return Result.ok({ coverHash: "not-a-hash" } as never);
+        return Result.err({
+          code: "cover_update_unknown",
+          effect: { cover: true, outcome: "unknown", baselineHash: "a".repeat(64) },
+          cause: { at: "content.cover_confirm", kind: "domain", code: "confirmation_timeout" },
+          cleanup: { at: "content.cover_cleanup", kind: "domain", code: "cleanup_failed" },
+        });
+      },
+      async saveArticle() {
+        if (mode === "lost") throw new Error("fixture lost response after dispatch");
+        if (mode === "malformed")
+          return Result.err({
+            code: "save_unknown",
+            effect: { outcome: "confirmed", persistence: "bogus" },
+          } as never);
+        return Result.err({
+          code: "save_unknown",
+          effect: { outcome: "confirmed", persistence: "unverified" },
+          cause: { at: "bg.fresh_read", kind: "nexus", code: "E_CONN_CLOSED" },
+          cleanup: { at: "content.history_cleanup", kind: "domain", code: "cleanup_failed" },
+        });
+      },
+    });
+    activeServers.push(provider);
+    const coverArgs = [
+      "article",
+      "cover",
+      "article-ref",
+      "--asset",
+      "asset-ref",
+      "--expected-hash",
+      "a".repeat(64),
+    ];
+    const saveArgs = [
+      "article",
+      "save",
+      "article-ref",
+      "--expected-body-hash",
+      "a".repeat(64),
+      "--expected-fields-hash",
+      "b".repeat(64),
+      "--expected-cover-hash",
+      "c".repeat(64),
+    ];
+    const knownSave = await runCli(saveArgs, socket);
+    expect(knownSave.exitCode).toBe(1);
+    expect(JSON.parse(knownSave.stderr.trim().split("\n").at(-1)!).error).toMatchObject({
+      code: "save_unknown",
+      snapshot: {
+        effect: { outcome: "confirmed", persistence: "unverified" },
+        result: {
+          status: "error",
+          error: {
+            code: "save_unknown",
+            cause: { at: "bg.fresh_read", kind: "nexus", code: "E_CONN_CLOSED" },
+            cleanup: { at: "content.history_cleanup", kind: "domain", code: "cleanup_failed" },
+          },
+        },
+      },
+      instruction: expect.stringContaining("不要换键重做"),
+    });
+    const knownCover = await runCli(coverArgs, socket);
+    expect(knownCover.exitCode).toBe(1);
+    expect(JSON.parse(knownCover.stderr.trim().split("\n").at(-1)!).error).toMatchObject({
+      code: "cover_update_unknown",
+      snapshot: {
+        effect: { cover: true, outcome: "unknown", baselineHash: "a".repeat(64) },
+        result: {
+          status: "error",
+          error: {
+            cleanup: { at: "content.cover_cleanup", kind: "domain", code: "cleanup_failed" },
+          },
+        },
+      },
+      instruction: expect.stringContaining("不要换键重做"),
+    });
+
+    mode = "lost";
+    const lostSave = await runCli(saveArgs, socket);
+    expect(JSON.parse(lostSave.stderr.trim().split("\n").at(-1)!).error).toMatchObject({
+      code: "operation_unresolved",
+      issue: { failure: { cause: { at: "cli.call", kind: "nexus", code: "E_REMOTE_EXCEPTION" } } },
+      instruction: expect.stringContaining("不要换键重做"),
+    });
+    const lostCover = await runCli(coverArgs, socket);
+    expect(JSON.parse(lostCover.stderr.trim().split("\n").at(-1)!).error).toMatchObject({
+      code: "operation_unresolved",
+      issue: { failure: { cause: { at: "cli.call", kind: "nexus", code: "E_REMOTE_EXCEPTION" } } },
+      instruction: expect.stringContaining("不要换键重做"),
+    });
+
+    mode = "malformed";
+    expect(
+      JSON.parse((await runCli(saveArgs, socket)).stderr.trim().split("\n").at(-1)!).error.code,
+    ).toBe("invalid_result_envelope");
+    expect(
+      JSON.parse((await runCli(coverArgs, socket)).stderr.trim().split("\n").at(-1)!).error.code,
+    ).toBe("invalid_result_envelope");
+  });
+
+  test("asset upload crosses CLI Node IPC as Blob bytes plus independent filename and MIME", async () => {
+    const directory = await tempDir();
+    const socket = path.join(directory, "asset-upload.sock");
+    const file = path.join(directory, "original-name.png");
+    const bytes = Uint8Array.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 1, 2, 3]);
+    await writeFile(file, bytes);
+    const server = await startProvider(socket, {
+      async uploadAsset(article, payload) {
+        expect(article).toBe("article-ref");
+        expect(payload.filename).toBe("original-name.png");
+        expect(payload.mimeType).toBe("image/png");
+        expect(new Uint8Array(await payload.blob.arrayBuffer())).toEqual(bytes);
+        return Result.ok({
+          asset: "ephemeral:fixture",
+          filename: payload.filename,
+          thumbnailUrl: "https://mmbiz.qpic.cn/thumb/300",
+        });
+      },
+    });
+    activeServers.push(server);
+    const result = await runCli(["asset", "upload", "article-ref", "--file", file], socket);
+    expect(result.exitCode).toBe(0);
+    const reply = JSON.parse(result.stdout);
+    expect(result.stderr).toBe(`operation ${reply.snapshot.operationId}\n`);
+    expect(reply).toMatchObject({
+      snapshot: {
+        operation: "upload",
+        state: "settled",
+        effect: {
+          outcome: "confirmed",
+          filename: "original-name.png",
+          thumbnailUrl: "https://mmbiz.qpic.cn/thumb/300",
+        },
+      },
+    });
+    expect(reply.snapshot).not.toHaveProperty("asset");
+    expect(result.stdout).not.toContain(file);
+  });
+
+  test("asset list reports only the visible-page scope over CLI IPC", async () => {
+    const directory = await tempDir();
+    const socket = path.join(directory, "asset-list.sock");
+    const server = await startProvider(socket, {
+      async listAssets(article) {
+        expect(article).toBe("article-ref");
+        return Result.ok({
+          scope: "visible-page",
+          cards: [
+            {
+              asset: "ephemeral:visible-card",
+              filename: "visible.png",
+              thumbnailUrl: "https://mmbiz.qpic.cn/thumb/300",
+            },
+          ],
+        });
+      },
+    });
+    activeServers.push(server);
+    const result = await runCli(["asset", "list", "article-ref"], socket);
+    expect(result.exitCode).toBe(0);
+    expect(JSON.parse(result.stdout)).toEqual({
+      scope: "visible-page",
+      cards: [
+        {
+          asset: "ephemeral:visible-card",
+          filename: "visible.png",
+          thumbnailUrl: "https://mmbiz.qpic.cn/thumb/300",
+        },
+      ],
+    });
+  });
+
+  test("asset upload reports an uncertain dispatched outcome and never retries", async () => {
+    const directory = await tempDir();
+    const socket = path.join(directory, "asset-unknown.sock");
+    const file = path.join(directory, "uncertain.png");
+    await writeFile(file, Uint8Array.from([137, 80, 78, 71, 13, 10, 26, 10]));
+    let calls = 0;
+    const server = await startProvider(socket, {
+      async uploadAsset() {
+        calls++;
+        return Result.err({
+          code: "asset_upload_unknown",
+          cause: { at: "content.upload_confirm", kind: "domain", code: "snapshot_incomplete" },
+          cleanup: { at: "content.library_cleanup", kind: "domain", code: "cleanup_failed" },
+        });
+      },
+    });
+    activeServers.push(server);
+    const result = await runCli(["asset", "upload", "article-ref", "--file", file], socket);
+    expect(result.exitCode).toBe(1);
+    expect(calls).toBe(1);
+    expect(JSON.parse(result.stderr.trim().split("\n").at(-1)!).error).toMatchObject({
+      code: "asset_upload_unknown",
+      snapshot: {
+        effect: { outcome: "unknown" },
+        result: {
+          error: {
+            cause: { at: "content.upload_confirm", kind: "domain", code: "snapshot_incomplete" },
+            cleanup: { at: "content.library_cleanup", kind: "domain", code: "cleanup_failed" },
+          },
+        },
+      },
+    });
+  });
+
+  test("validates title and malformed field JSON before starting or connecting to a broker", async () => {
+    const directory = await tempDir();
+    const socket = path.join(directory, "must-not-connect.sock");
+    const fields = path.join(directory, "fields.json");
+    await writeFile(fields, JSON.stringify({ title: "x".repeat(65) }));
+    const result = await runCli(
+      ["article", "update", "article-ref", "--fields", fields, "--expected-hash", "a".repeat(64)],
+      socket,
+    );
+    expect(result.exitCode).toBe(1);
+    expect(JSON.parse(result.stderr).error.code).toBe("invalid_fields");
+    expect(result.stderr).not.toContain("broker_start_failed");
+  });
+
+  test("upload preserves Nexus remote exceptions separately from malformed business envelopes", async () => {
+    const directory = await tempDir();
+    const socket = path.join(directory, "upload-errors.sock");
+    const file = path.join(directory, "input.png");
+    await writeFile(file, Uint8Array.from([137, 80, 78, 71, 13, 10, 26, 10]));
+    let mode: "throw" | "malformed" = "throw";
+    let calls = 0;
+    const provider = await startProvider(socket, {
+      async uploadAsset() {
+        calls++;
+        if (mode === "throw") throw new Error("private-url-secret-must-not-escape");
+        return Result.ok({ asset: "test", filename: "input.png", unexpected: true } as never);
+      },
+    });
+    activeServers.push(provider);
+    const thrown = await runCli(["asset", "upload", "ref", "--file", file], socket);
+    expect(JSON.parse(thrown.stderr.trim().split("\n").at(-1)!).error.issue.failure.cause).toEqual({
+      at: "cli.call",
+      kind: "nexus",
+      code: "E_REMOTE_EXCEPTION",
+    });
+    expect(thrown.stderr).not.toContain("private-url-secret");
+    expect(calls).toBe(1);
+    mode = "malformed";
+    const malformed = await runCli(["asset", "upload", "ref", "--file", file], socket);
+    expect(JSON.parse(malformed.stderr.trim().split("\n").at(-1)!).error.issue.failure.code).toBe(
+      "invalid_result_envelope",
+    );
+    expect(calls).toBe(2);
+  });
+
+  test("upload's local validation identifies file_read and never reaches a provider", async () => {
+    const directory = await tempDir();
+    const socket = path.join(directory, "upload-no-call.sock");
+    let calls = 0;
+    const provider = await startProvider(socket, {
+      async uploadAsset() {
+        calls++;
+        throw new Error("must not execute");
+      },
+    });
+    activeServers.push(provider);
+    const failed = await runCli(
+      ["asset", "upload", "ref", "--file", path.join(directory, "missing.png")],
+      socket,
+    );
+    expect(failed.exitCode).toBe(1);
+    expect(JSON.parse(failed.stderr).error.failure.cause).toEqual({
+      at: "cli.file_read",
+      kind: "runtime",
+      code: "file_error",
+    });
+    expect(calls).toBe(0);
+  });
+
+  test("field update returns only fieldsHash and preserves partial-result facts", async () => {
+    const directory = await tempDir();
+    const socket = path.join(directory, "update.sock");
+    const fields = path.join(directory, "fields.json");
+    await writeFile(fields, JSON.stringify({ summary: "更新" }));
+    const server = await startProvider(socket, {
+      async updateArticleFields(article, input, hash) {
+        expect([article, input, hash]).toEqual([
+          "article-ref",
+          { summary: "更新" },
+          "a".repeat(64),
+        ]);
+        return Result.ok({ fieldsHash: "b".repeat(64) });
+      },
+    });
+    activeServers.push(server);
+    const result = await runCli(
+      ["article", "update", "article-ref", "--fields", fields, "--expected-hash", "a".repeat(64)],
+      socket,
+    );
+    expect(result.exitCode).toBe(0);
+    expect(JSON.parse(result.stdout)).toMatchObject({
+      snapshot: {
+        operation: "fields",
+        state: "settled",
+        effect: {
+          fieldsHash: "b".repeat(64),
+          requested: ["summary"],
+          attempted: ["summary"],
+          confirmed: ["summary"],
+          unknown: [],
+        },
+      },
+    });
+    expect(result.stderr).toBe(`operation ${JSON.parse(result.stdout).snapshot.operationId}\n`);
+  });
+  test("article check crosses real CLI IPC and returns exactly bounded issue arrays", async () => {
+    const directory = await tempDir();
+    const socket = path.join(directory, "check.sock");
+    const issues: import("@mpctl/contracts").ArticleCheckResult = {
+      errors: ["title_empty"],
+      warnings: ["cover_unchecked"],
+    };
+    const server = await startProvider(socket, {
+      async checkArticle(article) {
+        expect(article).toBe("article-ref");
+        return Result.ok(issues);
+      },
+    });
+    activeServers.push(server);
+    const checked = await runCli(["article", "check", "article-ref"], socket);
+    expect(checked).toEqual({ exitCode: 0, stdout: `${JSON.stringify(issues)}\n`, stderr: "" });
+    expect(Object.keys(JSON.parse(checked.stdout))).toEqual(["errors", "warnings"]);
+  });
+  test("unknown check errors are not retried", async () => {
+    const directory = await tempDir();
+    const socket = path.join(directory, "check-error.sock");
+    let calls = 0;
+    const server = await startProvider(socket, {
+      async checkArticle() {
+        calls++;
+        return Result.err({ code: "target_unavailable" });
+      },
+    });
+    activeServers.push(server);
+    const checked = await runCli(["article", "check", "article-ref"], socket);
+    expect(checked.exitCode).toBe(1);
+    expect(JSON.parse(checked.stderr).error).toEqual({ code: "target_unavailable" });
+    expect(calls).toBe(1);
+  });
+  test("field update unknown errors preserve only unique bounded field names and do not retry", async () => {
+    const directory = await tempDir();
+    const socket = path.join(directory, "update-unknown.sock");
+    const fields = path.join(directory, "fields-unknown.json");
+    await writeFile(fields, JSON.stringify({ author: "New" }));
+    let calls = 0;
+    const server = await startProvider(socket, {
+      async updateArticleFields() {
+        calls++;
+        return Result.err({
+          code: "field_update_unknown",
+          effect: {
+            outcome: "unknown",
+            requested: ["author"],
+            attempted: ["author"],
+            confirmed: [],
+            unknown: ["author"],
+          },
+        });
+      },
+    });
+    activeServers.push(server);
+    const result = await runCli(
+      ["article", "update", "article-ref", "--fields", fields, "--expected-hash", "a".repeat(64)],
+      socket,
+    );
+    expect(result.exitCode).toBe(1);
+    expect(JSON.parse(result.stderr.split("\n").slice(1).join("\n")).error).toMatchObject({
+      code: "field_update_unknown",
+      snapshot: { operation: "fields", effect: { confirmed: [], unknown: ["author"] } },
+    });
+    expect(calls).toBe(1);
+  });
+  test("inspect returns exactly the fields-only snapshot through broker IPC", async () => {
+    const directory = await tempDir();
+    const socket = path.join(directory, "inspect.sock");
+    const fields = { title: " 标题 ", author: "作者", summary: "", fieldsHash: "a".repeat(64) };
+    const server = await startProvider(socket, {
+      async inspectArticle(article) {
+        expect(article).toBe("article-ref");
+        return Result.ok(fields);
+      },
+    });
+    activeServers.push(server);
+    const result = await runCli(["article", "inspect", "article-ref"], socket);
+    expect(result).toEqual({ exitCode: 0, stdout: `${JSON.stringify(fields)}\n`, stderr: "" });
+    expect(Object.keys(JSON.parse(result.stdout))).toEqual([
+      "title",
+      "author",
+      "summary",
+      "fieldsHash",
+    ]);
+  });
+  test("inspect preserves failure codes and only suggests a new reference for an unavailable target", async () => {
+    const directory = await tempDir();
+    const socket = path.join(directory, "inspect-failures.sock");
+    const server = await startProvider(socket, {
+      async inspectArticle(article) {
+        if (article === "locked-out") return Result.err({ code: "not_logged_in" });
+        if (article === "broken-page") return Result.err({ code: "page_failed" });
+        return Result.err({ code: "target_unavailable", stage: "target_not_ready" });
+      },
+    });
+    activeServers.push(server);
+
+    for (const [article, code] of [
+      ["locked-out", "not_logged_in"],
+      ["broken-page", "page_failed"],
+      ["stale-ref", "target_unavailable"],
+    ] as const) {
+      const result = await runCli(["article", "inspect", article], socket);
+      expect(result.exitCode).toBe(1);
+      expect(result.stdout).toBe("");
+      const error = JSON.parse(result.stderr).error;
+      expect(error.code).toBe(code);
+      if (code === "target_unavailable") {
+        expect(error.instruction).toBe(
+          "用 article current 获取新引用，或 list → open 指定已有稿。",
+        );
+        expect(error.stage).toBe("target_not_ready");
+      } else {
+        expect(error.stage).toBeUndefined();
+        expect(error.instruction).toBe(
+          code === "not_logged_in" ? "在浏览器中登录公众号." : undefined,
+        );
+      }
+      expect(
+        Object.keys(error).every((key) => ["code", "instruction", "stage"].includes(key)),
+      ).toBe(true);
+    }
+  });
   test("classifies ownership when the nonce arrives at the readiness boundary", () => {
     expect(ownsStartupBroker(true, undefined)).toBe(true);
     expect(ownsStartupBroker(false, undefined)).toBe(false);
@@ -119,14 +1694,19 @@ describe("CLI over Nexus Node IPC", () => {
     expect(JSON.parse(listed.stdout)).toEqual({
       articles: [{ candidate: "候选 A", title: "雨后" }],
     });
-    expect(await runCli(["article", "open", "候选 A"], socket)).toMatchObject({
-      exitCode: 0,
-      stdout: `${JSON.stringify({ article: "opened-1", bodyHash })}\n`,
-    });
-    expect(await runCli(["article", "new"], socket)).toMatchObject({
-      exitCode: 0,
-      stdout: `${JSON.stringify({ article: "new-1", bodyHash })}\n`,
-    });
+    for (const args of [
+      ["article", "open", "候选 A"],
+      ["article", "new"],
+    ]) {
+      const navigation = await runCli(args, socket);
+      expect(navigation.exitCode).toBe(0);
+      expect(JSON.parse(navigation.stdout).snapshot.effect).toMatchObject({
+        navigation: true,
+        outcome: "confirmed",
+        bodyHash,
+      });
+      expect(JSON.parse(navigation.stdout).snapshot.result.value).toEqual({});
+    }
 
     const pulled = await runCli(["article", "pull", "a-1", "--body", articleFile], socket);
     expect(pulled.exitCode).toBe(0);
@@ -139,7 +1719,13 @@ describe("CLI over Nexus Node IPC", () => {
       socket,
     );
     expect(pushedEmpty.exitCode).toBe(0);
-    expect(JSON.parse(pushedEmpty.stdout)).toEqual({ bodyHash });
+    expect(JSON.parse(pushedEmpty.stdout)).toMatchObject({
+      snapshot: {
+        state: "settled",
+        effect: { outcome: "confirmed", bodyHash },
+        result: { status: "ok" },
+      },
+    });
     expect(pushed).toEqual({ article: "a-1", html: "", expectedHash: bodyHash });
     expect(await readFile(articleFile, "utf8")).toBe("");
 
@@ -184,18 +1770,22 @@ describe("CLI over Nexus Node IPC", () => {
 
     const created = await runCli(["article", "new"], socket);
     expect(created.exitCode).toBe(0);
-    expect(JSON.parse(created.stdout)).toEqual({
-      article: "opaque-new-article",
-      bodyHash: "0".repeat(64),
+    expect(JSON.parse(created.stdout).snapshot).toMatchObject({
+      operation: "new",
+      state: "settled",
+      effect: { bodyHash: "0".repeat(64) },
+      result: { status: "ok", value: {} },
     });
-    expect(created.stderr).toBe("");
+    expect(created.stderr).toBe(`operation ${JSON.parse(created.stdout).snapshot.operationId}\n`);
     const opened = await runCli(["article", "open", "candidate-1"], socket);
     expect(opened.exitCode).toBe(0);
-    expect(JSON.parse(opened.stdout)).toEqual({
-      article: "opaque-saved-article",
-      bodyHash: "0".repeat(64),
+    expect(JSON.parse(opened.stdout).snapshot).toMatchObject({
+      operation: "open",
+      state: "settled",
+      effect: { bodyHash: "0".repeat(64) },
+      result: { status: "ok", value: {} },
     });
-    expect(opened.stderr).toBe("");
+    expect(opened.stderr).toBe(`operation ${JSON.parse(opened.stdout).snapshot.operationId}\n`);
     expect(calls).toEqual(["newArticle", { openArticle: "candidate-1" }]);
   });
 
@@ -211,7 +1801,9 @@ describe("CLI over Nexus Node IPC", () => {
 
     const result = await runCli(["article", "new"], socket);
     expect(result.exitCode).not.toBe(0);
-    expect(JSON.parse(result.stderr).error.code).toBe("target_unavailable");
+    expect(JSON.parse(result.stderr.trim().split("\n").at(-1)!).error.code).toBe(
+      "target_unavailable",
+    );
     expect(result.stderr).not.toContain("url");
   });
 
@@ -243,6 +1835,12 @@ describe("CLI over Nexus Node IPC", () => {
       ["article", "current", "--help"],
       ["article", "pull", "--help"],
       ["article", "push", "--help"],
+      ["operation", "status", "--help"],
+      ["article", "check", "--help"],
+      ["article", "save", "--help"],
+      ["asset", "--help"],
+      ["asset", "list", "--help"],
+      ["asset", "upload", "--help"],
       ["status", "--help"],
       ["connect", "--help"],
       ["broker"],
@@ -263,6 +1861,83 @@ describe("CLI over Nexus Node IPC", () => {
     expect(existsSync(socket)).toBe(false);
   }, 15_000);
 
+  test("article help groups field inspection separately and documents the supported field contract", async () => {
+    const directory = await tempDir();
+    const socket = path.join(directory, "help-must-not-start.sock");
+    const root = await runCli(["--help"], socket);
+    const articleHelp = await runCli(["article", "--help"], socket);
+    const inspectHelp = await runCli(["article", "inspect", "--help"], socket);
+    const updateHelp = await runCli(["article", "update", "--help"], socket);
+    const checkHelp = await runCli(["article", "check", "--help"], socket);
+    const saveHelp = await runCli(["article", "save", "--help"], socket);
+
+    expect(root.exitCode).toBe(0);
+    expect(root.stdout).toContain("本地 HTML 文件");
+    expect(root.stdout).toContain("作者和摘要");
+    expect(root.stderr).toBe("");
+    expect(articleHelp.exitCode).toBe(0);
+    expect(articleHelp.stdout).toContain("选择文章：");
+    expect(articleHelp.stdout).toContain("正文文件：");
+    expect(articleHelp.stdout).toContain("文章字段：");
+    expect(articleHelp.stdout.indexOf("文章字段：")).toBeLessThan(
+      articleHelp.stdout.indexOf("选择文章："),
+    );
+    const fieldCommands = articleHelp.stdout.split("文章字段：")[1]!.split("选择文章：")[0]!;
+    const selectionCommands = articleHelp.stdout.split("选择文章：")[1]!.split("正文文件：")[0]!;
+    expect(fieldCommands).toContain("inspect <article>");
+    expect(fieldCommands).toContain("update [options] <article>");
+    expect(selectionCommands).not.toMatch(/^\s+inspect\b/m);
+    expect(selectionCommands).not.toMatch(/^\s+update\b/m);
+    expect(selectionCommands).toContain("list");
+    expect(selectionCommands).toContain("open");
+    expect(selectionCommands).toContain("new");
+    expect(selectionCommands).toContain("current");
+    for (const result of [articleHelp, inspectHelp, updateHelp, checkHelp, saveHelp]) {
+      expect(result.exitCode).toBe(0);
+      expect(result.stderr).toBe("");
+    }
+    expect(inspectHelp.stdout).toContain("title、author、summary");
+    expect(inspectHelp.stdout).toContain("Usage: mpctl article inspect [options] <article>");
+    expect(inspectHelp.stdout).toContain("仅基于这三个原始字段的 fieldsHash");
+    expect(inspectHelp.stdout).toContain("不读取正文、封面或其他设置，也不写入页面");
+    expect(updateHelp.stdout).toContain("title（最多 64 个 UTF-16 单元）");
+    expect(updateHelp.stdout).toContain("title 清空后的镜像读取可能为换行");
+    expect(updateHelp.stdout).toContain("fieldsHash");
+    expect(updateHelp.stdout).toContain("Usage: mpctl article update [options] <article>");
+    expect(updateHelp.stdout).toContain("--fields <json-file>");
+    expect(updateHelp.stdout).toContain("--expected-hash <fieldsHash>");
+    expect(updateHelp.stdout).toContain("支持 title（最多 64 个 UTF-16 单元）");
+    expect(updateHelp.stdout).toContain("author（最多 8 个）与 summary（最多 120 个）");
+    expect(updateHelp.stdout).toContain("不保存或发表");
+    expect(checkHelp.stdout).toContain("只返回精确的 errors 与 warnings 数组");
+    expect(checkHelp.stdout).toContain("不会保存、聚焦页面或派发修改");
+    expect(saveHelp.stdout).toContain("bodyHash 来自已读正文，不是修改后本地文件的 hash");
+    expect(saveHelp.stdout).toContain("fieldsHash 来自 article inspect");
+    expect(saveHelp.stdout).toContain("coverHash 来自 article cover 只读结果");
+    expect(saveHelp.stdout).toContain("不刷新草稿列表、不重载编辑页、不做独立云端重开验收");
+    expect(saveHelp.stdout).toContain("persistence 为 unverified，不代表平台级准备就绪");
+    expect(existsSync(socket)).toBe(false);
+  });
+
+  test("asset help discloses visible-page handles and upload uncertainty without starting a broker", async () => {
+    const directory = await tempDir();
+    const socket = path.join(directory, "asset-help-no-broker.sock");
+    const listed = await runCli(["asset", "list", "--help"], socket);
+    const uploaded = await runCli(["asset", "upload", "--help"], socket);
+    for (const result of [listed, uploaded]) {
+      expect(result.exitCode).toBe(0);
+      expect(result.stderr).toBe("");
+    }
+    expect(listed.stdout).toContain("visible-page");
+    expect(listed.stdout).toContain("临时句柄");
+    expect(listed.stdout).toContain("缩略图，不是正文原图地址");
+    expect(uploaded.stdout).toContain("--file <path>");
+    expect(uploaded.stdout).toContain("snapshot.effect");
+    expect(uploaded.stdout).toContain("不换键或重传");
+    expect(uploaded.stdout).toContain("上传不保存或发表");
+    expect(existsSync(socket)).toBe(false);
+  });
+
   test("current obtains a fresh existing-editor reference and navigation errors expose only page-created facts", async () => {
     const directory = await tempDir();
     const socket = path.join(directory, "current.sock");
@@ -279,11 +1954,13 @@ describe("CLI over Nexus Node IPC", () => {
     expect(current.exitCode).toBe(0);
     expect(JSON.parse(current.stdout).article).toBe("fresh-current");
     const failed = await runCli(["article", "new"], socket);
-    expect(JSON.parse(failed.stderr).error).toMatchObject({
+    expect(JSON.parse(failed.stderr.trim().split("\n").at(-1)!).error).toMatchObject({
       code: "page_failed",
-      stage: "target_not_ready",
-      pageCreated: true,
-      instruction: expect.stringContaining("不要直接重复"),
+      snapshot: {
+        effect: { pageCreated: true },
+        result: { error: { cause: { at: "bg.navigation", code: "target_not_ready" } } },
+      },
+      instruction: expect.stringContaining("不要换键重做"),
     });
   });
   test("status details diagnose protocol mismatch without claiming login readiness or invoking workspace", async () => {
@@ -305,6 +1982,8 @@ describe("CLI over Nexus Node IPC", () => {
             brokerVersion: "0.2.0",
             extensionVersion: "older",
             sessionId: "internal-session",
+            ledgerId: fixtureLedgerId,
+            keyLedgerId: fixtureLedgerId,
           });
         },
       },
@@ -315,7 +1994,7 @@ describe("CLI over Nexus Node IPC", () => {
       connected: true,
       brokerVersion: "0.2.0",
       extensionVersion: "older",
-      expectedVersion: "0.3.0",
+      expectedVersion: protocolVersion,
     });
     const failed = await runCli(["article", "new"], socket);
     expect(JSON.parse(failed.stderr).error.code).toBe("version_mismatch");
@@ -337,9 +2016,12 @@ describe("CLI over Nexus Node IPC", () => {
 
     const result = await runCli(["article", "new"], socket);
     expect(result.exitCode).not.toBe(0);
-    const error = JSON.parse(result.stderr).error;
+    const error = JSON.parse(result.stderr.trim().split("\n").at(-1)!).error;
     expect(error.code).toBe("page_failed");
-    expect(error).toEqual({ code: "page_failed", stage: "native_target_missing" });
+    expect(error.snapshot.result.error).toEqual({
+      code: "page_failed",
+      cause: { at: "bg.navigation", kind: "domain", code: "native_target_missing" },
+    });
     expect(result.stderr).not.toContain("token");
     expect(result.stderr).not.toContain("mp.weixin.qq.com");
   });
@@ -355,9 +2037,12 @@ describe("CLI over Nexus Node IPC", () => {
     activeServers.push(server);
 
     const result = await runCli(["article", "new"], socket);
-    const error = JSON.parse(result.stderr).error;
+    const error = JSON.parse(result.stderr.trim().split("\n").at(-1)!).error;
     expect(error.code).toBe("page_failed");
-    expect(error).toEqual({ code: "page_failed", stage: "source_ambiguous" });
+    expect(error.snapshot.result.error).toEqual({
+      code: "page_failed",
+      cause: { at: "bg.navigation", kind: "domain", code: "source_ambiguous" },
+    });
     expect(result.stderr).not.toContain("mp.weixin.qq.com");
     expect(result.stderr).not.toContain("token");
   });
@@ -373,9 +2058,12 @@ describe("CLI over Nexus Node IPC", () => {
     activeServers.push(server);
 
     const result = await runCli(["article", "open", "candidate-1"], socket);
-    const error = JSON.parse(result.stderr).error;
+    const error = JSON.parse(result.stderr.trim().split("\n").at(-1)!).error;
     expect(error.code).toBe("target_unavailable");
-    expect(error).toEqual({ code: "target_unavailable", stage: "target_not_ready" });
+    expect(error.snapshot.result.error).toEqual({
+      code: "target_unavailable",
+      cause: { at: "bg.navigation", kind: "domain", code: "target_not_ready" },
+    });
     expect(result.stderr).not.toContain("candidate-1");
     expect(result.stderr).not.toContain("mp.weixin.qq.com");
     expect(result.stderr).not.toContain("token");
@@ -392,10 +2080,11 @@ describe("CLI over Nexus Node IPC", () => {
     activeServers.push(server);
     const result = await runCli(["article", "new"], socket);
     expect(result.exitCode).toBe(0);
-    expect(result.stderr).toBe("");
-    expect(JSON.parse(result.stdout)).toEqual({
-      article: "ready-article",
-      bodyHash: "0".repeat(64),
+    expect(result.stderr).toBe(`operation ${JSON.parse(result.stdout).snapshot.operationId}\n`);
+    expect(JSON.parse(result.stdout).snapshot).toMatchObject({
+      operation: "new",
+      effect: { bodyHash: "0".repeat(64) },
+      result: { status: "ok", value: {} },
     });
   });
 
@@ -508,11 +2197,12 @@ describe("CLI over Nexus Node IPC", () => {
     const result = await runCli(["article", "new"], path.join(directory, "provider.sock"));
 
     expect(result.exitCode).toBe(0);
-    expect(JSON.parse(result.stdout)).toEqual({
-      article: "slow-1",
-      bodyHash: "0".repeat(64),
+    expect(JSON.parse(result.stdout).snapshot).toMatchObject({
+      operation: "new",
+      effect: { bodyHash: "0".repeat(64) },
+      result: { status: "ok", value: {} },
     });
-    expect(result.stderr).toBe("");
+    expect(result.stderr).toBe(`operation ${JSON.parse(result.stdout).snapshot.operationId}\n`);
   });
 
   test("reports a rejected dispatched body write as unknown without retrying", async () => {
@@ -534,7 +2224,10 @@ describe("CLI over Nexus Node IPC", () => {
     );
 
     expect(result.exitCode).not.toBe(0);
-    expect(JSON.parse(result.stderr).error.code).toBe("write_unknown");
+    expect(JSON.parse(result.stderr.trim().split("\n").at(-1)!).error).toMatchObject({
+      code: "operation_unresolved",
+      issue: { failure: { cause: { at: "cli.call", kind: "nexus", code: "E_REMOTE_EXCEPTION" } } },
+    });
     expect(writes).toBe(1);
     expect(await readFile(bodyFile, "utf8")).toBe("<p>once</p>");
   });
@@ -556,7 +2249,9 @@ describe("CLI over Nexus Node IPC", () => {
     );
 
     expect(result.exitCode).not.toBe(0);
-    expect(JSON.parse(result.stderr).error.code).toBe("target_unavailable");
+    expect(JSON.parse(result.stderr.trim().split("\n").at(-1)!).error.code).toBe(
+      "target_unavailable",
+    );
   });
 
   test("reports disconnected status and asks the user to connect in the extension", async () => {
@@ -656,7 +2351,13 @@ describe("CLI over Nexus Node IPC", () => {
       socket,
       {},
       {
-        getStatus: async () => Result.ok({ connected: existsSync(marker) }),
+        getStatus: async () =>
+          Result.ok({
+            connected: existsSync(marker),
+            ...(existsSync(marker)
+              ? { ledgerId: fixtureLedgerId, keyLedgerId: fixtureLedgerId }
+              : {}),
+          }),
       },
     );
     activeServers.push(server);
@@ -970,6 +2671,82 @@ async function startProvider(
         import("@mpctl/contracts").WorkspaceError
       >
     >;
+    inspectArticle(
+      article: string,
+    ): Promise<
+      import("better-result").Result<
+        { title: string; author: string; summary: string; fieldsHash: string },
+        import("@mpctl/contracts").WorkspaceError
+      >
+    >;
+    updateArticleFields(
+      article: string,
+      fields: { title?: string; author?: string; summary?: string },
+      expectedHash: string,
+    ): Promise<
+      import("better-result").Result<
+        { fieldsHash: string },
+        import("@mpctl/contracts").Failure & { effect?: import("@mpctl/contracts").FieldsEffect }
+      >
+    >;
+    checkArticle(
+      article: string,
+    ): Promise<
+      import("better-result").Result<
+        import("@mpctl/contracts").ArticleCheckResult,
+        import("@mpctl/contracts").WorkspaceError
+      >
+    >;
+    listAssets(
+      article: string,
+    ): Promise<
+      import("better-result").Result<
+        import("@mpctl/contracts").AssetList,
+        import("@mpctl/contracts").WorkspaceError
+      >
+    >;
+    uploadAsset(
+      article: string,
+      payload: {
+        blob: Blob;
+        filename: string;
+        mimeType: "image/png" | "image/jpeg" | "image/gif" | "image/webp";
+      },
+    ): Promise<
+      import("better-result").Result<
+        import("@mpctl/contracts").AssetCard,
+        import("@mpctl/contracts").Failure & { effect?: import("@mpctl/contracts").UploadEffect }
+      >
+    >;
+    readArticleCover(
+      article: string,
+    ): Promise<
+      import("better-result").Result<
+        { coverHash: string },
+        import("@mpctl/contracts").WorkspaceError
+      >
+    >;
+    setArticleCover(
+      article: string,
+      asset: string,
+      expectedHash: string,
+    ): Promise<
+      import("better-result").Result<
+        { coverHash: string },
+        import("@mpctl/contracts").Failure & { effect?: import("@mpctl/contracts").CoverEffect }
+      >
+    >;
+    saveArticle(
+      article: string,
+      bodyHash: string,
+      fieldsHash: string,
+      coverHash: string,
+    ): Promise<
+      import("better-result").Result<
+        import("@mpctl/contracts").ArticleResult,
+        import("@mpctl/contracts").Failure & { effect?: import("@mpctl/contracts").SaveEffect }
+      >
+    >;
   }>,
   connection: {
     getStatus(): Promise<
@@ -980,7 +2757,13 @@ async function startProvider(
     >;
   } = {
     async getStatus() {
-      return Result.ok({ connected: true });
+      return Result.ok({
+        connected: true,
+        brokerVersion: protocolVersion,
+        extensionVersion: protocolVersion,
+        ledgerId: fixtureLedgerId,
+        keyLedgerId: fixtureLedgerId,
+      });
     },
   },
 ): Promise<{ dispose(): void }> {
@@ -1023,7 +2806,15 @@ async function startConnectionOnlyProvider(
         token: connectionToken,
         service: {
           async getStatus() {
-            return encodeResult(connectionStatusResultCodec, Result.ok({ connected }));
+            return encodeResult(
+              connectionStatusResultCodec,
+              Result.ok({
+                connected,
+                brokerVersion: protocolVersion,
+                extensionVersion: protocolVersion,
+                ...(connected ? { ledgerId: fixtureLedgerId, keyLedgerId: fixtureLedgerId } : {}),
+              }),
+            );
           },
         },
       },
@@ -1064,6 +2855,53 @@ async function startWireStatusProvider(socketPath: string): Promise<{ dispose():
   return { dispose: () => endpoint.close() };
 }
 
+async function navigationResult(
+  operationId: string,
+  operation: "new" | "open",
+  result: Awaited<
+    ReturnType<NonNullable<NonNullable<Parameters<typeof startProvider>[1]>["newArticle"]>>
+  >,
+) {
+  return encodeResult(
+    operationResultCodec,
+    Result.ok({
+      snapshot: {
+        operationId,
+        operation,
+        state: "settled" as const,
+        effect: {
+          navigation: true as const,
+          outcome: result.isOk()
+            ? ("confirmed" as const)
+            : result.error.pageCreated
+              ? ("unknown" as const)
+              : ("not_dispatched" as const),
+          pageCreated: result.isOk() || !!(result.isErr() && result.error.pageCreated),
+          auxiliaryCreated: [],
+          targetBound: result.isOk(),
+          ...(result.isOk() ? { bodyHash: result.value.bodyHash } : {}),
+        },
+        result: result.isOk()
+          ? { status: "ok" as const, value: {} }
+          : {
+              status: "error" as const,
+              error: {
+                code: result.error.code as import("@mpctl/contracts").Failure["code"],
+                ...(result.error.stage
+                  ? {
+                      cause: {
+                        at: "bg.navigation" as const,
+                        kind: "domain" as const,
+                        code: result.error.stage,
+                      },
+                    }
+                  : {}),
+              },
+            },
+      },
+    }),
+  );
+}
 function encodeWorkspaceProvider(
   workspace: NonNullable<Parameters<typeof startProvider>[1]>,
 ): WorkspaceService {
@@ -1072,14 +2910,172 @@ function encodeWorkspaceProvider(
       encodeResult(cleanupWorkspaceResultCodec, await workspace.cleanupWorkspace!()),
     listArticles: async () =>
       encodeResult(listArticlesResultCodec, await workspace.listArticles!()),
-    openArticle: async (candidate) =>
-      encodeResult(articleResultCodec, await workspace.openArticle!(candidate)),
-    newArticle: async () => encodeResult(articleResultCodec, await workspace.newArticle!()),
+    openArticle: async (input) =>
+      navigationResult(input.operationId, "open", await workspace.openArticle!(input.candidate)),
+    newArticle: async (input) =>
+      navigationResult(input.operationId, "new", await workspace.newArticle!()),
     currentArticle: async () => encodeResult(articleResultCodec, await workspace.currentArticle!()),
     readBody: async (article) =>
       encodeResult(workspaceResultCodec, await workspace.readBody!(article)),
-    writeBody: async (article, html, expectedHash) =>
-      encodeResult(writeBodyResultCodec, await workspace.writeBody!(article, html, expectedHash)),
+    writeBody: async (input) => {
+      const result = await workspace.writeBody!(input.article, input.html, input.expectedHash);
+      const snapshot = result.isOk()
+        ? {
+            operationId: input.operationId,
+            operation: "body" as const,
+            state: "settled" as const,
+            effect: { outcome: "confirmed" as const, bodyHash: result.value.bodyHash },
+            result: { status: "ok" as const, value: {} },
+          }
+        : {
+            operationId: input.operationId,
+            operation: "body" as const,
+            state: "settled" as const,
+            effect: { outcome: "not_dispatched" as const },
+            result: {
+              status: "error" as const,
+              error: { code: result.error.code as import("@mpctl/contracts").Failure["code"] },
+            },
+          };
+      return encodeResult(operationResultCodec, Result.ok({ snapshot }));
+    },
+    getOperation: async () => ({
+      status: "error",
+      error: { failure: { code: "operation_not_found" } },
+    }),
+    inspectArticle: async (article) =>
+      encodeResult(articleFieldsResultCodec, await workspace.inspectArticle!(article)),
+    updateArticleFields: async (input) => {
+      const result = await workspace.updateArticleFields!(
+        input.article,
+        input.fields,
+        input.expectedHash,
+      );
+      const requested = (["title", "author", "summary"] as const).filter(
+        (name) => input.fields[name] !== undefined,
+      );
+      const effect: import("@mpctl/contracts").FieldsEffect = result.isOk()
+        ? {
+            outcome: "confirmed",
+            requested,
+            attempted: requested,
+            confirmed: requested,
+            unknown: [],
+            fieldsHash: result.value.fieldsHash,
+          }
+        : (result.error.effect ?? {
+            outcome: "not_dispatched",
+            requested,
+            attempted: [],
+            confirmed: [],
+            unknown: [],
+          });
+      const snapshot = {
+        operationId: input.operationId,
+        operation: "fields" as const,
+        state: "settled" as const,
+        effect,
+        result: result.isOk()
+          ? { status: "ok" as const, value: {} }
+          : {
+              status: "error" as const,
+              error: {
+                code: result.error.code,
+                ...(result.error.cause ? { cause: result.error.cause } : {}),
+                ...(result.error.cleanup ? { cleanup: result.error.cleanup } : {}),
+              },
+            },
+      };
+      return encodeResult(operationResultCodec, Result.ok({ snapshot }));
+    },
+    checkArticle: async (article) =>
+      encodeResult(articleCheckResultCodec, await workspace.checkArticle!(article)),
+    listAssets: async (article) =>
+      encodeResult(assetListResultCodec, await workspace.listAssets!(article)),
+    uploadAsset: async (input) => {
+      const result = await workspace.uploadAsset!(input.article, input);
+      if (result.isOk() && "unexpected" in result.value)
+        return { status: "ok", value: result.value } as never;
+      const effect: import("@mpctl/contracts").UploadEffect = result.isOk()
+        ? {
+            outcome: "confirmed",
+            filename: result.value.filename,
+            thumbnailUrl: result.value.thumbnailUrl ?? "https://mmbiz.qpic.cn/test/300",
+          }
+        : (result.error.effect ?? { outcome: "unknown", filename: input.filename });
+      const failure = result.isErr()
+        ? (() => {
+            const { effect: _effect, ...failure } = result.error;
+            return failure;
+          })()
+        : undefined;
+      return encodeResult(
+        operationResultCodec,
+        Result.ok({
+          snapshot: {
+            operationId: input.operationId,
+            operation: "upload",
+            state: "settled",
+            effect,
+            result: failure ? { status: "error", error: failure } : { status: "ok", value: {} },
+          },
+        }),
+      );
+    },
+    readArticleCover: async (article) =>
+      encodeResult(articleCoverResultCodec, await workspace.readArticleCover!(article)),
+    setArticleCover: async (input) => {
+      const outcome = await workspace.setArticleCover!(
+        input.article,
+        "asset" in input ? input.asset : `body:${input.bodyImage}`,
+        input.expectedCoverHash,
+      );
+      const { effect: failureEffect, ...failure } = outcome.isErr() ? outcome.error : {};
+      return encodeResult(
+        operationResultCodec,
+        Result.ok({
+          snapshot: {
+            operationId: input.operationId,
+            operation: "cover",
+            state: "settled",
+            effect: outcome.isOk()
+              ? { cover: true, outcome: "confirmed", coverHash: outcome.value.coverHash }
+              : (failureEffect ?? { cover: true, outcome: "not_dispatched" }),
+            result: outcome.isOk()
+              ? { status: "ok", value: {} }
+              : { status: "error", error: failure as import("@mpctl/contracts").Failure },
+          },
+        }),
+      );
+    },
+    saveArticle: async (input) => {
+      const outcome = await workspace.saveArticle!(
+        input.article,
+        input.expectedBodyHash,
+        input.expectedFieldsHash,
+        input.expectedCoverHash,
+      );
+      const { effect: failureEffect, ...failure } = outcome.isErr() ? outcome.error : {};
+      return encodeResult(
+        operationResultCodec,
+        Result.ok({
+          snapshot: {
+            operationId: input.operationId,
+            operation: "save",
+            state: "settled",
+            effect: outcome.isOk()
+              ? {
+                  outcome: "confirmed",
+                  persistence: "unverified",
+                }
+              : (failureEffect ?? { outcome: "not_dispatched", persistence: "unverified" }),
+            result: outcome.isOk()
+              ? { status: "ok", value: {} }
+              : { status: "error", error: failure as import("@mpctl/contracts").Failure },
+          },
+        }),
+      );
+    },
   };
 }
 
@@ -1121,7 +3117,15 @@ async function runCliWithEnvironment(
   );
   const child = spawn(process.execPath, ["run", "packages/cli/src/main.ts", ...args], {
     cwd: path.resolve(import.meta.dir, "../../.."),
-    env: { ...process.env, MPCTL_BROKER_CONFIG: isolatedConfigPath, ...extraEnvironment },
+    env: {
+      ...process.env,
+      MPCTL_BROKER_CONFIG: isolatedConfigPath,
+      XDG_RUNTIME_DIR: path.dirname(isolatedConfigPath),
+      MPCTL_PAIRING_CREDENTIAL: "",
+      MPCTL_BROKER_WS_PORT: "",
+      MPCTL_EXTENSION_ID: "",
+      ...extraEnvironment,
+    },
     stdio: ["ignore", "pipe", "pipe"],
   });
   let stdout = "";

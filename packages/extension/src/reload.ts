@@ -10,7 +10,7 @@ export type ReloadError = {
 export function createReloadControl(options: {
   storage: Pick<typeof chrome.storage.local, "get" | "set" | "remove">;
   connect(): Promise<BetterResult<void, { code: "connect_failed" | "invalid_result_envelope" }>>;
-  reload(): BetterResult<void, ReloadError>;
+  reload(): BetterResult<void, ReloadError> | Promise<BetterResult<void, ReloadError>>;
   report?(result: BetterResult<void, ReloadError>): void;
   reportCleanup?(result: BetterResult<void, ReloadError>): void;
 }) {
@@ -29,8 +29,8 @@ export function createReloadControl(options: {
       if (stored.isErr()) return stored;
       // Ok means the one-shot intent was stored and reload was scheduled, not executed.
       setTimeout(async () => {
-        const reloaded = Result.try({
-          try: () => options.reload(),
+        const reloaded = await Result.tryPromise({
+          try: async () => options.reload(),
           catch: () => ({ code: "reload_failed" as const }),
         });
         const reloadResult = reloaded.isErr() ? reloaded : reloaded.value;

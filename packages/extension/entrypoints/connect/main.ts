@@ -7,7 +7,6 @@ import {
   disconnectResultCodec,
   controlStatusResultCodec,
 } from "@mpctl/contracts";
-import { decodeControlResult } from "../../src/connection";
 import { createPopupControl } from "../../src/popup-control";
 import { connectFromPage, connectionFailureMessage } from "../../src/connection-page";
 
@@ -139,23 +138,21 @@ async function connect() {
           try: async () => await wire.connect(),
           catch: () => ({ code: "connect_failed" as const }),
         });
-        return result.isErr() ? result : decodeControlResult(connectResultCodec, result.value);
+        return result.isErr() ? result : connectResultCodec.deserialize(result.value);
       },
       disconnect: async () => {
         const result = await Result.tryPromise({
           try: async () => await wire.disconnect(),
           catch: () => ({ code: "disconnect_failed" as const }),
         });
-        return result.isErr() ? result : decodeControlResult(disconnectResultCodec, result.value);
+        return result.isErr() ? result : disconnectResultCodec.deserialize(result.value);
       },
       getStatus: async () => {
         const result = await Result.tryPromise({
           try: async () => await wire.getStatus(),
           catch: () => ({ code: "status_failed" as const }),
         });
-        return result.isErr()
-          ? result
-          : decodeControlResult(controlStatusResultCodec, result.value);
+        return result.isErr() ? result : controlStatusResultCodec.deserialize(result.value);
       },
     };
     const result = await connectFromPage(async () => Result.ok(controlProxy));

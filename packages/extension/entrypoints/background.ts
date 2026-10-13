@@ -1,8 +1,9 @@
 import { defineBackground } from "wxt/utils/define-background";
 import { Result } from "better-result";
+import { protocolVersion } from "@mpctl/contracts";
 import { backgroundControlToken } from "../src/background-contracts";
 import { createBackgroundScriptConfig } from "@nexus-js/chrome";
-import { backgroundNexus } from "../src/background-runtime";
+import { backgroundNexus, hasPreparationVersion } from "../src/background-runtime";
 import {
   createBackgroundControl,
   createConnectionController,
@@ -11,12 +12,14 @@ import {
 import { createWorkspace } from "../src/workspace";
 import { createPageManager, restorePagesOnStartup } from "../src/pages";
 import { createReloadControl } from "../src/reload";
+import { createOperations } from "../src/operations";
 
 export default defineBackground(() => {
   const reportResult = (scope: string, result: { isErr(): boolean; error?: { code?: string } }) => {
     if (result.isErr()) console.error(`mpctl ${scope} failed: ${result.error?.code ?? "unknown"}`);
   };
   const pages = createPageManager();
+  const operations = createOperations();
   restorePagesOnStartup(
     async () => {
       const restored = await pages
@@ -27,7 +30,7 @@ export default defineBackground(() => {
     },
     (listener) => chrome.runtime.onStartup.addListener(listener),
   );
-  const workspace = createWorkspace({ pages });
+  const workspace = createWorkspace({ pages, operations });
   const reloadControl = createReloadControl({
     storage: chrome.storage.local,
     connect: async () => {
@@ -36,20 +39,34 @@ export default defineBackground(() => {
         ? Result.err({ code: "connect_failed" as const })
         : Result.ok(undefined);
     },
-    reload: () =>
-      Result.try({
-        try: () => chrome.runtime.reload(),
-        catch: () => ({ code: "reload_failed" as const }),
-      }),
+    reload: async () => {
+      const initialized = await operations;
+      if (initialized.isErr()) return Result.err({ code: "reload_failed" });
+      // Recheck at the actual scheduled dispatch, not only when the marker was stored.
+      const reloaded = await initialized.value.maintenance(async () =>
+        Result.try({
+          try: () => chrome.runtime.reload(),
+          catch: () => ({ code: "reload_failed" as const }),
+        }),
+      );
+      return reloaded.isOk() ? reloaded.value : Result.err({ code: "reload_failed" });
+    },
     report: (result) => reportResult("scheduled reload", result),
     reportCleanup: (result) => reportResult("reload marker cleanup", result),
   });
   let controller!: ReturnType<typeof createConnectionController>;
   const control = createBackgroundControl({
+    ledger: operations,
     controller: () => controller,
-    reload: () => reloadControl.reload(),
+    reload: async () => {
+      const initialized = await operations;
+      if (initialized.isErr()) return Result.err({ code: "reload_failed" });
+      const reloaded = await initialized.value.maintenance(() => reloadControl.reload());
+      return reloaded.isOk() ? reloaded.value : Result.err({ code: "reload_failed" });
+    },
   });
   controller = createConnectionController({
+    ledger: operations,
     loadSettings: readConnectionSettings,
     workspace,
     control,
@@ -57,7 +74,13 @@ export default defineBackground(() => {
   const configured = Result.try({
     try: () =>
       backgroundNexus.configure({
-        ...createBackgroundScriptConfig(),
+        ...createBackgroundScriptConfig({ app: { protocolVersion } }),
+        policy: {
+          canConnect: ({ remoteIdentity }) =>
+            remoteIdentity.context !== "content-script" || hasPreparationVersion(remoteIdentity),
+          canCall: ({ remoteIdentity }) =>
+            remoteIdentity.context !== "content-script" || hasPreparationVersion(remoteIdentity),
+        },
         providers: [
           {
             token: backgroundControlToken,

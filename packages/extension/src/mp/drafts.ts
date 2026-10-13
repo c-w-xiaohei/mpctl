@@ -1,11 +1,6 @@
-import { Result } from "better-result";
-
 export type DraftGroup = { groupId: string; title: string };
-export type DraftOpenError = { code: "draft_unavailable" | "page_failed" };
-export type DraftOpenResult = import("better-result").Result<string, DraftOpenError>;
 const cardSelector = ".weui-desktop-card[data-appid]";
 const titleSelector = ".weui-desktop-publish__cover__title";
-const editSelector = ".weui-desktop-tooltip__wrp.weui-desktop-link a";
 
 /** Uses only the single observed list-card structure; group IDs remain opaque candidates. */
 export function listDraftGroups(document: Document): DraftGroup[] {
@@ -21,27 +16,6 @@ export function listDraftGroups(document: Document): DraftGroup[] {
     if (!groupId || !title || counts.get(groupId) !== 1) return [];
     return [{ groupId, title }];
   });
-}
-
-export function openDraftGroup(
-  document: Document,
-  groupId: string,
-  stillUnique: () => boolean = () => true,
-): DraftOpenResult {
-  return Result.try({
-    try: () => {
-      const cards = [...document.querySelectorAll(cardSelector)].filter(
-        (card) => card.getAttribute("data-appid") === groupId,
-      );
-      if (cards.length !== 1) return undefined;
-      const edit = cards[0]?.querySelector<HTMLAnchorElement>(editSelector);
-      if (!edit || !isVisible(edit) || !stillUnique()) return undefined;
-      return edit.href || undefined;
-    },
-    catch: () => ({ code: "page_failed" as const }),
-  }).andThen((href) =>
-    href ? Result.ok(href) : Result.err({ code: "draft_unavailable" as const }),
-  );
 }
 
 /** Counts every visible appmsg item before validating the observed current first item. */

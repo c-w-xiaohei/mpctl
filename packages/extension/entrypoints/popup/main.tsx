@@ -12,7 +12,6 @@ import {
   controlStatusResultCodec,
   disconnectResultCodec,
 } from "@mpctl/contracts";
-import { decodeControlResult } from "../../src/connection";
 import {
   readConnectionSettings,
   saveConnectionSettings,
@@ -204,21 +203,21 @@ const getControl = async () => {
       try: async () => await remote.connect(),
       catch: () => ({ code: "connect_failed" as const }),
     });
-    return wire.isErr() ? wire : decodeControlResult(connectResultCodec, wire.value);
+    return wire.isErr() ? wire : connectResultCodec.deserialize(wire.value);
   };
   const disconnect = async () => {
     const wire = await Result.tryPromise({
       try: async () => await remote.disconnect(),
       catch: () => ({ code: "disconnect_failed" as const }),
     });
-    return wire.isErr() ? wire : decodeControlResult(disconnectResultCodec, wire.value);
+    return wire.isErr() ? wire : disconnectResultCodec.deserialize(wire.value);
   };
   const getStatus = async () => {
     const wire = await Result.tryPromise({
       try: async () => await remote.getStatus(),
       catch: () => ({ code: "status_failed" as const }),
     });
-    return wire.isErr() ? wire : decodeControlResult(controlStatusResultCodec, wire.value);
+    return wire.isErr() ? wire : controlStatusResultCodec.deserialize(wire.value);
   };
   return Result.ok({
     connect,

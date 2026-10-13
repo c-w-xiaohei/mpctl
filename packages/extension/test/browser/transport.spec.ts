@@ -3,6 +3,7 @@ import { mkdtemp, rm } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
+import { routeBridgeFixture, collectBridgeDiagnostics } from "./fixtures/bridge-routing";
 
 const root = path.resolve(fileURLToPath(new URL("../../../..", import.meta.url)));
 const fixtureExtension = path.join(
@@ -15,6 +16,7 @@ const fixtureUrl = "https://mp.weixin.qq.com/cgi-bin/appmsg?t=fixture";
 test("production page endpoints preserve binary offsets and ordering across MAIN/ISOLATED worlds", async () => {
   test.setTimeout(30_000);
   const temp = await mkdtemp(path.join(os.tmpdir(), "mpctl-bridge-browser-"));
+  const diagnostics: string[] = [];
   const context = await chromium.launchPersistentContext(path.join(temp, "profile"), {
     channel: "chromium",
     headless: true,
@@ -30,33 +32,27 @@ test("production page endpoints preserve binary offsets and ordering across MAIN
     ],
   });
   try {
-    await context.route("**/*", async (route) => {
-      const url = new URL(route.request().url());
-      if (url.hostname === "mp.weixin.qq.com" && url.pathname === "/cgi-bin/appmsg") {
-        await route.fulfill({
-          path: path.join(fixtureRoot, "index.html"),
-          contentType: "text/html",
-        });
-        return;
-      }
-      if (url.hostname === "mp.weixin.qq.com" && url.pathname === "/cgi-bin/jsapi.js") {
-        await route.fulfill({
-          path: path.join(fixtureRoot, "jsapi.js"),
-          contentType: "text/javascript",
-        });
-        return;
-      }
-      if (url.protocol === "chrome-extension:" || url.protocol === "devtools:")
-        return route.continue();
-      return route.abort("blockedbyclient");
-    });
-    await context.routeWebSocket("**/*", (route) =>
-      route.close({ code: 1008, reason: "Offline fixture" }),
-    );
+    await routeBridgeFixture(context, fixtureRoot, fixtureExtension, diagnostics);
+
     const page = await context.newPage();
+    collectBridgeDiagnostics(page, diagnostics);
+
     await page.goto(fixtureUrl);
+    try {
+      await expect
+        .poll(() => page.locator("html").getAttribute("data-mpctl-fixture-ready"))
+        .toBe("yes");
+    } catch (error) {
+      diagnostics.push(`html=${await page.locator("html").evaluate((node) => node.outerHTML)}`);
+      diagnostics.push(
+        `workers=${JSON.stringify(context.serviceWorkers().map((worker) => new URL(worker.url()).pathname))}`,
+      );
+      throw new Error(
+        `${error instanceof Error ? error.message : String(error)}\n${diagnostics.join("\n")}`,
+      );
+    }
     await expect
-      .poll(() => page.locator("html").getAttribute("data-mpctl-fixture-ready"))
+      .poll(() => page.locator("html").getAttribute("data-mpctl-fixture-rpc-ready"))
       .toBe("yes");
     await expect
       .poll(() => page.locator("html").getAttribute("data-mpctl-main-connected"))
@@ -107,6 +103,45 @@ test("production page endpoints preserve binary offsets and ordering across MAIN
             .filter((sequence: number | null): sequence is number => sequence !== null),
         ),
     ).toEqual([1, 2, 3]);
+
+    const binaryRpc = await page.evaluate(async () => {
+      const values = Uint8Array.from({ length: 100 * 1024 }, (_, index) => index % 251);
+      const backing = new Uint8Array([0xaa, 41, 42, 0xbb]);
+      const received = new Promise<{
+        blob: Blob;
+        bytes: Uint8Array;
+        nested: { blob: Blob };
+      }>((resolve) =>
+        document.addEventListener(
+          "mpctl-fixture-rpc-result",
+          (event) => resolve((event as CustomEvent).detail),
+          { once: true },
+        ),
+      );
+      document.dispatchEvent(
+        new CustomEvent("mpctl-fixture-rpc-command", {
+          detail: {
+            blob: new Blob([values], { type: "image/png" }),
+            bytes: new Uint8Array(backing.buffer, 1, 2),
+            nested: { blob: new Blob(["nested"], { type: "text/plain" }) },
+          },
+        }),
+      );
+      const result = await received;
+      return {
+        blobType: result.blob.type,
+        blobBytes: [...new Uint8Array(await result.blob.arrayBuffer())],
+        bytes: [...result.bytes],
+        nestedType: result.nested.blob.type,
+        nestedText: await result.nested.blob.text(),
+        expectedBytes: [...values],
+      };
+    });
+    expect(binaryRpc.blobType).toBe("image/png");
+    expect(binaryRpc.blobBytes).toEqual(binaryRpc.expectedBytes);
+    expect(binaryRpc.bytes).toEqual([41, 42]);
+    expect(binaryRpc.nestedType).toBe("text/plain");
+    expect(binaryRpc.nestedText).toBe("nested");
     await expect
       .poll(() => page.locator("html").getAttribute("data-mpctl-main-plain-envelopes"))
       .toBe("[true,true]");

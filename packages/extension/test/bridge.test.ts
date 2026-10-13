@@ -2,6 +2,7 @@ import { describe, expect, test } from "bun:test";
 import { Nexus, Token, type IPort } from "@nexus-js/core";
 import { Result } from "better-result";
 import { createPageEndpoint, injectMainWorldBridge } from "../src/transport/page-bridge";
+import { CountingTarget, TrackingTarget } from "./listener-target-fixture";
 
 const eventNames = { fromIsolated: "mpctl:test:isolated", fromMain: "mpctl:test:main" };
 
@@ -40,6 +41,47 @@ describe("page Nexus transport", () => {
     const remote = await client.connect({ target: {} });
     expect(await remote.get(token).read()).toBe("from MAIN");
     await Promise.all([isolated.close?.(), main.close?.()]);
+    await Promise.all([isolated.close?.(), main.close?.()]);
+  });
+
+  test("Nexus.safeCall exposes a dispatched rejection as unknown rather than a normal page failure", async () => {
+    const { isolated, main } = endpoints();
+    const token = new Token<{ update(): Promise<void> }>("test.page.dispatched-update");
+    let calls = 0;
+    const server = new Nexus()
+      .provide(token, {
+        async update() {
+          calls++;
+          throw new Error("reply lost after mutation");
+        },
+      })
+      .configure({ endpoint: { implementation: main, meta: {} } });
+    const client = new Nexus().configure({ endpoint: { implementation: isolated, meta: {} } });
+    await Promise.all([server.ready(), client.ready()]);
+    const remote = await client.connect({ target: {} });
+    const acquired = remote.safeGet(token);
+    expect(Result.isOk(acquired)).toBe(true);
+    if (Result.isError(acquired)) return;
+    const result = await Nexus.safeCall(acquired.value.update());
+    expect(Result.isError(result)).toBe(true);
+    expect(calls).toBe(1);
+    await Promise.all([isolated.close?.(), main.close?.()]);
+  });
+
+  test("real Nexus RPC transfers Blob MIME and bytes across the page bridge", async () => {
+    const { isolated, main } = endpoints();
+    const token = new Token<{ echo(blob: Blob): Promise<Blob> }>("test.page.binary-blob");
+    const server = new Nexus().provide(token, { echo: async (blob: Blob) => blob }).configure({
+      endpoint: { implementation: main, meta: {} },
+    });
+    const client = new Nexus().configure({ endpoint: { implementation: isolated, meta: {} } });
+    await Promise.all([server.ready(), client.ready()]);
+    const remote = await client.connect({ target: {} });
+    const result = await remote
+      .get(token)
+      .echo(new Blob([Uint8Array.from([0, 255, 7])], { type: "image/png" }));
+    expect(result.type).toBe("image/png");
+    expect([...new Uint8Array(await result.arrayBuffer())]).toEqual([0, 255, 7]);
     await Promise.all([isolated.close?.(), main.close?.()]);
   });
 
@@ -167,26 +209,7 @@ describe("page Nexus transport", () => {
   });
 
   test("returns a typed bootstrap error and disposes endpoint listeners when preparation fails", async () => {
-    class CountingTarget extends EventTarget {
-      readonly listeners = new Set<EventListenerOrEventListenerObject>();
-      override addEventListener(
-        type: string,
-        callback: EventListenerOrEventListenerObject | null,
-        options?: boolean | AddEventListenerOptions,
-      ) {
-        if (callback) this.listeners.add(callback);
-        super.addEventListener(type, callback, options);
-      }
-      override removeEventListener(
-        type: string,
-        callback: EventListenerOrEventListenerObject | null,
-        options?: boolean | EventListenerOptions,
-      ) {
-        if (callback) this.listeners.delete(callback);
-        super.removeEventListener(type, callback, options);
-      }
-    }
-    const target = new CountingTarget();
+    const target = new TrackingTarget();
     const result = await injectMainWorldBridge(target, undefined, () => {
       throw new Error("prepare failure");
     });
@@ -211,32 +234,6 @@ describe("page Nexus transport", () => {
   });
 
   test("repeated port disconnects release listeners and remain reconnectable", async () => {
-    class CountingTarget extends EventTarget {
-      readonly listeners = new Map<string, Set<EventListenerOrEventListenerObject>>();
-      override addEventListener(
-        type: string,
-        callback: EventListenerOrEventListenerObject | null,
-        options?: boolean | AddEventListenerOptions,
-      ) {
-        if (callback) {
-          const listeners = this.listeners.get(type) ?? new Set();
-          listeners.add(callback);
-          this.listeners.set(type, listeners);
-        }
-        super.addEventListener(type, callback, options);
-      }
-      override removeEventListener(
-        type: string,
-        callback: EventListenerOrEventListenerObject | null,
-        options?: boolean | EventListenerOptions,
-      ) {
-        if (callback) this.listeners.get(type)?.delete(callback);
-        super.removeEventListener(type, callback, options);
-      }
-      count() {
-        return [...this.listeners.values()].reduce((total, listeners) => total + listeners.size, 0);
-      }
-    }
     const target = new CountingTarget();
     const isolated = createPageEndpoint({
       target,
@@ -263,32 +260,6 @@ describe("page Nexus transport", () => {
   });
 
   test("MAIN endpoint closes its listener and accepted port when ISOLATED disconnects", async () => {
-    class CountingTarget extends EventTarget {
-      readonly listeners = new Map<string, Set<EventListenerOrEventListenerObject>>();
-      override addEventListener(
-        type: string,
-        callback: EventListenerOrEventListenerObject | null,
-        options?: boolean | AddEventListenerOptions,
-      ) {
-        if (callback) {
-          const listeners = this.listeners.get(type) ?? new Set();
-          listeners.add(callback);
-          this.listeners.set(type, listeners);
-        }
-        super.addEventListener(type, callback, options);
-      }
-      override removeEventListener(
-        type: string,
-        callback: EventListenerOrEventListenerObject | null,
-        options?: boolean | EventListenerOptions,
-      ) {
-        if (callback) this.listeners.get(type)?.delete(callback);
-        super.removeEventListener(type, callback, options);
-      }
-      count() {
-        return [...this.listeners.values()].reduce((total, listeners) => total + listeners.size, 0);
-      }
-    }
     const target = new CountingTarget();
     const isolated = createPageEndpoint({
       target,
@@ -315,32 +286,6 @@ describe("page Nexus transport", () => {
   });
 
   test("endpoint close attempts every port and removes listeners when a disconnect callback throws", async () => {
-    class CountingTarget extends EventTarget {
-      readonly listeners = new Map<string, Set<EventListenerOrEventListenerObject>>();
-      override addEventListener(
-        type: string,
-        callback: EventListenerOrEventListenerObject | null,
-        options?: boolean | AddEventListenerOptions,
-      ) {
-        if (callback) {
-          const listeners = this.listeners.get(type) ?? new Set();
-          listeners.add(callback);
-          this.listeners.set(type, listeners);
-        }
-        super.addEventListener(type, callback, options);
-      }
-      override removeEventListener(
-        type: string,
-        callback: EventListenerOrEventListenerObject | null,
-        options?: boolean | EventListenerOptions,
-      ) {
-        if (callback) this.listeners.get(type)?.delete(callback);
-        super.removeEventListener(type, callback, options);
-      }
-      count() {
-        return [...this.listeners.values()].reduce((total, listeners) => total + listeners.size, 0);
-      }
-    }
     const target = new CountingTarget();
     const isolated = createPageEndpoint({
       target,

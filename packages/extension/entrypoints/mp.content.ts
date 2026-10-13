@@ -1,8 +1,18 @@
 import { defineContentScript } from "wxt/utils/define-content-script";
-import { Nexus, type NexusInstance } from "@nexus-js/core";
+import { Nexus, type NexusInstance, type Remote } from "@nexus-js/core";
 import { createContentScriptConfig, chromeTarget, type ChromeAdapterModel } from "@nexus-js/chrome";
 import { injectMainWorldBridge, type PageBridgeAdapterModel } from "../src/transport/page-bridge";
 import { Result } from "better-result";
+import { protocolVersion } from "@mpctl/contracts";
+import {
+  operationIdSchema,
+  assetPayloadSchema,
+  assetRequestDigest,
+  type Failure,
+} from "@mpctl/contracts";
+import * as v from "valibot";
+import { hasPreparationVersion, type ContentAppMeta } from "../src/background-runtime";
+import type { AuthorizationPolicy } from "@nexus-js/core";
 import type { SerializedResult } from "better-result";
 import { pageEditorReadyResultCodec, pageEditorToken } from "../src/page-contracts";
 import {
@@ -11,12 +21,37 @@ import {
   homePageToken,
   homeIsReadyResultCodec,
   openDraftListResultCodec,
-  openNewEditorResultCodec,
   listDraftsResultCodec,
-  openDraftResultCodec,
   validateDraftResultCodec,
   currentItemCountResultCodec,
-  hasUniqueCurrentItemResultCodec,
+  articleFieldsToken,
+  articleFieldsResultCodec,
+  articleFieldUpdateResultCodec,
+  fieldsExecutionSchema,
+  fieldsIdentityResultCodec,
+  fieldsReceiptResultCodec,
+  fieldsRequestDigest,
+  fieldsRequestSignature,
+  type FieldsReceipt,
+  materialPageToken,
+  materialListResultCodec,
+  materialUploadResultCodec,
+  materialIdentityResultCodec,
+  uploadReceiptResultCodec,
+  uploadExecutionSchema,
+  articleCoverPageToken,
+  coverExecutionSchema,
+  saveExecutionSchema,
+  coverWriteResultCodec,
+  saveWriteResultCodec,
+  coverSaveReceiptResultCodec,
+  coverRequestDigest,
+  saveRequestDigest,
+  type CoverExecution,
+  type SaveExecution,
+  type CoverReceipt,
+  type SaveReceipt,
+  articleCoverHashResultCodec,
 } from "../src/background-contracts";
 import {
   detectLoginTimeout,
@@ -31,8 +66,19 @@ import {
   countVisibleAppmsgItems,
   hasUniqueObservedCurrentItem,
   listDraftGroups,
-  openDraftGroup,
 } from "../src/mp/drafts";
+import {
+  hashArticleFields,
+  readArticleFields,
+  validateArticleFieldUpdate,
+  writeArticleFields,
+  initialFieldsEffect,
+} from "../src/mp/article-fields";
+import { listMaterials } from "../src/mp/material-library";
+import { uploadMaterial } from "../src/mp/asset-upload";
+import { readArticleCover, hashArticleCover } from "../src/mp/article-cover";
+import { setArticleCover, coverPreviewVisible as isVisible } from "../src/mp/cover-input";
+import { saveArticle as saveNativeArticle } from "../src/mp/article-save";
 
 type ProtocolError = { code: "invalid_result_envelope" };
 
@@ -54,7 +100,8 @@ export async function initializeContentServices(
   dependencies: {
     document: Document;
     pageRuntime: NexusInstance<PageBridgeAdapterModel>;
-    chromeRuntime: NexusInstance<ChromeAdapterModel<{ editorReady: boolean }>>;
+    chromeRuntime: NexusInstance<ChromeAdapterModel<ContentAppMeta>>;
+    app?: ContentAppMeta;
     pageState(): Promise<{
       state: "ready" | "not_logged_in" | "loading";
       route: string;
@@ -62,9 +109,15 @@ export async function initializeContentServices(
     }>;
     validateTarget(): boolean;
     onDispose?(cleanup: () => void | Promise<void>): void;
+    onEditor?(
+      editor: () =>
+        | Remote<import("../src/page-contracts").PageEditorService, PageBridgeAdapterModel>
+        | undefined,
+    ): void;
   },
   editorToken: typeof pageEditorToken = pageEditorToken,
 ): Promise<import("better-result").Result<boolean, { code: string }>> {
+  const app = dependencies.app ?? { protocolVersion, editorReady: false };
   const initialStatus = await Result.tryPromise({
     try: () => dependencies.pageState(),
     catch: () => ({ code: "page_failed" }),
@@ -77,71 +130,65 @@ export async function initializeContentServices(
   });
   if (Result.isError(connected)) return connected;
   const pageConnection = connected.value;
-  const editorResult = Result.try({
-    try: () => pageConnection.get(editorToken),
-    catch: () => ({ code: "page_failed" as const }),
-  });
-  if (Result.isError(editorResult)) {
+  const disconnectWithError = (error: { code: string }) => {
     const disconnected = disconnectPageConnection(pageConnection);
-    return Result.isError(disconnected) ? disconnected : editorResult;
-  }
+    if (Result.isError(disconnected)) reportStartupFailure(disconnected.error);
+    return Result.err(error);
+  };
+  if (!hasPreparationVersion(pageConnection.contextMeta))
+    return disconnectWithError({ code: "version_mismatch" });
+  const editorResult = pageConnection.safeGet(editorToken);
+  if (Result.isError(editorResult)) return disconnectWithError(editorResult.error);
   const editor = editorResult.value;
   const assertUnchanged = () =>
     Result.try({
       try: () => {
+        if (
+          pageConnection.status !== "connected" ||
+          !hasPreparationVersion(pageConnection.contextMeta)
+        )
+          return false;
         if (detectLoginTimeout(dependencies.document).state === "not_logged_in") return false;
         return dependencies.validateTarget();
       },
       catch: () => ({ code: "page_failed" }),
     }).andThen((valid) => (valid ? Result.ok() : Result.err({ code: "target_unavailable" })));
   const beforeReady = assertUnchanged();
-  if (Result.isError(beforeReady)) {
-    const disconnected = disconnectPageConnection(pageConnection);
-    return Result.isError(disconnected) ? disconnected : beforeReady;
-  }
-  const readyWire = await Result.tryPromise({
-    try: async () => await editor.ready(),
-    catch: () => ({ code: "page_failed" }),
-  });
-  if (Result.isError(readyWire)) {
-    const disconnected = disconnectPageConnection(pageConnection);
-    return Result.isError(disconnected) ? disconnected : readyWire;
-  }
+  if (Result.isError(beforeReady)) return disconnectWithError(beforeReady.error);
+  const readyWire = await Nexus.safeCall(editor.ready());
+  if (Result.isError(readyWire)) return disconnectWithError(readyWire.error);
   const ready = await pageEditorReadyResultCodec.deserialize(readyWire.value);
-  if (Result.isError(ready)) {
-    const disconnected = disconnectPageConnection(pageConnection);
-    return Result.isError(disconnected) ? disconnected : ready;
-  }
+  if (Result.isError(ready)) return disconnectWithError(ready.error);
   const afterReady = assertUnchanged();
-  if (Result.isError(afterReady)) {
-    const disconnected = disconnectPageConnection(pageConnection);
-    return Result.isError(disconnected) ? disconnected : afterReady;
-  }
-  if (!ready.value.isReady || !ready.value.isNew) {
-    const disconnected = disconnectPageConnection(pageConnection);
-    return Result.isError(disconnected) ? disconnected : Result.err({ code: "unsupported_editor" });
-  }
+  if (Result.isError(afterReady)) return disconnectWithError(afterReady.error);
+  if (!ready.value.isReady || !ready.value.isNew)
+    return disconnectWithError({ code: "unsupported_editor" });
   const finalStatus = await Result.tryPromise({
     try: () => dependencies.pageState(),
     catch: () => ({ code: "page_failed" }),
   });
-  if (Result.isError(finalStatus)) {
-    const disconnected = disconnectPageConnection(pageConnection);
-    return Result.isError(disconnected) ? disconnected : finalStatus;
-  }
-  if (finalStatus.value.state === "not_logged_in") {
-    const disconnected = disconnectPageConnection(pageConnection);
-    return Result.isError(disconnected) ? disconnected : Result.err({ code: "not_logged_in" });
-  }
-  if (finalStatus.value.state !== "ready") {
-    const disconnected = disconnectPageConnection(pageConnection);
-    return Result.isError(disconnected) ? disconnected : Result.err({ code: "editor_not_ready" });
-  }
+  if (Result.isError(finalStatus)) return disconnectWithError(finalStatus.error);
+  if (finalStatus.value.state === "not_logged_in")
+    return disconnectWithError({ code: "not_logged_in" });
+  if (finalStatus.value.state !== "ready") return disconnectWithError({ code: "editor_not_ready" });
+  const beforeRelay = assertUnchanged();
+  if (Result.isError(beforeRelay)) return disconnectWithError(beforeRelay.error);
   const relayCreated = Result.try({
     try: () =>
-      Nexus.relay({
+      Nexus.relay<ChromeAdapterModel<ContentAppMeta>, PageBridgeAdapterModel>({
         from: dependencies.chromeRuntime,
-        to: { nexus: dependencies.pageRuntime, target: {} },
+        to: {
+          nexus: dependencies.pageRuntime,
+          where: (
+            identity: PageBridgeAdapterModel["contextMeta"],
+            observed: PageBridgeAdapterModel["connectionMeta"],
+          ) =>
+            observed === pageConnection.connectionMeta &&
+            identity === pageConnection.contextMeta &&
+            pageConnection.status === "connected" &&
+            hasPreparationVersion(identity) &&
+            Result.isOk(assertUnchanged()),
+        },
         services: [editorToken],
       }),
     catch: () => ({ code: "page_failed" as const }),
@@ -152,12 +199,23 @@ export async function initializeContentServices(
     return relayCreated;
   }
   const relay = relayCreated.value;
+  let active = true;
+  const revoke = () => {
+    if (!active) return;
+    active = false;
+    app.editorReady = false;
+    const disposed = disposeRelay(relay);
+    if (Result.isError(disposed)) reportStartupFailure(disposed.error);
+    return dependencies.chromeRuntime
+      .updateIdentity({ app: { ...app } })
+      .catch(() => reportStartupFailure({ code: "page_failed" }));
+  };
+  pageConnection.onDisconnected(revoke);
+  pageConnection.subscribeIdentity((identity) => {
+    if (!hasPreparationVersion(identity)) revoke();
+  });
   const registration = Result.try({
-    try: () =>
-      dependencies.onDispose?.(async () => {
-        const result = await disposeRelay(relay);
-        if (Result.isError(result)) reportStartupFailure(result.error);
-      }),
+    try: () => dependencies.onDispose?.(revoke),
     catch: () => ({ code: "page_failed" as const }),
   });
   if (Result.isError(registration)) {
@@ -167,17 +225,44 @@ export async function initializeContentServices(
     if (Result.isError(disconnected)) reportStartupFailure(disconnected.error);
     return registration;
   }
+  const beforePublication = assertUnchanged();
+  if (Result.isError(beforePublication)) {
+    await revoke();
+    return disconnectWithError(beforePublication.error);
+  }
   const identity = await Result.tryPromise({
-    try: () => dependencies.chromeRuntime.updateIdentity({ app: { editorReady: true } }),
+    try: () => {
+      app.editorReady = active;
+      return dependencies.chromeRuntime.updateIdentity({ app: { ...app } });
+    },
     catch: () => ({ code: "page_failed" }),
   });
   if (Result.isError(identity)) {
-    const relayDisposed = disposeRelay(relay);
+    await revoke();
     const disconnected = disconnectPageConnection(pageConnection);
-    if (Result.isError(relayDisposed)) reportStartupFailure(relayDisposed.error);
     if (Result.isError(disconnected)) reportStartupFailure(disconnected.error);
     return identity;
   }
+  const afterPublication = assertUnchanged();
+  if (!active || Result.isError(afterPublication)) {
+    await revoke();
+    // An in-flight ready snapshot can arrive after invalidation's revoke.
+    // Fence that snapshot before returning the terminal result.
+    app.editorReady = false;
+    await dependencies.chromeRuntime
+      .updateIdentity({ app: { ...app } })
+      .catch(() => reportStartupFailure({ code: "page_failed" }));
+    return disconnectWithError(
+      Result.isError(afterPublication) ? afterPublication.error : { code: "target_unavailable" },
+    );
+  }
+  dependencies.onEditor?.(() =>
+    active &&
+    pageConnection.status === "connected" &&
+    hasPreparationVersion(pageConnection.contextMeta)
+      ? editor
+      : undefined,
+  );
   return Result.ok(true);
 }
 
@@ -227,16 +312,6 @@ export async function runContentStartup(options: {
       : Result.err({ code: "document_not_ready" });
   }
 
-  if (options.route.kind === "home") {
-    const registered = registerInvalidation(options.ctx, async () =>
-      stopWatching(options.stopWatchingLogin),
-    );
-    if (Result.isError(registered)) {
-      const cleaned = stopWatching(options.stopWatchingLogin);
-      return Result.isError(cleaned) ? cleaned : Result.err({ code: "setup_failed" });
-    }
-    return Result.ok();
-  }
   if (options.route.kind === "draft-list") {
     const decision = await Result.tryPromise({
       try: async () => options.waitForDraftDecision(),
@@ -246,20 +321,12 @@ export async function runContentStartup(options: {
       const cleanup = stopWatching(options.stopWatchingLogin);
       return Result.isError(cleanup) ? cleanup : decision;
     }
-    if (decision.value === "not_logged_in") {
-      const registered = registerInvalidation(options.ctx, async () =>
-        stopWatching(options.stopWatchingLogin),
-      );
-      if (Result.isError(registered)) {
-        const cleaned = stopWatching(options.stopWatchingLogin);
-        return Result.isError(cleaned) ? cleaned : Result.err({ code: "setup_failed" });
-      }
-      return Result.ok();
-    }
-    if (decision.value !== "ready") {
+    if (decision.value === "loading") {
       const cleanup = stopWatching(options.stopWatchingLogin);
       return Result.isError(cleanup) ? cleanup : Result.err({ code: "setup_failed" });
     }
+  }
+  if (options.route.kind === "home" || options.route.kind === "draft-list") {
     const registered = registerInvalidation(options.ctx, async () =>
       stopWatching(options.stopWatchingLogin),
     );
@@ -274,15 +341,17 @@ export async function runContentStartup(options: {
     return Result.isError(cleanup) ? cleanup : Result.err({ code: "route_unsupported" });
   }
 
-  const result = await options.prepareEditor();
-  if (Result.isError(result)) {
+  const registered = registerInvalidation(options.ctx, () => cleanupStartupResources(options));
+  if (Result.isError(registered)) {
     const cleanup = await cleanupStartupResources(options);
     if (Result.isError(cleanup)) return Result.err(cleanup.error);
     return Result.err({ code: "setup_failed" });
   }
-  const registered = registerInvalidation(options.ctx, () => cleanupStartupResources(options));
-  if (Result.isError(registered)) {
-    const cleanup = await cleanupStartupResources(options);
+  const result = await options.prepareEditor();
+  if (Result.isError(result)) {
+    // MAIN belongs to bootstrap; login observation belongs to the live document,
+    // just like the independently published Chrome status service.
+    const cleanup = options.cleanupEditor ? await options.cleanupEditor() : Result.ok();
     if (Result.isError(cleanup)) return Result.err(cleanup.error);
     return Result.err({ code: "setup_failed" });
   }
@@ -335,12 +404,6 @@ function stopWatching(
   return Result.try({ try: () => stop(), catch: () => ({ code: "setup_failed" as const }) });
 }
 
-async function disposeBridge(
-  bridge: import("../src/transport/page-bridge").IsolatedPageBridge,
-): Promise<import("../src/transport/page-bridge").BridgeCleanupResult> {
-  return bridge.dispose();
-}
-
 export function createDraftPageService(document: Document) {
   const routeIdentity = appmsgRouteIdentity(document.location.href);
   const isOriginalDraftList = classifyAppmsgUrl(document.location.href).kind === "draft-list";
@@ -361,18 +424,6 @@ export function createDraftPageService(document: Document) {
             catch: () => ({ code: "page_failed" as const }),
           });
       return encodeServiceResult(listDraftsResultCodec, result);
-    },
-    async openDraft(candidate: string) {
-      const result = !isCurrentDraftList()
-        ? Result.err({ code: "route_changed" as const })
-        : openDraftGroup(document, candidate, () => {
-            const current = listDraftGroups(document);
-            if (!isCurrentDraftList()) return false;
-            if (current.filter((item) => item.groupId === candidate).length !== 1) return false;
-            if (detectLoginTimeout(document).state === "not_logged_in") return false;
-            return true;
-          });
-      return encodeServiceResult(openDraftResultCodec, result);
     },
     async validateDraft(candidate: string) {
       const result = Result.try({
@@ -398,15 +449,6 @@ export function createDraftPageService(document: Document) {
         currentItemCountResultCodec,
         Result.try({
           try: () => countVisibleAppmsgItems(document),
-          catch: () => ({ code: "page_failed" as const }),
-        }),
-      );
-    },
-    async hasUniqueCurrentItem() {
-      return encodeServiceResult(
-        hasUniqueCurrentItemResultCodec,
-        Result.try({
-          try: () => hasUniqueObservedCurrentItem(document),
           catch: () => ({ code: "page_failed" as const }),
         }),
       );
@@ -459,24 +501,6 @@ export function createHomePageService(document: Document) {
       );
       return encodeServiceResult(openDraftListResultCodec, result);
     },
-    async openNewEditor() {
-      const found = Result.try({
-        try: () => uniqueControl("div.new-creation__menu-item", isArticleItem),
-        catch: () => ({ code: "page_failed" as const }),
-      });
-      const result = Result.isError(found)
-        ? found
-        : found.value
-          ? Result.try({
-              try: () => {
-                found.value?.click();
-                return true;
-              },
-              catch: () => ({ code: "page_failed" as const }),
-            })
-          : Result.err({ code: "control_unavailable" as const });
-      return encodeServiceResult(openNewEditorResultCodec, result);
-    },
   };
 }
 
@@ -494,17 +518,28 @@ export default defineContentScript({
   async main(ctx) {
     const route = classifyAppmsgUrl(location.href);
     const routeIdentity = appmsgRouteIdentity(location.href) ?? "unsupported";
-    let loginTimeout = detectLoginTimeout(document).state === "not_logged_in";
+    const app: ContentAppMeta = {
+      protocolVersion,
+      editorReady: false,
+      loginExpired: detectLoginTimeout(document).state === "not_logged_in",
+    };
+    let fieldsActive = true;
+    let existingEditor:
+      | (() =>
+          | Remote<import("../src/page-contracts").PageEditorService, PageBridgeAdapterModel>
+          | undefined)
+      | undefined;
+    ctx.onInvalidated(() => {
+      fieldsActive = false;
+    });
     const isOriginalEditor = createEditorTargetValidator(document);
-    const validateTarget = () => !loginTimeout && isOriginalEditor();
-    const chromeRuntime = new Nexus<ChromeAdapterModel<{ editorReady: boolean }>>();
+    const validateTarget = () => fieldsActive && !app.loginExpired && isOriginalEditor();
+    const chromeRuntime = new Nexus<ChromeAdapterModel<ContentAppMeta>>();
     chromeRuntime.configure({
-      ...createContentScriptConfig<{ editorReady: boolean }>({ app: { editorReady: false } }),
-      policy: {
-        canCall({ serviceName }) {
-          return serviceName !== pageEditorToken.id || validateTarget();
-        },
-      },
+      ...createContentScriptConfig<ContentAppMeta>({
+        app: { ...app },
+      }),
+      policy: contentAuthorizationPolicy(validateTarget),
     });
     const runtimeReady = await Result.tryPromise({
       try: async () => chromeRuntime.ready(),
@@ -514,57 +549,54 @@ export default defineContentScript({
       reportStartupFailure(runtimeReady.error);
       return;
     }
+    if (!fieldsActive) return;
     chromeRuntime.provide(draftPageToken, createDraftPageService(document));
+    chromeRuntime.provide(
+      articleFieldsToken,
+      createArticleFieldsService(document, () => fieldsActive && validateTarget()),
+    );
+    chromeRuntime.provide(
+      materialPageToken,
+      createMaterialPageService(document, () => fieldsActive && validateTarget()),
+    );
+    chromeRuntime.provide(
+      articleCoverPageToken,
+      createArticleCoverPageService(
+        document,
+        () => fieldsActive && validateTarget(),
+        () => (fieldsActive ? existingEditor?.() : undefined),
+      ),
+    );
     chromeRuntime.provide(homePageToken, createHomePageService(document));
-    let editorServiceReady = false;
     const stopWatchingLogin = observeLoginTimeout(document, (state) => {
-      loginTimeout = state === "not_logged_in";
+      if (!fieldsActive || appmsgRouteIdentity(document.location.href) !== routeIdentity) return;
+      const expired = state === "not_logged_in";
+      if (expired === app.loginExpired) return;
+      app.loginExpired = expired;
+      void chromeRuntime
+        .updateIdentity({ app: { ...app } })
+        .catch(() => reportStartupFailure({ code: "page_failed" }));
     });
-    chromeRuntime.provide(contentStatusToken, {
-      async status() {
-        const outcome = Result.try({
-          try: () => {
-            const domReady = document.readyState !== "loading";
-            const currentLoginTimeout = detectLoginTimeout(document).state === "not_logged_in";
-            if (currentLoginTimeout) loginTimeout = true;
-            const hasObservedDraftCard =
-              route.kind === "draft-list" &&
-              [...document.querySelectorAll<HTMLElement>(".weui-desktop-card[data-appid]")].some(
-                (card) => card.isConnected,
-              );
-            let state: "ready" | "not_logged_in" | "loading";
-            if (currentLoginTimeout || loginTimeout) state = "not_logged_in";
-            else if (route.kind === "home" && domReady) state = "ready";
-            else if (route.kind === "draft-list" && domReady && hasObservedDraftCard)
-              state = "ready";
-            else if (editorServiceReady) state = "ready";
-            else state = "loading";
-            return { state, route: routeIdentity, documentReady: domReady };
-          },
-          catch: () => ({ code: "page_failed" as const }),
-        });
-        return encodeServiceResult(contentStatusResultCodec, outcome);
-      },
-    });
+    chromeRuntime.provide(
+      contentStatusToken,
+      createContentStatusService(document, validateTarget, () => app.loginExpired === true),
+    );
     let pageRuntime: Nexus<PageBridgeAdapterModel> | undefined;
     let bridge: import("../src/transport/page-bridge").IsolatedPageBridge | undefined;
     const cleanupEditorBootstrap = async (): Promise<
       import("../src/transport/page-bridge").BridgeCleanupResult
-    > => {
-      const disposed = bridge ? await disposeBridge(bridge) : Result.ok();
-      return disposed;
-    };
+    > => (bridge ? bridge.dispose() : Result.ok());
     const backgroundConnected = await Result.tryPromise({
       try: async () => chromeRuntime.connect({ target: chromeTarget.background(), timeout: 2_000 }),
       catch: () => ({ code: "setup_failed" as const }),
     });
-    if (Result.isError(backgroundConnected)) {
+    if (Result.isError(backgroundConnected) || !fieldsActive) {
       const cleanup = await cleanupStartupResources({
         stopWatchingLogin,
         cleanupEditor: cleanupEditorBootstrap,
       });
       if (Result.isError(cleanup)) reportStartupFailure(cleanup.error);
-      reportStartupFailure(backgroundConnected.error);
+      if (Result.isError(backgroundConnected)) reportStartupFailure(backgroundConnected.error);
       return;
     }
     const startup = await runContentStartup({
@@ -583,25 +615,39 @@ export default defineContentScript({
       async prepareEditor() {
         const bridgeResult = await injectMainWorldBridge(document, undefined, async (endpoint) => {
           pageRuntime = new Nexus<PageBridgeAdapterModel>();
-          pageRuntime.configure({ endpoint: { implementation: endpoint, meta: {} } });
+          pageRuntime.configure({
+            endpoint: { implementation: endpoint, meta: { app: { protocolVersion } } },
+            policy: {
+              canConnect: ({ remoteIdentity }) => hasPreparationVersion(remoteIdentity),
+              canCall: ({ remoteIdentity }) => hasPreparationVersion(remoteIdentity),
+            },
+          });
           await pageRuntime.ready();
         });
         if (Result.isError(bridgeResult)) return Result.err({ code: "setup_failed" as const });
         bridge = bridgeResult.value;
+        if (!fieldsActive) {
+          const cleanup = await cleanupEditorBootstrap();
+          return Result.isError(cleanup) ? cleanup : Result.err({ code: "target_unavailable" });
+        }
         if (!pageRuntime) return Result.err({ code: "setup_failed" as const });
         const initialized = await initializeContentServices({
           document,
           pageRuntime,
           chromeRuntime,
+          app,
           onDispose: (cleanup) => ctx.onInvalidated(cleanup),
           async pageState() {
             return {
-              state: loginTimeout ? "not_logged_in" : "ready",
+              state: app.loginExpired ? "not_logged_in" : "ready",
               route: routeIdentity,
               documentReady: document.readyState !== "loading",
             };
           },
           validateTarget,
+          onEditor(accessor) {
+            existingEditor = accessor;
+          },
         });
         if (Result.isError(initialized)) return initialized;
         return initialized.value ? Result.ok() : Result.err({ code: "setup_failed" as const });
@@ -611,20 +657,515 @@ export default defineContentScript({
       reportStartupFailure(startup.error);
       return;
     }
-    editorServiceReady = route.kind === "new" || route.kind === "saved-editor";
   },
 });
 
-function reportStartupFailure(error: unknown): void {
-  console.error("mpctl content startup failed", error);
+export function contentAuthorizationPolicy(
+  validateTarget: () => boolean,
+): AuthorizationPolicy<ChromeAdapterModel<ContentAppMeta>> {
+  return {
+    canConnect: ({ remoteIdentity }) => hasPreparationVersion(remoteIdentity),
+    canCall: ({ serviceName, remoteIdentity, localIdentity }) =>
+      hasPreparationVersion(remoteIdentity) &&
+      (serviceName !== pageEditorToken.id ||
+        (localIdentity.app.editorReady &&
+          localIdentity.app.loginExpired !== true &&
+          validateTarget())),
+  };
 }
 
-function isVisible(element: HTMLElement): boolean {
-  if (element.hidden || element.getAttribute("aria-hidden") === "true") return false;
-  const style = element.ownerDocument.defaultView?.getComputedStyle(element);
-  return (
-    style?.display !== "none" &&
-    style?.visibility !== "hidden" &&
-    element.getClientRects().length > 0
-  );
+export function createContentStatusService(
+  document: Document,
+  validateTarget: () => boolean,
+  loginExpired: () => boolean = () => false,
+) {
+  const route = classifyAppmsgUrl(document.location.href);
+  const routeIdentity = appmsgRouteIdentity(document.location.href) ?? "unsupported";
+  return {
+    async status() {
+      const outcome = Result.try({
+        try: () => {
+          const domReady = document.readyState !== "loading";
+          const hasDraftCard =
+            route.kind === "draft-list" &&
+            [...document.querySelectorAll<HTMLElement>(".weui-desktop-card[data-appid]")].some(
+              (card) => card.isConnected,
+            );
+          const state =
+            detectLoginTimeout(document).state === "not_logged_in" || loginExpired()
+              ? ("not_logged_in" as const)
+              : domReady &&
+                  (route.kind === "home" ||
+                    hasDraftCard ||
+                    ((route.kind === "new" || route.kind === "saved-editor") && validateTarget()))
+                ? ("ready" as const)
+                : ("loading" as const);
+          return { state, route: routeIdentity, documentReady: domReady };
+        },
+        catch: () => ({ code: "page_failed" as const }),
+      });
+      return encodeServiceResult(contentStatusResultCodec, outcome);
+    },
+  };
+}
+
+export function createArticleFieldsService(document: Document, validateTarget: () => boolean) {
+  const executorId = crypto.randomUUID();
+  const entries = new Map<
+    string,
+    {
+      signature: string;
+      task: Promise<
+        import("better-result").SerializedResult<
+          FieldsReceipt,
+          import("@mpctl/contracts").ServiceError<Failure>
+        >
+      >;
+      receipt?: FieldsReceipt;
+    }
+  >();
+  const originalRoute = appmsgRouteIdentity(document.location.href);
+  let updateQueue = Promise.resolve();
+  const guardedRead = (): import("better-result").Result<
+    import("../src/mp/article-fields").ArticleFields,
+    { code: string }
+  > => {
+    if (!originalRoute || appmsgRouteIdentity(document.location.href) !== originalRoute)
+      return Result.err({ code: "route_changed" as const });
+    if (detectLoginTimeout(document).state === "not_logged_in")
+      return Result.err({ code: "not_logged_in" as const });
+    if (!validateTarget()) return Result.err({ code: "target_unavailable" as const });
+    const fields = readArticleFields(document);
+    if (Result.isError(fields)) return fields;
+    if (detectLoginTimeout(document).state === "not_logged_in")
+      return Result.err({ code: "not_logged_in" as const });
+    if (!validateTarget() || appmsgRouteIdentity(document.location.href) !== originalRoute)
+      return Result.err({ code: "target_unavailable" as const });
+    return fields;
+  };
+  return {
+    identity() {
+      return encodeServiceResult(fieldsIdentityResultCodec, Result.ok({ executorId }));
+    },
+    getReceipt(id: string) {
+      return encodeServiceResult(
+        fieldsReceiptResultCodec,
+        v.safeParse(operationIdSchema, id).success
+          ? Result.ok(entries.get(id)?.receipt ?? null)
+          : Result.err({ code: "invalid_operation" as const }),
+      );
+    },
+    async readArticleFields() {
+      const result = Result.try({
+        try: guardedRead,
+        catch: () => ({ code: "page_failed" as const }),
+      }).andThen((fields) => fields);
+      const mapped = Result.isError(result)
+        ? Result.err({
+            code:
+              result.error.code === "not_logged_in"
+                ? ("not_logged_in" as const)
+                : result.error.code === "route_changed" ||
+                    result.error.code === "target_unavailable"
+                  ? ("route_changed" as const)
+                  : ("page_failed" as const),
+          })
+        : Result.ok(result.value);
+      return encodeServiceResult(articleFieldsResultCodec, mapped);
+    },
+    updateArticleFields(
+      input: unknown,
+      expectedHash: string,
+      execution: import("../src/background-contracts").FieldsExecution,
+    ) {
+      const validated = validateArticleFieldUpdate(input);
+      const bound = v.safeParse(fieldsExecutionSchema, execution);
+      const reject = (code: Failure["code"]) =>
+        encodeServiceResult(articleFieldUpdateResultCodec, Result.err({ code }));
+      if (validated.isErr() || !/^[0-9a-f]{64}$/.test(expectedHash) || !bound.success)
+        return reject("invalid_operation");
+      if (bound.output.executorId !== executorId) return reject("executor_mismatch");
+      const id = bound.output.operationId;
+      const signature = fieldsRequestSignature(validated.value, expectedHash);
+      const existing = entries.get(id);
+      if (existing)
+        return existing.signature === signature ? existing.task : reject("operation_conflict");
+      let resolve!: (value: Awaited<ReturnType<typeof reject>>) => void;
+      const entry: { signature: string; task: ReturnType<typeof reject>; receipt?: FieldsReceipt } =
+        {
+          signature,
+          task: new Promise((done) => {
+            resolve = done;
+          }),
+        };
+      entries.set(id, entry);
+      const previous = updateQueue;
+      let release!: () => void;
+      const node = new Promise<void>((done) => {
+        release = done;
+      });
+      updateQueue = previous.then(() => node);
+      void run().then(resolve);
+      return entry.task;
+      async function run() {
+        let receipt: FieldsReceipt | undefined;
+        try {
+          const requestDigest = await fieldsRequestDigest(validated.unwrap(), expectedHash);
+          receipt = {
+            operationId: id,
+            executorId,
+            requestDigest,
+            effect: initialFieldsEffect(validated.unwrap()),
+            ended: false,
+          };
+          entry.receipt = receipt;
+          await previous;
+          const refuse = (code: Failure["code"]) => {
+            receipt!.ended = true;
+            receipt!.result = {
+              status: "error",
+              error: { code, cause: { at: "content.preflight", kind: "domain", code } },
+            };
+          };
+          const before = Result.try({
+            try: guardedRead,
+            catch: () => ({ code: "page_failed" }),
+          }).andThen((value) => value);
+          if (before.isErr()) refuse(before.error.code as Failure["code"]);
+          else {
+            const hash = await hashArticleFields(before.value);
+            if (hash.isErr()) refuse("hash_failed");
+            else if (hash.value !== expectedHash) refuse("content_conflict");
+            else {
+              const current = guardedRead();
+              if (current.isErr()) refuse(current.error.code as Failure["code"]);
+              else if (JSON.stringify(current.value) !== JSON.stringify(before.value))
+                refuse("content_conflict");
+              else
+                Object.assign(
+                  receipt,
+                  await writeArticleFields(
+                    document,
+                    validated.unwrap(),
+                    () => {
+                      if (
+                        !originalRoute ||
+                        appmsgRouteIdentity(document.location.href) !== originalRoute
+                      )
+                        return Result.err({ code: "route_changed" as const });
+                      if (detectLoginTimeout(document).state === "not_logged_in")
+                        return Result.err({ code: "not_logged_in" as const });
+                      if (!validateTarget())
+                        return Result.err({ code: "target_unavailable" as const });
+                      return Result.ok();
+                    },
+                    (effect) => {
+                      receipt!.effect = effect;
+                    },
+                  ),
+                );
+            }
+          }
+          return encodeServiceResult(articleFieldUpdateResultCodec, Result.ok(receipt));
+        } catch {
+          if (!receipt) return reject("hash_failed");
+          receipt.ended = true;
+          receipt.result = {
+            status: "error",
+            error: {
+              code: "page_failed",
+              cause: { at: "content.preflight", kind: "runtime", code: "unexpected_exception" },
+            },
+          };
+          return encodeServiceResult(articleFieldUpdateResultCodec, Result.ok(receipt));
+        } finally {
+          release();
+        }
+      }
+    },
+  };
+}
+
+export function createMaterialPageService(document: Document, validateTarget: () => boolean) {
+  const executorId = crypto.randomUUID();
+  const entries = new Map<
+    string,
+    {
+      digest: Promise<string>;
+      task: Promise<
+        import("better-result").SerializedResult<
+          import("../src/background-contracts").UploadReceipt,
+          import("@mpctl/contracts").ServiceError<Failure>
+        >
+      >;
+      receipt?: import("../src/background-contracts").UploadReceipt;
+    }
+  >();
+  const route = appmsgRouteIdentity(document.location.href);
+  const guard = () => {
+    if (!route || appmsgRouteIdentity(document.location.href) !== route)
+      return Result.err({ code: "route_changed" as const });
+    if (detectLoginTimeout(document).state === "not_logged_in")
+      return Result.err({ code: "not_logged_in" as const });
+    if (!validateTarget()) return Result.err({ code: "target_unavailable" as const });
+    return Result.ok(undefined);
+  };
+  return {
+    async list() {
+      const result = await listMaterials(document, guard);
+      return encodeServiceResult(materialListResultCodec, result);
+    },
+    identity() {
+      return encodeServiceResult(materialIdentityResultCodec, Result.ok({ executorId }));
+    },
+    getReceipt(id: string) {
+      return encodeServiceResult(
+        uploadReceiptResultCodec,
+        v.safeParse(operationIdSchema, id).success
+          ? Result.ok(entries.get(id)?.receipt ?? null)
+          : Result.err({ code: "invalid_operation" as const }),
+      );
+    },
+    upload(
+      payload: import("@mpctl/contracts").AssetPayload,
+      execution: import("../src/background-contracts").UploadExecution,
+    ) {
+      const reject = (code: Failure["code"]) =>
+        encodeServiceResult(materialUploadResultCodec, Result.err({ code }));
+      const parsed = v.safeParse(assetPayloadSchema, payload);
+      const bound = v.safeParse(uploadExecutionSchema, execution);
+      if (!parsed.success || !bound.success) return reject("invalid_operation");
+      payload = parsed.output;
+      if (bound.output.executorId !== executorId) return reject("executor_mismatch");
+      const id = bound.output.operationId;
+      const digest = Promise.resolve().then(() => assetRequestDigest(payload));
+      void digest.catch(() => undefined);
+      const old = entries.get(id);
+      if (old)
+        return Promise.all([old.digest, digest]).then(
+          ([a, b]) => (a === b ? old.task : reject("operation_conflict")),
+          () => reject("hash_failed"),
+        );
+      let resolve!: (value: Awaited<ReturnType<typeof reject>>) => void;
+      const entry: {
+        digest: Promise<string>;
+        task: ReturnType<typeof reject>;
+        receipt?: import("../src/background-contracts").UploadReceipt;
+      } = {
+        digest,
+        task: new Promise((done) => {
+          resolve = done;
+        }),
+      };
+      // Reserve before the first asynchronous fingerprint/UI step, including direct Nexus duplicates.
+      entries.set(id, entry);
+      void run().then(resolve, async () => resolve(await reject("page_failed")));
+      return entry.task;
+      async function run() {
+        let receipt: import("../src/background-contracts").UploadReceipt;
+        try {
+          receipt = {
+            operationId: id,
+            executorId,
+            requestDigest: await digest,
+            effect: { outcome: "not_dispatched", filename: payload.filename },
+            ended: false,
+          };
+        } catch (error) {
+          return reject(v.isValiError(error) ? "invalid_asset" : "hash_failed");
+        }
+        entry.receipt = receipt;
+        await uploadMaterial(document, payload, guard, (observation) =>
+          Object.assign(receipt, observation),
+        );
+        return encodeServiceResult(materialUploadResultCodec, Result.ok(receipt));
+      }
+    },
+  };
+}
+
+export function createArticleCoverPageService(
+  document: Document,
+  validateTarget: () => boolean,
+  existingEditor?: () =>
+    | Remote<import("../src/page-contracts").PageEditorService, PageBridgeAdapterModel>
+    | undefined,
+) {
+  const executorId = crypto.randomUUID();
+  const entries = new Map<
+    string,
+    { signature: string; task: Promise<unknown>; receipt?: CoverReceipt | SaveReceipt }
+  >();
+  const route = appmsgRouteIdentity(document.location.href);
+  const guard = (): import("better-result").Result<
+    void,
+    { code: "route_changed" | "not_logged_in" | "target_unavailable" }
+  > => {
+    if (!route || appmsgRouteIdentity(document.location.href) !== route)
+      return Result.err({ code: "route_changed" });
+    if (detectLoginTimeout(document).state === "not_logged_in")
+      return Result.err({ code: "not_logged_in" });
+    if (!validateTarget()) return Result.err({ code: "target_unavailable" });
+    return Result.ok(undefined);
+  };
+  const read = async (): Promise<
+    import("better-result").Result<
+      string,
+      {
+        code:
+          | "route_changed"
+          | "not_logged_in"
+          | "target_unavailable"
+          | "cover_unavailable"
+          | "unsupported"
+          | "hash_failed"
+          | "page_failed";
+      }
+    >
+  > => {
+    const before = guard();
+    if (Result.isError(before)) return before;
+    const snapshot = readArticleCover(document);
+    if (Result.isError(snapshot)) return Result.err({ code: snapshot.error.code });
+    const hash = await hashArticleCover(snapshot.value);
+    const after = guard();
+    if (Result.isError(after)) return after;
+    return Result.isError(hash) ? Result.err({ code: hash.error.code }) : Result.ok(hash.value);
+  };
+  return {
+    identity() {
+      return encodeServiceResult(fieldsIdentityResultCodec, Result.ok({ executorId }));
+    },
+    async getReceipt(id: string) {
+      if (!entries.has(id)) {
+        const editor = existingEditor?.();
+        if (editor) {
+          const response = await Nexus.safeCall(editor.getCoverReceipt(id));
+          return response.isErr()
+            ? encodeServiceResult(
+                coverSaveReceiptResultCodec,
+                Result.err({ code: "receipt_unreachable" }),
+              )
+            : response.value;
+        }
+        if (existingEditor)
+          return encodeServiceResult(
+            coverSaveReceiptResultCodec,
+            Result.err({ code: "receipt_unreachable" }),
+          );
+      }
+      return encodeServiceResult(
+        coverSaveReceiptResultCodec,
+        Result.ok(entries.get(id)?.receipt ?? null),
+      );
+    },
+    async read() {
+      const outcome = await read();
+      return encodeServiceResult(articleCoverHashResultCodec, outcome);
+    },
+    set(
+      candidate: { filename: string; thumbnailUrl: string },
+      expectedHash: string,
+      execution: CoverExecution,
+    ) {
+      const reject = (code: import("@mpctl/contracts").Failure["code"]) =>
+        encodeServiceResult(coverWriteResultCodec, Result.err({ code }));
+      if (!v.safeParse(coverExecutionSchema, execution).success) return reject("invalid_operation");
+      if (
+        !v.safeParse(
+          v.strictObject({
+            filename: v.pipe(v.string(), v.minLength(1)),
+            thumbnailUrl: v.pipe(v.string(), v.url()),
+          }),
+          candidate,
+        ).success ||
+        !/^[0-9a-f]{64}$/.test(expectedHash)
+      )
+        return reject("invalid_payload");
+      if (execution.executorId !== executorId) return reject("executor_mismatch");
+      const signature = JSON.stringify([
+        "cover",
+        candidate.filename,
+        candidate.thumbnailUrl,
+        expectedHash,
+        execution.asset,
+      ]);
+      const old = entries.get(execution.operationId);
+      if (old)
+        return old.signature === signature
+          ? (old.task as ReturnType<typeof reject>)
+          : reject("operation_conflict");
+      let resolve!: (value: Awaited<ReturnType<typeof reject>>) => void;
+      const task = new Promise<Awaited<ReturnType<typeof reject>>>((done) => {
+        resolve = done;
+      });
+      const entry: { signature: string; task: typeof task; receipt?: CoverReceipt } = {
+        signature,
+        task,
+      };
+      entries.set(execution.operationId, entry);
+      void run().then(resolve, async () => resolve(await reject("page_failed")));
+      return task;
+      async function run() {
+        const receipt: CoverReceipt = {
+          operationId: execution.operationId,
+          executorId,
+          requestDigest: await coverRequestDigest(execution.asset, expectedHash),
+          effect: { cover: true, outcome: "not_dispatched" },
+          ended: false,
+        };
+        entry.receipt = receipt;
+        await setArticleCover(document, candidate, expectedHash, guard, (observation) =>
+          Object.assign(receipt, observation),
+        );
+        return encodeServiceResult(coverWriteResultCodec, Result.ok(receipt));
+      }
+    },
+    save(execution: SaveExecution) {
+      const reject = (code: import("@mpctl/contracts").Failure["code"]) =>
+        encodeServiceResult(saveWriteResultCodec, Result.err({ code }));
+      if (!v.safeParse(saveExecutionSchema, execution).success) return reject("invalid_operation");
+      if (execution.executorId !== executorId) return reject("executor_mismatch");
+      const signature = JSON.stringify([
+        "save",
+        execution.expectedBodyHash,
+        execution.expectedFieldsHash,
+        execution.expectedCoverHash,
+      ]);
+      const old = entries.get(execution.operationId);
+      if (old)
+        return old.signature === signature
+          ? (old.task as ReturnType<typeof reject>)
+          : reject("operation_conflict");
+      let resolve!: (value: Awaited<ReturnType<typeof reject>>) => void;
+      const task = new Promise<Awaited<ReturnType<typeof reject>>>((done) => {
+        resolve = done;
+      });
+      const entry: { signature: string; task: typeof task; receipt?: SaveReceipt } = {
+        signature,
+        task,
+      };
+      entries.set(execution.operationId, entry);
+      void run().then(resolve, async () => resolve(await reject("page_failed")));
+      return task;
+      async function run() {
+        const receipt: SaveReceipt = {
+          operationId: execution.operationId,
+          executorId,
+          requestDigest: await saveRequestDigest(execution),
+          effect: { outcome: "not_dispatched", persistence: "unverified" },
+          ended: false,
+        };
+        entry.receipt = receipt;
+        await saveNativeArticle(document, guard, {
+          publish: (observation) => Object.assign(receipt, observation),
+        });
+        return encodeServiceResult(saveWriteResultCodec, Result.ok(receipt));
+      }
+    },
+  };
+}
+
+function reportStartupFailure(error: unknown): void {
+  console.error("mpctl content startup failed", error);
 }

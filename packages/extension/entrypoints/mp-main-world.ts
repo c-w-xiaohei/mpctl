@@ -1,4 +1,6 @@
 import { Nexus } from "@nexus-js/core";
+import { protocolVersion } from "@mpctl/contracts";
+import { hasPreparationVersion } from "../src/background-runtime";
 import { defineUnlistedScript } from "wxt/utils/define-unlisted-script";
 import { createEditorService, type EditorJsapi } from "../src/mp/jsapi";
 import { createEditorTargetValidator } from "../src/mp/editor";
@@ -6,7 +8,10 @@ import { pageEditorToken } from "../src/page-contracts";
 import { createPageEndpoint } from "../src/transport/page-bridge";
 import { Result } from "better-result";
 
-type MainBootstrapError = { code: "main_startup_failed" | "main_cleanup_failed" };
+type MainBootstrapError = {
+  code: "main_startup_failed" | "main_cleanup_failed";
+  cleanupFailed?: true;
+};
 
 export async function awaitMainWorldReady(
   ready: Promise<unknown>,
@@ -21,7 +26,7 @@ export async function awaitMainWorldReady(
     try: async () => closeEndpoint(),
     catch: () => ({ code: "main_cleanup_failed" as const }),
   });
-  return Result.isError(cleanup) ? Result.err({ code: "main_cleanup_failed" }) : started;
+  return Result.isError(cleanup) ? Result.err({ ...started.error, cleanupFailed: true }) : started;
 }
 
 export async function disposeMainWorldEndpoint(
@@ -48,6 +53,7 @@ export async function mountMainWorldBridge(
     throw new Error("MAIN world editor bridge bootstrap parameters are unavailable");
   }
   let createdEndpoint: ReturnType<typeof createPageEndpoint> | undefined;
+  let active = true;
   const endpointSetup = Result.try({
     try: () => {
       createdEndpoint = createPageEndpoint({
@@ -55,24 +61,35 @@ export async function mountMainWorldBridge(
         channelId,
         side: "main",
         eventNames: { fromIsolated: inbound, fromMain: outbound },
+        onClose() {
+          active = false;
+        },
       });
       const instance = new Nexus()
         .provide(
           pageEditorToken,
           createEditorService({
-            validateTarget: createEditorTargetValidator(document),
-            invoke(request) {
+            document,
+            validateTarget: (() => {
+              const isTarget = createEditorTargetValidator(document);
+              return () => active && isTarget();
+            })(),
+            get invoke() {
               const page = window as Window & { __MP_Editor_JSAPI__?: EditorJsapi };
               const current = page.__MP_Editor_JSAPI__;
-              if (typeof current?.invoke !== "function") {
-                request.errCb({ code: "jsapi_unavailable" });
-                return;
-              }
-              return current.invoke.call(current, request);
+              return typeof current?.invoke === "function"
+                ? current.invoke.bind(current)
+                : undefined;
             },
           }),
         )
-        .configure({ endpoint: { implementation: createdEndpoint, meta: {} } });
+        .configure({
+          endpoint: { implementation: createdEndpoint, meta: { app: { protocolVersion } } },
+          policy: {
+            canConnect: ({ remoteIdentity }) => hasPreparationVersion(remoteIdentity),
+            canCall: ({ remoteIdentity }) => hasPreparationVersion(remoteIdentity),
+          },
+        });
       return { endpoint: createdEndpoint, instance };
     },
     catch: () => ({ code: "main_startup_failed" as const }),
@@ -83,7 +100,8 @@ export async function mountMainWorldBridge(
         try: async () => createdEndpoint?.close?.(),
         catch: () => ({ code: "main_cleanup_failed" as const }),
       });
-      if (Result.isError(cleanup)) return Result.err(cleanup.error);
+      if (Result.isError(cleanup))
+        return Result.err({ ...endpointSetup.error, cleanupFailed: true });
     }
     return endpointSetup;
   }
@@ -92,6 +110,7 @@ export async function mountMainWorldBridge(
   if (Result.isError(ready)) return ready;
   return Result.ok({
     async dispose() {
+      active = false;
       return disposeMainWorldEndpoint(() => endpoint.close?.());
     },
   });

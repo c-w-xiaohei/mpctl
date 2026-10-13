@@ -2,13 +2,98 @@ import { describe, expect, test } from "bun:test";
 import {
   classifyEditorReadiness,
   classifyLoginTimeoutMarkers,
-  classifyContentPageState,
   waitForEditorPageDecision,
-  waitForLoginTimeoutState,
+  observeLoginTimeout,
   createEditorTargetValidator,
+  waitForDocumentReady,
 } from "../src/mp/editor";
 
 describe("editor readiness classification", () => {
+  test.each(["interactive", "complete"] as const)(
+    "accepts parsed %s documents without waiting for external resources",
+    async (readyState) => {
+      const events = new EventTarget();
+      const document = {
+        readyState,
+        addEventListener: events.addEventListener.bind(events),
+        removeEventListener: events.removeEventListener.bind(events),
+      } as unknown as Document;
+      expect(await waitForDocumentReady(document, 0)).toBe(true);
+    },
+  );
+
+  test("settles on DOMContentLoaded and removes readiness listeners", async () => {
+    const documentEvents = new EventTarget();
+    const windowEvents = new EventTarget();
+    const removed: string[] = [];
+    let readyState = "loading";
+    const document = {
+      get readyState() {
+        return readyState;
+      },
+      addEventListener: documentEvents.addEventListener.bind(documentEvents),
+      removeEventListener(type: string, listener: EventListener) {
+        removed.push(type);
+        documentEvents.removeEventListener(type, listener);
+      },
+      defaultView: {
+        addEventListener: windowEvents.addEventListener.bind(windowEvents),
+        removeEventListener(type: string, listener: EventListener) {
+          removed.push(type);
+          windowEvents.removeEventListener(type, listener);
+        },
+      },
+    } as unknown as Document;
+    const pending = waitForDocumentReady(document, 1_000);
+    readyState = "interactive";
+    documentEvents.dispatchEvent(new Event("DOMContentLoaded"));
+    expect(await pending).toBe(true);
+    expect(removed).toEqual(["DOMContentLoaded", "load"]);
+  });
+
+  test("a document that remains unparsed times out instead of becoming ready", async () => {
+    const events = new EventTarget();
+    const document = {
+      readyState: "loading",
+      addEventListener: events.addEventListener.bind(events),
+      removeEventListener: events.removeEventListener.bind(events),
+    } as unknown as Document;
+    expect(await waitForDocumentReady(document, 0)).toBe(false);
+  });
+
+  test("parsed DOM still requires positive draft or editor evidence", async () => {
+    const events = new EventTarget();
+    let cards: { isConnected: boolean }[] = [];
+    const document = {
+      readyState: "interactive",
+      URL: "https://mp.weixin.qq.com/cgi-bin/appmsg?begin=0&count=10&type=77&action=list_card",
+      body: { classList: [] },
+      querySelector: () => null,
+      querySelectorAll: () => cards,
+      addEventListener: events.addEventListener.bind(events),
+      removeEventListener: events.removeEventListener.bind(events),
+    } as unknown as Document;
+    const original = globalThis.MutationObserver;
+    globalThis.MutationObserver = class {
+      observe() {}
+      disconnect() {}
+    } as unknown as typeof MutationObserver;
+    try {
+      const decision = waitForEditorPageDecision(document, () => false, 1_000);
+      expect(decision.current()).toBe("loading");
+      cards = [{ isConnected: true }];
+      decision.notify();
+      expect(await decision.result).toBe("ready");
+      Object.defineProperty(document, "URL", {
+        value: "https://mp.weixin.qq.com/cgi-bin/appmsg?action=edit&type=77",
+      });
+      const editor = waitForEditorPageDecision(document, () => false, 0);
+      expect(await editor.result).toBe("loading");
+    } finally {
+      globalThis.MutationObserver = original;
+    }
+  });
+
   test("distinguishes a logged-out page from an editor still loading", () => {
     expect(classifyEditorReadiness({ loginTimeout: true, jsapiAvailable: false })).toBe(
       "not_logged_in",
@@ -44,12 +129,13 @@ describe("editor readiness classification", () => {
     });
   });
 
-  test("observes timeout markers that appear after document_start", async () => {
+  test("observes late login timeout markers until the runtime watcher is disposed", () => {
     const listeners = new Map<string, () => void>();
     const classes = new Set<string>();
     let info = "";
     let href = "";
     let observerCallback: (() => void) | undefined;
+    let disconnected = 0;
     const document = {
       readyState: "loading",
       body: { classList: { [Symbol.iterator]: () => classes.values() } },
@@ -72,43 +158,28 @@ describe("editor readiness classification", () => {
         observerCallback = callback;
       }
       observe() {}
-      disconnect() {}
+      disconnect() {
+        disconnected++;
+      }
     } as unknown as typeof MutationObserver;
     try {
-      const pending = waitForLoginTimeoutState(document as unknown as Document, 1_000);
+      const states: string[] = [];
+      const stop = observeLoginTimeout(document as unknown as Document, (state) =>
+        states.push(state),
+      );
+      expect(states).toEqual(["loading"]);
       classes.add("page_error");
       classes.add("page_timeout");
       info = "登录超时，请重新登录";
       href = "https://mp.weixin.qq.com/cgi-bin/loginpage?url=secret";
       observerCallback?.();
-      expect(await pending).toEqual({ state: "not_logged_in" });
-      expect(listeners.has("DOMContentLoaded")).toBe(false);
+      expect(states).toEqual(["loading", "not_logged_in"]);
+      expect(disconnected).toBe(0);
+      stop();
+      expect(disconnected).toBe(1);
     } finally {
       globalThis.MutationObserver = original;
     }
-  });
-
-  test("does not treat a DOM-ready empty list as usable, and reclassifies late timeout evidence", () => {
-    const route = "appmsg|list_card|type=77|begin=0|count=10";
-    const emptyList = {
-      routeKind: "draft-list" as const,
-      documentReady: true,
-      visibleDraftCards: 0,
-      editorReady: false,
-      loginTimeout: false,
-    };
-    expect(classifyContentPageState(emptyList)).toBe("loading");
-    expect(classifyContentPageState({ ...emptyList, visibleDraftCards: 1 })).toBe("ready");
-    expect(
-      classifyContentPageState({ ...emptyList, loginTimeout: true, visibleDraftCards: 1 }),
-    ).toBe("not_logged_in");
-    // Status is re-read from the same document on every query; late timeout markers override a previous loading observation.
-    const observations = [
-      classifyContentPageState(emptyList),
-      classifyContentPageState({ ...emptyList, loginTimeout: true }),
-    ];
-    expect(observations).toEqual(["loading", "not_logged_in"]);
-    expect(route).toContain("begin=0");
   });
 
   test("continues observing a DOM-ready ambiguous page past the old window and catches late timeout markers", async () => {

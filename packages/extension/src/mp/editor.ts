@@ -20,21 +20,6 @@ export function createEditorTargetValidator(document: Document): () => boolean {
 
 export type LoginTimeoutMarkers = { bodyClasses: string[]; infoText: string; jumpUrl: string };
 
-export function classifyContentPageState(input: {
-  routeKind: "draft-list" | "new-editor" | "saved-editor" | "unsupported";
-  documentReady: boolean;
-  visibleDraftCards: number;
-  editorReady: boolean;
-  loginTimeout: boolean;
-}): EditorState {
-  if (input.loginTimeout) return "not_logged_in";
-  if (!input.documentReady) return "loading";
-  if (input.routeKind === "draft-list") return input.visibleDraftCards > 0 ? "ready" : "loading";
-  if (input.routeKind === "new-editor" || input.routeKind === "saved-editor")
-    return input.editorReady ? "ready" : "loading";
-  return "loading";
-}
-
 export function classifyLoginTimeoutMarkers(markers: LoginTimeoutMarkers): { state: EditorState } {
   let jump: URL;
   try {
@@ -57,40 +42,6 @@ export function detectLoginTimeout(document: Document): { state: EditorState } {
     bodyClasses: [...(document.body?.classList ?? [])],
     infoText: document.querySelector("#info")?.textContent ?? "",
     jumpUrl,
-  });
-}
-
-export function waitForLoginTimeoutState(
-  document: Document,
-  timeoutMs = 10_000,
-): Promise<{ state: EditorState }> {
-  const current = detectLoginTimeout(document);
-  if (current.state === "not_logged_in") return Promise.resolve(current);
-  return new Promise((resolve) => {
-    let settled = false;
-    const finish = (state: EditorState) => {
-      if (settled) return;
-      settled = true;
-      observer.disconnect();
-      clearTimeout(timer);
-      document.removeEventListener("DOMContentLoaded", check);
-      resolve({
-        state: detectLoginTimeout(document).state === "not_logged_in" ? "not_logged_in" : state,
-      });
-    };
-    const check = () => {
-      if (detectLoginTimeout(document).state === "not_logged_in") finish("not_logged_in");
-    };
-    const observer = new MutationObserver(check);
-    observer.observe(document, {
-      childList: true,
-      subtree: true,
-      characterData: true,
-      attributes: true,
-      attributeFilter: ["class", "href"],
-    });
-    const timer = setTimeout(() => finish("loading"), timeoutMs);
-    check();
   });
 }
 
@@ -123,7 +74,7 @@ export function waitForEditorPageDecision(
   });
   const evaluate = (): EditorState => {
     if (detectLoginTimeout(document).state === "not_logged_in") return "not_logged_in";
-    if (document.readyState !== "complete") return "loading";
+    if (document.readyState === "loading") return "loading";
     const route = classifyObservedRoute(document.URL);
     if (route === "draft-list") {
       const cards = [
@@ -148,10 +99,7 @@ export function waitForEditorPageDecision(
     const state = evaluate();
     if (state !== "loading") finish(state);
   };
-  const observer = new MutationObserver(() => {
-    const state = evaluate();
-    if (state !== "loading") finish(state);
-  });
+  const observer = new MutationObserver(checkReady);
   observer.observe(document, {
     childList: true,
     subtree: true,
@@ -169,7 +117,9 @@ export function waitForEditorPageDecision(
 }
 
 export function waitForDocumentReady(document: Document, timeoutMs = 10_000): Promise<boolean> {
-  if (document.readyState === "complete") return Promise.resolve(true);
+  // DOM availability is separate from editor/JSAPI readiness. Images and other
+  // subresources must not prevent an already parsed editor from bootstrapping.
+  if (document.readyState !== "loading") return Promise.resolve(true);
   return new Promise((resolve) => {
     let settled = false;
     const finish = (ready: boolean) => {
@@ -178,10 +128,10 @@ export function waitForDocumentReady(document: Document, timeoutMs = 10_000): Pr
       clearTimeout(timer);
       document.removeEventListener("DOMContentLoaded", check);
       document.defaultView?.removeEventListener("load", check);
-      resolve(ready || document.readyState === "complete");
+      resolve(ready || document.readyState !== "loading");
     };
     const check = () => {
-      if (document.readyState === "complete") finish(true);
+      if (document.readyState !== "loading") finish(true);
     };
     document.addEventListener("DOMContentLoaded", check);
     document.defaultView?.addEventListener("load", check);

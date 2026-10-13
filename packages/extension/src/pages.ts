@@ -1,11 +1,47 @@
 import { chromeTarget } from "@nexus-js/chrome";
-import { type Connection } from "@nexus-js/core";
+import { Nexus, NexusError, type Connection, type RemoteValue } from "@nexus-js/core";
 import { Result, type Result as BetterResult } from "better-result";
 import { type ArticleNavigationStage } from "@mpctl/contracts";
-import { backgroundNexus } from "./background-runtime";
+import { backgroundNexus, hasPreparationVersion } from "./background-runtime";
 
-import { pageEditorToken, type PageEditorService } from "./page-contracts";
-import { contentStatusToken, draftPageToken, homePageToken } from "./background-contracts";
+import {
+  pageEditorToken,
+  pageEditorReadyResultCodec,
+  pageEditorContentResultCodec,
+  pageEditorWriteResultCodec,
+  type PageEditorService,
+} from "./page-contracts";
+import { pageEditorReceiptResultCodec, type BodyReceipt } from "./page-contracts";
+import type { OperationTarget } from "./operations";
+import type { Failure } from "@mpctl/contracts";
+import {
+  contentStatusToken,
+  draftPageToken,
+  homePageToken,
+  articleFieldsToken,
+  articleFieldUpdateResultCodec,
+  fieldsIdentityResultCodec,
+  fieldsReceiptResultCodec,
+  type FieldsReceipt,
+  type FieldsExecution,
+  materialPageToken,
+  materialListResultCodec,
+  materialUploadResultCodec,
+  materialIdentityResultCodec,
+  uploadReceiptResultCodec,
+  type UploadReceipt,
+  articleCoverPageToken,
+  coverWriteResultCodec,
+  saveWriteResultCodec,
+  coverReceiptResultCodec,
+  saveReceiptResultCodec,
+  type CoverExecution,
+  type BodyCoverExecution,
+  type SaveExecution,
+  type CoverReceipt,
+  type SaveReceipt,
+  articleCoverHashResultCodec,
+} from "./background-contracts";
 import {
   contentStatusResultCodec,
   currentItemCountResultCodec,
@@ -13,6 +49,7 @@ import {
   listDraftsResultCodec,
   openDraftListResultCodec,
   validateDraftResultCodec,
+  articleFieldsResultCodec,
 } from "./background-contracts";
 
 import {
@@ -42,212 +79,260 @@ function isPublicRootUrl(value: string | undefined): boolean {
   }
 }
 
-export type NativeTargetCapture =
-  | { kind: "captured"; url: string }
-  | { kind: "ambiguous" | "unavailable" | "unsupported" | "control_unavailable" };
+function isSavedEditorForGroup(url: string, groupId: string): boolean {
+  const route = classifyAppmsgUrl(url);
+  return route.kind === "saved-editor" && route.groupId === groupId;
+}
+
+function hasReadyEditor(identity: unknown): boolean {
+  if (typeof identity !== "object" || identity === null || !("app" in identity)) return false;
+  const app = identity.app;
+  return (
+    typeof app === "object" && app !== null && "editorReady" in app && app.editorReady === true
+  );
+}
+
+function hasExpiredLogin(identity: unknown): boolean {
+  if (typeof identity !== "object" || identity === null || !("app" in identity)) return false;
+  const app = identity.app;
+  return (
+    typeof app === "object" && app !== null && "loginExpired" in app && app.loginExpired === true
+  );
+}
+
+import { captureNativeNewEditorUrl, captureNativeDraftEditorUrl } from "./native-editor-target";
+export { captureNativeNewEditorUrl, captureNativeDraftEditorUrl } from "./native-editor-target";
+export type { NativeTargetCapture } from "./native-editor-target";
+
+type PageReplyError = { code: string } & Partial<
+  Pick<import("@mpctl/contracts").WorkspaceError, "readFailure">
+> & { cleanupFailed?: boolean; ended?: boolean; failure?: Failure };
+
+function callPage<T>(lazy: RemoteValue<T>, onInvoke?: () => void) {
+  if (!hasPreparationVersion(lazy.connection.contextMeta)) throw new PageAdmissionError();
+  onInvoke?.();
+  return Nexus.safeCall(lazy);
+}
 
 async function decodeRemote<T>(
-  codec: {
-    deserialize(value: unknown): Promise<import("better-result").Result<T, { code: string }>>;
-  },
-  operation: () => unknown,
+  codec: { deserialize(value: unknown): Promise<BetterResult<T, PageReplyError>> },
+  operation: () => RemoteValue<unknown>,
+  component?: import("@mpctl/contracts").ReadFailure["component"],
+  onInvoke?: () => void,
 ): Promise<PageManagerResult<T>> {
-  const remote = await Result.tryPromise({
-    try: () => Promise.resolve(operation()),
-    catch: () => ({ code: "page_failed" as const }),
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  let stage: import("@mpctl/contracts").ReadFailure["stage"] = "page_acquire";
+  const invoked = Result.tryPromise({
+    try: async () => {
+      const lazy = operation();
+      if (!hasPreparationVersion(lazy.connection.contextMeta))
+        return pageErr({
+          code: "page_failed",
+          observedFailure: { kind: "protocol", causeCode: "version_mismatch" },
+          ...(component
+            ? {
+                readFailure: {
+                  stage: "page_connect" as const,
+                  kind: "protocol" as const,
+                  causeCode: "version_mismatch",
+                  component,
+                },
+              }
+            : {}),
+        });
+      stage = "page_call";
+      const result = await callPage(lazy, onInvoke);
+      stage = "page_decode";
+      return Result.isError(result)
+        ? pageErr({
+            code: "page_failed",
+            observedFailure: observedFailure(result.error),
+            ...(component
+              ? {
+                  readFailure: {
+                    stage: "page_call" as const,
+                    ...observedFailure(result.error),
+                    component,
+                  },
+                }
+              : {}),
+          })
+        : decodePageReply(codec, result.value, component);
+    },
+    catch: (error) => ({
+      code: "page_failed" as const,
+      observedFailure: observedFailure(error),
+      ...(component
+        ? {
+            readFailure: {
+              stage:
+                error instanceof NexusError && error.code === "E_SERVICE_UNAVAILABLE"
+                  ? ("page_acquire" as const)
+                  : ("page_call" as const),
+              ...observedFailure(error),
+              component,
+            },
+          }
+        : {}),
+    }),
   });
-  if (Result.isError(remote)) return pageErr(remote.error);
-  const decoded = await codec.deserialize(remote.value);
+  try {
+    return await Promise.race([
+      invoked.then((result) => (Result.isError(result) ? pageErr<T>(result.error) : result.value)),
+      new Promise<PageManagerResult<T>>((resolve) => {
+        timer = setTimeout(
+          () =>
+            resolve(
+              pageErr({
+                code: "page_failed",
+                observedFailure: { kind: "nexus", causeCode: "E_CALL_TIMEOUT" },
+                ...(component
+                  ? {
+                      readFailure: { stage, kind: "nexus", causeCode: "E_CALL_TIMEOUT", component },
+                    }
+                  : {}),
+              }),
+            ),
+          4_000,
+        );
+      }),
+    ]);
+  } finally {
+    if (timer !== undefined) clearTimeout(timer);
+  }
+}
+
+async function mutationReply<T>(
+  codec: { deserialize(value: unknown): Promise<BetterResult<T, Failure>> },
+  operation: () => RemoteValue<unknown>,
+  timeoutMs = 4_000,
+): Promise<BetterResult<T, MaterialCallFailure>> {
+  let invoked = false;
+  let at: NonNullable<Failure["cause"]>["at"] = "bg.page_acquire";
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const boundary = (error: unknown): MaterialCallFailure => ({
+    ...materialBoundaryFailure(error, at),
+    ...(!invoked ? { notInvoked: true } : {}),
+  });
+  const call = async (): Promise<BetterResult<T, MaterialCallFailure>> => {
+    try {
+      const lazy = operation();
+      at = "bg.page_call";
+      const response = await callPage(lazy, () => {
+        invoked = true;
+      });
+      if (response.isErr()) return Result.err(boundary(response.error));
+      at = "bg.page_decode";
+      try {
+        const decoded = await codec.deserialize(response.value);
+        return decoded.isErr() && decoded.error.code === "invalid_result_envelope"
+          ? Result.err({
+              code: "invalid_result_envelope",
+              cause: { at, kind: "protocol", code: "invalid_result_envelope" },
+            })
+          : decoded;
+      } catch {
+        return Result.err({
+          code: "invalid_result_envelope",
+          cause: { at, kind: "protocol", code: "invalid_result_envelope" },
+        });
+      }
+    } catch (error) {
+      return Result.err(boundary(error));
+    }
+  };
+  try {
+    return await Promise.race([
+      call(),
+      new Promise<BetterResult<T, MaterialCallFailure>>((resolve) => {
+        timer = setTimeout(
+          () =>
+            resolve(Result.err(boundary(new NexusError("Page reply timeout", "E_CALL_TIMEOUT")))),
+          timeoutMs,
+        );
+      }),
+    ]);
+  } finally {
+    if (timer !== undefined) clearTimeout(timer);
+  }
+}
+
+async function decodePageReply<T>(
+  codec: {
+    deserialize(value: unknown): Promise<BetterResult<T, PageReplyError>>;
+  },
+  wire: unknown,
+  component?: import("@mpctl/contracts").ReadFailure["component"],
+): Promise<PageManagerResult<T>> {
+  const decoding = await Result.tryPromise({
+    try: () => codec.deserialize(wire),
+    catch: () => ({
+      code: "invalid_result_envelope" as const,
+      observedFailure: observedFailure(undefined, true),
+      ...(component
+        ? {
+            readFailure: {
+              stage: "page_decode" as const,
+              kind: "protocol" as const,
+              causeCode: "invalid_result_envelope",
+              component,
+            },
+          }
+        : {}),
+    }),
+  });
+  if (Result.isError(decoding)) return pageErr(decoding.error);
+  const decoded = decoding.value;
   if (Result.isError(decoded)) {
+    const facts = {
+      ...(decoded.error.readFailure ? { readFailure: decoded.error.readFailure } : {}),
+      ...(decoded.error.cleanupFailed ? { cleanupFailed: true as const } : {}),
+      ...(decoded.error.ended !== undefined ? { ended: decoded.error.ended } : {}),
+      ...(decoded.error.failure ? { failure: decoded.error.failure } : {}),
+      observedFailure: decoded.error.readFailure
+        ? { kind: decoded.error.readFailure.kind, causeCode: decoded.error.readFailure.causeCode }
+        : { kind: "domain" as const, causeCode: decoded.error.code },
+    };
     if (decoded.error.code === "invalid_result_envelope")
-      return pageErr({ code: "invalid_result_envelope" });
+      return pageErr({
+        code: "invalid_result_envelope",
+        observedFailure: observedFailure(undefined, true),
+        ...(component
+          ? {
+              readFailure: {
+                stage: "page_decode" as const,
+                kind: "protocol" as const,
+                causeCode: "invalid_result_envelope",
+                component,
+              },
+            }
+          : {}),
+      });
     if (decoded.error.code === "route_changed" || decoded.error.code === "target_unavailable")
-      return pageErr({ code: "target_unavailable" });
-    if (decoded.error.code === "not_logged_in") return pageErr({ code: "not_logged_in" });
-    return pageErr({ code: "page_failed" });
+      return pageErr({ code: "target_unavailable", ...facts });
+    if (decoded.error.code === "not_logged_in") return pageErr({ code: "not_logged_in", ...facts });
+    if (decoded.error.code === "content_conflict" || decoded.error.code === "invalid_fields")
+      return pageErr({ code: decoded.error.code, ...facts });
+    if (
+      decoded.error.code === "cover_unavailable" ||
+      decoded.error.code === "cover_input_unavailable" ||
+      decoded.error.code === "cover_update_unknown" ||
+      decoded.error.code === "hash_failed" ||
+      decoded.error.code === "unsupported"
+    )
+      return pageErr({
+        code: decoded.error.code,
+        ...facts,
+        ...("baselineHash" in decoded.error && typeof decoded.error.baselineHash === "string"
+          ? { baselineHash: decoded.error.baselineHash }
+          : {}),
+      });
+    return pageErr({
+      code: "page_failed",
+      ...facts,
+    });
   }
   return pageOk(decoded.value);
-}
-
-/** Capture only one supported URL actually produced by the site's native Article control. */
-export async function captureNativeNewEditorUrl(_unused?: string): Promise<NativeTargetCapture> {
-  const page = window;
-  const originalOpen = page.open;
-  const captured: string[] = [];
-  let lastCapturedAt = 0;
-  let unsupportedTarget = false;
-  page.open = ((url?: string | URL | null, target?: string, features?: string) => {
-    if (url != null) {
-      try {
-        const candidate = new URL(String(url), document.location.href);
-        if (
-          candidate.origin === "https://mp.weixin.qq.com" &&
-          candidate.pathname === "/cgi-bin/appmsg"
-        ) {
-          if (
-            candidate.searchParams.get("t") === "media/appmsg_edit_v2" &&
-            candidate.searchParams.get("action") === "edit" &&
-            candidate.searchParams.get("isNew") === "1" &&
-            candidate.searchParams.get("type") === "77"
-          ) {
-            captured.push(candidate.href);
-            lastCapturedAt = Date.now();
-          } else {
-            unsupportedTarget = true;
-          }
-          return null;
-        }
-      } catch {
-        // Ignore malformed or unsupported popup targets and fail closed below.
-      }
-    }
-    return url == null
-      ? originalOpen.call(page, undefined, target, features)
-      : originalOpen.call(page, url, target, features);
-  }) as typeof window.open;
-  try {
-    const controls = [
-      ...document.querySelectorAll<HTMLElement>("div.new-creation__menu-item"),
-    ].filter((element) => {
-      const style = element.ownerDocument.defaultView?.getComputedStyle(element);
-      return (
-        element.textContent?.trim() === "文章" &&
-        !element.hidden &&
-        style?.display !== "none" &&
-        style?.visibility !== "hidden" &&
-        element.getClientRects().length > 0
-      );
-    });
-    if (controls.length !== 1) return { kind: "control_unavailable" };
-    controls[0]!.click();
-    const deadline = Date.now() + 1_500;
-    while (Date.now() < deadline && (captured.length === 0 || Date.now() - lastCapturedAt < 400))
-      await new Promise((resolve) => setTimeout(resolve, 10));
-    if (captured.length > 1) return { kind: "ambiguous" };
-    if (captured.length === 0 && unsupportedTarget) return { kind: "unsupported" };
-    return captured.length === 1
-      ? { kind: "captured", url: captured[0]! }
-      : { kind: "unavailable" };
-  } finally {
-    page.open = originalOpen;
-  }
-}
-
-export async function captureNativeDraftEditorUrl(
-  candidateId: string,
-): Promise<NativeTargetCapture> {
-  const cards = [
-    ...document.querySelectorAll<HTMLElement>(".weui-desktop-card[data-appid]"),
-  ].filter((card) => card.getAttribute("data-appid") === candidateId);
-  if (cards.length !== 1) return { kind: "control_unavailable" };
-  const card = cards[0]!;
-  const cardStyle = card.ownerDocument.defaultView?.getComputedStyle(card);
-  if (
-    card.hidden ||
-    card.getAttribute("aria-hidden") === "true" ||
-    cardStyle?.display === "none" ||
-    cardStyle?.visibility === "hidden" ||
-    card.getClientRects().length === 0
-  )
-    return { kind: "control_unavailable" };
-  const link = cards[0]!.querySelector<HTMLAnchorElement>(
-    ".weui-desktop-tooltip__wrp.weui-desktop-link a",
-  );
-  if (!link) return { kind: "control_unavailable" };
-  const validateTarget = (value: string | URL | undefined): string | undefined => {
-    if (value === undefined) return undefined;
-    try {
-      const observed = new URL(String(value), document.location.href);
-      if (
-        observed.origin === "https://mp.weixin.qq.com" &&
-        observed.pathname === "/cgi-bin/appmsg" &&
-        observed.searchParams.get("t") === "media/appmsg_edit" &&
-        observed.searchParams.get("action") === "edit" &&
-        observed.searchParams.get("type") === "77" &&
-        observed.searchParams.get("appmsgid") === candidateId
-      )
-        return observed.href;
-    } catch {
-      // Ignore malformed handler output and fail closed below.
-    }
-    return undefined;
-  };
-  const candidateIsCurrent = () => {
-    const currentCards = [
-      ...document.querySelectorAll<HTMLElement>(".weui-desktop-card[data-appid]"),
-    ].filter((card) => card.getAttribute("data-appid") === candidateId);
-    return currentCards.length === 1 && currentCards[0] === cards[0];
-  };
-  const initialHref = validateTarget(link.href);
-  if (initialHref) return { kind: "captured", url: initialHref };
-  // A visible draft card owns its hover-only toolbar; reveal the native Edit control.
-  const linkStyle = link.ownerDocument.defaultView?.getComputedStyle(link);
-  if (
-    linkStyle?.display === "none" ||
-    linkStyle?.visibility === "hidden" ||
-    link.getClientRects().length === 0
-  ) {
-    card.dispatchEvent(new MouseEvent("mouseover", { bubbles: true }));
-    card.dispatchEvent(new MouseEvent("mouseenter"));
-  }
-  const targetIdentity = (value: string) => {
-    const url = new URL(value);
-    url.searchParams.delete("timestamp");
-    url.searchParams.sort();
-    return url.href;
-  };
-  let observedHref: string | undefined;
-  const page = window as Window & { open: typeof window.open };
-  const originalOpen = page.open;
-  let captured: string | undefined;
-  let ambiguousCapture = false;
-  page.open = function (url?: string | URL, targetName?: string, features?: string) {
-    if (url !== undefined && url !== null) {
-      const target = validateTarget(url);
-      if (target && captured !== undefined && targetIdentity(target) !== targetIdentity(captured))
-        ambiguousCapture = true;
-      else if (target) captured = target;
-      else return originalOpen.call(page, url, targetName, features);
-    }
-    return null;
-  } as typeof window.open;
-  const preventSourceNavigation = (event: MouseEvent) => event.preventDefault();
-  link.addEventListener("click", preventSourceNavigation, true);
-  try {
-    link.click();
-    const deadline = Date.now() + 1_500;
-    let lastChange = Date.now();
-    let priorHref = link.href;
-    let sawNativeResult = false;
-    while (Date.now() < deadline) {
-      if (!candidateIsCurrent()) return { kind: "control_unavailable" };
-      if (link.href !== priorHref) {
-        priorHref = link.href;
-        lastChange = Date.now();
-        const target = validateTarget(priorHref);
-        if (target) {
-          sawNativeResult = true;
-          observedHref = target;
-        }
-      }
-      if (ambiguousCapture) return { kind: "ambiguous" };
-      if (Date.now() - lastChange >= 400) {
-        if (observedHref && captured && targetIdentity(observedHref) !== targetIdentity(captured))
-          return { kind: "ambiguous" };
-        if (sawNativeResult && observedHref) return { kind: "captured", url: observedHref };
-        if (captured) return { kind: "captured", url: captured };
-      }
-      await new Promise((resolve) => setTimeout(resolve, 10));
-    }
-    if (ambiguousCapture) return { kind: "ambiguous" };
-    if (observedHref && captured && targetIdentity(observedHref) !== targetIdentity(captured))
-      return { kind: "ambiguous" };
-    const url = sawNativeResult ? observedHref : captured;
-    return url ? { kind: "captured", url } : { kind: "unavailable" };
-  } finally {
-    link.removeEventListener("click", preventSourceNavigation, true);
-    page.open = originalOpen;
-  }
 }
 
 export type PageBinding = {
@@ -256,6 +341,10 @@ export type PageBinding = {
   url: string;
   routeRevision?: number;
 };
+type ObservedBoundaryFailure = {
+  kind: "domain" | "runtime" | "nexus" | "protocol";
+  causeCode: string;
+};
 type PageManagerErrorDetails =
   | { code: "page_failed" }
   | { code: "target_unavailable" }
@@ -263,13 +352,86 @@ type PageManagerErrorDetails =
   | { code: "not_logged_in" }
   | { code: "invalid_result_envelope" }
   | { code: "missing_group"; groupId: number }
-  | { code: "navigation_failed"; stage: ArticleNavigationStage };
-export type PageManagerError = PageManagerErrorDetails & { pageCreated?: boolean };
+  | { code: "navigation_failed"; stage: ArticleNavigationStage }
+  | { code: "content_conflict" | "invalid_fields" }
+  | ({
+      code:
+        | "asset_upload_unknown"
+        | "asset_list_failed"
+        | "asset_ambiguous"
+        | "invalid_asset"
+        | "asset_too_large"
+        | "cleanup_failed"
+        | "dialog_unavailable"
+        | "library_open_unknown"
+        | "invalid_payload";
+    } & { cleanupFailed?: true })
+  | ({
+      code:
+        | "cover_unavailable"
+        | "cover_input_unavailable"
+        | "cover_update_unknown"
+        | "hash_failed";
+      baselineHash?: string;
+    } & { cleanupFailed?: true })
+  | { code: "unsupported" };
+export type PageManagerError = PageManagerErrorDetails & {
+  pageCreated?: boolean;
+  cleanupFailed?: true;
+  ended?: boolean;
+  failure?: Failure;
+  baselineHash?: string;
+  readFailure?: import("@mpctl/contracts").ReadFailure;
+  observedFailure?: ObservedBoundaryFailure;
+};
 export type PageManagerResult<T> = BetterResult<T, PageManagerError>;
+// Local invocation knowledge, never a provider receipt or a public failure envelope.
+type MaterialCallFailure = Failure & { notInvoked?: true };
+
+function materialBoundaryFailure(error: unknown, at: NonNullable<Failure["cause"]>["at"]): Failure {
+  const page =
+    typeof error === "object" && error !== null && "code" in error
+      ? (error as {
+          code: string;
+          observedFailure?: ObservedBoundaryFailure;
+          readFailure?: import("@mpctl/contracts").ReadFailure;
+        })
+      : undefined;
+  const cause =
+    page?.observedFailure ??
+    (page?.readFailure
+      ? { kind: page.readFailure.kind, causeCode: page.readFailure.causeCode }
+      : undefined) ??
+    (error instanceof Error || !page
+      ? observedFailure(error)
+      : { kind: "domain" as const, causeCode: page.code });
+  const code =
+    page?.code === "target_unavailable" ||
+    page?.code === "target_ambiguous" ||
+    page?.code === "not_logged_in" ||
+    page?.code === "page_failed"
+      ? page.code
+      : "receipt_unreachable";
+  return { code, cause: { at, kind: cause.kind, code: cause.causeCode } };
+}
 
 const pageOk = <T>(value: T): PageManagerResult<T> => Result.ok(value);
 const pageErr = <T = never>(error: PageManagerError, pageCreated = false): PageManagerResult<T> =>
   Result.err({ ...error, ...(pageCreated ? { pageCreated: true } : {}) });
+
+function observedFailure(error: unknown, protocol = false): ObservedBoundaryFailure {
+  if (error instanceof PageAdmissionError)
+    return { kind: "protocol", causeCode: "version_mismatch" };
+  return {
+    kind: protocol ? "protocol" : error instanceof NexusError ? "nexus" : "runtime",
+    causeCode: protocol
+      ? "invalid_result_envelope"
+      : error instanceof NexusError
+        ? error.code
+        : "unexpected_exception",
+  };
+}
+
 const navigationErr = <T = never>(
   stage: ArticleNavigationStage,
   pageCreated = false,
@@ -281,7 +443,7 @@ const chromeResult = <T>(operation: () => Promise<T>): Promise<PageManagerResult
     catch: (error) =>
       isExactMissingGroupError(error)
         ? { code: "missing_group" as const, groupId: missingGroupId(error) }
-        : { code: "page_failed" as const },
+        : { code: "page_failed" as const, observedFailure: observedFailure(error) },
   });
 
 export function restorePagesOnStartup(
@@ -298,6 +460,47 @@ export function restorePagesOnStartup(
 type PageEditorServiceRemote = import("@nexus-js/core").Remote<PageEditorService>;
 
 type BrowserTab = { id?: number; url?: string };
+export type NavigationProgress = {
+  dispatch<T>(code: string, action: () => Promise<T>): Promise<T>;
+  created(role: "home" | "draft-list" | "editor", tabId?: number): Promise<void>;
+  bound(binding: PageBinding): Promise<void>;
+  uncertain(code: string): void;
+  sourceReady(binding?: PageBinding): void;
+  reloading?(binding: {
+    tabId: number;
+    documentId?: string;
+    url: string;
+  }): (completed: PageBinding) => void;
+  placed?(): Promise<void>;
+  dialogEnded?(): void;
+  materialInvoked?(): void;
+  tabRemoved?(tabId: number): void;
+  failed?(error: {
+    code: string;
+    stage?: ArticleNavigationStage;
+    observedFailure?: ObservedBoundaryFailure;
+    readFailure?: import("@mpctl/contracts").ReadFailure;
+    ended?: boolean;
+    failure?: Failure;
+    cleanupFailed?: true;
+  }): void;
+};
+type SavedEditorTarget = {
+  tabId: number;
+  url: string;
+  previousDocumentId?: string;
+  changed?: true;
+  firstDocumentId?: string;
+  firstRouteRevision?: number;
+  firstUrl?: string;
+};
+function managedPageIdentity(url: string | undefined): string | undefined {
+  if (isPublicRootUrl(url)) return "home";
+  const route = classifyAppmsgUrl(url);
+  if (route.kind === "unsupported") return undefined;
+  return route.kind === "saved-editor" ? `saved-editor:${route.groupId}` : route.kind;
+}
+
 type PageChrome = {
   getGroup(id: number): Promise<unknown>;
   queryGroups?(): Promise<Array<{ id: number; title?: string; windowId?: number }>>;
@@ -314,15 +517,18 @@ type PageChrome = {
   queryAllTabs?(): Promise<BrowserTab[]>;
   getTab(id: number): Promise<BrowserTab>;
   reloadTab?(id: number): Promise<void>;
+  updateTab?(id: number, options: { url: string }): Promise<void>;
   moveTab?(id: number, windowId: number): Promise<void>;
   getLocal?(key: string): Promise<Record<string, unknown>>;
   setLocal?(values: Record<string, unknown>): Promise<void>;
   getSession(key?: string | null): Promise<Record<string, unknown>>;
   setSession(values: Record<string, unknown>): Promise<void>;
-  removeSession(key: string): Promise<void>;
   onTabUpdated?(listener: (tabId: number, status: "loading" | "complete") => void): void;
   onTabRemoved?(listener: (tabId: number) => void): void;
-  getFrame?(details: { tabId: number; frameId: number }): Promise<{ documentId?: string } | null>;
+  getFrame?(details: {
+    tabId: number;
+    frameId: number;
+  }): Promise<{ documentId?: string; url?: string } | null>;
   onBeforeNavigate?(listener: (details: { tabId: number; frameId: number }) => void): void;
   onCommitted?(
     listener: (details: { tabId: number; frameId: number; documentId: string }) => void,
@@ -345,6 +551,9 @@ const chromePageApi: PageChrome = {
   queryAllTabs: () => chrome.tabs.query({}),
   getTab: (id) => chrome.tabs.get(id),
   reloadTab: (id) => chrome.tabs.reload(id),
+  updateTab: async (id, options) => {
+    await chrome.tabs.update(id, options);
+  },
   moveTab: async (id, windowId) => {
     await chrome.tabs.move(id, { windowId, index: -1 });
   },
@@ -355,9 +564,6 @@ const chromePageApi: PageChrome = {
   getSession: (key) => chrome.storage.session.get(key ?? null),
   setSession: async (values) => {
     await chrome.storage.session.set(values);
-  },
-  removeSession: async (key) => {
-    await chrome.storage.session.remove(key);
   },
   onTabUpdated: (listener) =>
     chrome.tabs.onUpdated.addListener((tabId, info) => {
@@ -373,9 +579,7 @@ const chromePageApi: PageChrome = {
 
 export function createPageManager(
   api: PageChrome = chromePageApi,
-  connectPage: (
-    binding: PageBinding,
-  ) => Promise<PageEditorService | PageEditorServiceRemote> = connectChromePage,
+  connectPage?: (binding: PageBinding) => Promise<PageEditorServiceRemote>,
   readPageStatus?: (binding: PageBinding) => Promise<{
     state: "ready" | "not_logged_in" | "loading";
     route: string;
@@ -387,6 +591,7 @@ export function createPageManager(
   let groupId: number | undefined;
   let resolvingGroup: Promise<PageManagerResult<number>> | undefined;
   let ensuringDraftList: Promise<PageManagerResult<PageBinding>> | undefined;
+  let refreshingDraftList: Promise<PageManagerResult<PageBinding>> | undefined;
   let acquiringHome: Promise<PageManagerResult<PageBinding>> | undefined;
   let acquiringHomeTabId: number | undefined;
   let restoring: Promise<PageManagerResult<void>> | undefined;
@@ -402,20 +607,219 @@ export function createPageManager(
   const frameChecks = new Map<number, number>();
   const frameCheckPending = new Set<number>();
   const frameCheckErrors = new Map<number, { documentId: string; error: PageManagerError }>();
-  const sessionQueues = new Map<number, Promise<PageManagerResult<void>>>();
-  const sessionRevisions = new Map<number, number>();
-  const savedOpenTargets = new Set<{
-    tabId: number;
-    url: string;
-    firstDocumentId?: string;
-    firstRouteRevision?: number;
-  }>();
+  // Only live BODY acquisition waits subscribe to document invalidation. DOM
+  // services do not share this readiness requirement or own these resources.
+  const editorWaits = new Set<() => void>();
+  const checkEditorWaits = () => {
+    for (const check of editorWaits) check();
+  };
+  const ownsCurrentDocument = (binding: PageBinding): boolean => {
+    const current = documents.get(binding.tabId);
+    return Boolean(
+      current &&
+      current.documentId === binding.documentId &&
+      (current.routeRevision ?? 0) === (binding.routeRevision ?? 0) &&
+      !invalidated.has(`${binding.tabId}:${binding.documentId}`) &&
+      !navigationPending.has(binding.tabId) &&
+      !frameCheckPending.has(binding.tabId),
+    );
+  };
+  const waitForEditor = (
+    connection: Connection,
+    binding: PageBinding,
+    deadline: number,
+  ): Promise<PageManagerResult<void>> =>
+    new Promise((resolve) => {
+      let settled = false;
+      let checking = false;
+      const cleanup: Array<() => void> = [];
+      const finish = (result: PageManagerResult<void>) => {
+        if (settled) return;
+        settled = true;
+        for (const stop of cleanup.splice(0)) stop();
+        resolve(result);
+      };
+      const guard = (): PageManagerResult<void> => {
+        if (!ownsCurrentDocument(binding)) return pageErr({ code: "target_unavailable" });
+        if (connection.status !== "connected")
+          return pageErr({
+            code: "page_failed",
+            readFailure: {
+              stage: "page_acquire",
+              kind: "nexus",
+              causeCode: "E_CONN_CLOSED",
+              component: "body",
+            },
+          });
+        if (!hasPreparationVersion(connection.contextMeta))
+          return pageErr({
+            code: "page_failed",
+            readFailure: {
+              stage: "page_acquire",
+              kind: "protocol",
+              causeCode: "version_mismatch",
+              component: "body",
+            },
+          });
+        return pageOk(undefined);
+      };
+      const check = () => {
+        if (settled) return;
+        const valid = guard();
+        if (valid.isErr()) {
+          finish(valid);
+          return;
+        }
+        if (checking) return;
+        checking = true;
+        void manager.isCurrent(binding).then(
+          (current) => {
+            checking = false;
+            if (settled) return;
+            const stillValid = guard();
+            if (stillValid.isErr()) {
+              finish(stillValid);
+              return;
+            }
+            if (current.isErr()) {
+              finish(pageErr(current.error));
+              return;
+            }
+            if (!current.value) {
+              finish(pageErr({ code: "target_unavailable" }));
+              return;
+            }
+            if (Date.now() >= deadline) return timeout();
+            if (hasExpiredLogin(connection.contextMeta)) finish(pageErr({ code: "not_logged_in" }));
+            else if (hasReadyEditor(connection.contextMeta)) finish(pageOk(undefined));
+          },
+          (error) =>
+            finish(
+              pageErr({
+                code: "page_failed",
+                readFailure: {
+                  stage: "page_acquire",
+                  ...observedFailure(error),
+                  component: "body",
+                },
+              }),
+            ),
+        );
+      };
+      editorWaits.add(check);
+      cleanup.push(() => editorWaits.delete(check));
+      const timeout = () => {
+        if (settled) return;
+        const valid = guard();
+        finish(
+          valid.isErr()
+            ? valid
+            : pageErr({
+                code: "page_failed",
+                readFailure: {
+                  stage: "page_acquire",
+                  kind: "runtime",
+                  causeCode: "editor_bootstrap_timeout",
+                  component: "body",
+                },
+              }),
+        );
+      };
+      // Reserve the final second of the existing budget for a single content
+      // observation. DOM readiness is independent of MAIN, so login can change
+      // without an editor identity event. Neither this call nor a stuck reply
+      // may extend the BODY deadline or reconnect to a different session.
+      const observeLogin = async () => {
+        if (settled) return;
+        const valid = guard();
+        if (valid.isErr()) return finish(valid);
+        const current = await manager.isCurrent(binding);
+        if (settled) return;
+        const stillValid = guard();
+        if (stillValid.isErr()) return finish(stillValid);
+        if (current.isErr()) return finish(pageErr(current.error));
+        if (!current.value) return finish(pageErr({ code: "target_unavailable" }));
+        if (Date.now() >= deadline) return timeout();
+        if (hasExpiredLogin(connection.contextMeta))
+          return finish(pageErr({ code: "not_logged_in" }));
+        if (hasReadyEditor(connection.contextMeta)) return finish(pageOk(undefined));
+        const remaining = deadline - Date.now();
+        if (remaining <= 0) return timeout();
+        const status = connection.safeGet(contentStatusToken, { callTimeout: remaining });
+        if (status.isErr()) return;
+        const invoked = await callPage(status.value.status());
+        if (settled) return;
+        const afterCall = guard();
+        if (afterCall.isErr()) return finish(afterCall);
+        if (invoked.isErr()) return;
+        const result = await decodePageReply(contentStatusResultCodec, invoked.value);
+        if (settled) return;
+        const afterStatus = await manager.isCurrent(binding);
+        if (settled) return;
+        const afterObservation = guard();
+        if (afterObservation.isErr()) return finish(afterObservation);
+        if (afterStatus.isErr()) return finish(pageErr(afterStatus.error));
+        if (!afterStatus.value) return finish(pageErr({ code: "target_unavailable" }));
+        if (Date.now() >= deadline) return timeout();
+        if (hasExpiredLogin(connection.contextMeta))
+          return finish(pageErr({ code: "not_logged_in" }));
+        if (hasReadyEditor(connection.contextMeta)) return finish(pageOk(undefined));
+        if (
+          result.isOk() &&
+          result.value.route === appmsgRouteIdentity(binding.url) &&
+          result.value.state === "not_logged_in"
+        )
+          finish(pageErr({ code: "not_logged_in" }));
+      };
+      const timer = setTimeout(timeout, Math.max(0, deadline - Date.now()));
+      cleanup.push(() => clearTimeout(timer));
+      const statusTimer = setTimeout(
+        () => void observeLogin().catch(timeout),
+        Math.max(0, deadline - Date.now() - 1_000),
+      );
+      cleanup.push(() => clearTimeout(statusTimer));
+      const retain = (stop: () => void) => {
+        if (settled) stop();
+        else cleanup.push(stop);
+      };
+      retain(connection.onDisconnected(check));
+      retain(connection.subscribeIdentity(check));
+      check();
+    });
+  const savedOpenTargets = new Set<SavedEditorTarget>();
+  const navigationObservers = new Set<NavigationProgress>();
   const nativeCaptureQueues = new Map<number, Promise<void>>();
+  function decodeNativeCapture(results: unknown[]) {
+    const entry = results[0];
+    const capture =
+      entry && typeof entry === "object" && "result" in entry ? entry.result : undefined;
+    if (!capture || typeof capture !== "object") return undefined;
+    const hasKind = "kind" in capture;
+    const kind = hasKind ? capture.kind : undefined;
+    const url = "url" in capture ? capture.url : undefined;
+    const ended = "ended" in capture ? capture.ended : undefined;
+    const notDispatched = "notDispatched" in capture ? capture.notDispatched : undefined;
+    const failure = "observedFailure" in capture ? capture.observedFailure : undefined;
+    return {
+      hasKind,
+      kind,
+      url: typeof url === "string" ? url : undefined,
+      ended: typeof ended === "boolean" ? ended : undefined,
+      notDispatched: notDispatched === true,
+      handlerException: !!(
+        failure &&
+        typeof failure === "object" &&
+        "causeCode" in failure &&
+        failure.causeCode === "native_handler_exception"
+      ),
+    };
+  }
   async function captureNative(
     binding: PageBinding,
     func: (...args: string[]) => unknown,
     args?: string[],
-  ): Promise<PageManagerResult<unknown[]>> {
+    progress?: NavigationProgress,
+  ): Promise<PageManagerResult<ReturnType<typeof decodeNativeCapture>>> {
     const previous = nativeCaptureQueues.get(binding.tabId);
     let release!: () => void;
     const lock = new Promise<void>((resolve) => {
@@ -423,20 +827,46 @@ export function createPageManager(
     });
     const queued = previous ? previous.then(() => lock) : lock;
     nativeCaptureQueues.set(binding.tabId, queued);
-    let result: PageManagerResult<unknown[]>;
+    let result: PageManagerResult<ReturnType<typeof decodeNativeCapture>>;
     try {
       await previous;
       const current = await manager.isCurrent(binding);
       if (Result.isError(current)) result = pageErr(current.error);
       else if (!current.value) result = navigationErr("source_changed");
       else if (!api.executeMain) result = navigationErr("native_control_unavailable");
-      else
+      else {
         result = await Result.tryPromise({
-          try: () => api.executeMain!({ tabId: binding.tabId, func, ...(args ? { args } : {}) }),
-          catch: () => ({ code: "page_failed" as const }),
+          try: () =>
+            dispatch(progress, "native_capture", () =>
+              api.executeMain!({ tabId: binding.tabId, func, ...(args ? { args } : {}) }),
+            ),
+          catch: (error) => ({
+            code: "page_failed" as const,
+            observedFailure: observedFailure(error),
+          }),
         }).then((capture) =>
-          Result.isError(capture) ? pageErr(capture.error) : pageOk(capture.value),
+          Result.isError(capture)
+            ? pageErr(capture.error)
+            : pageOk(decodeNativeCapture(capture.value)),
         );
+      }
+      if (result.isOk()) {
+        const capture = result.value;
+        if (
+          !capture ||
+          !capture.hasKind ||
+          (capture.kind === "captured"
+            ? capture.ended !== true && !capture.notDispatched
+            : capture.kind !== "control_unavailable" && capture.ended !== true) ||
+          capture.ended === false
+        )
+          progress?.uncertain("native_capture_end_unverified");
+        if (capture?.handlerException)
+          result = pageErr({
+            code: "page_failed",
+            observedFailure: { kind: "runtime", causeCode: "native_handler_exception" },
+          });
+      }
     } finally {
       release();
       if (nativeCaptureQueues.get(binding.tabId) === queued)
@@ -445,54 +875,366 @@ export function createPageManager(
     return result!;
   }
   const sourceReloads = new Map<string, Promise<PageManagerResult<number | undefined>>>();
-  const queueSession = (
-    tabId: number,
-    operation: () => Promise<PageManagerResult<void>>,
-    isCurrent: () => boolean = () => true,
-  ) => {
-    const previous = sessionQueues.get(tabId) ?? Promise.resolve(pageOk(undefined));
-    const queued = previous.then(async () => {
-      if (!isCurrent()) return pageOk(undefined);
-      const completed = await Result.tryPromise({
-        try: () => Promise.resolve(operation()),
-        catch: () => ({ code: "page_failed" as const }),
-      });
-      return Result.isError(completed) ? pageErr(completed.error) : completed.value;
+  const dispatch = <T>(
+    progress: NavigationProgress | undefined,
+    code: string,
+    action: () => Promise<T>,
+  ): Promise<T> => (progress ? progress.dispatch(code, action) : action());
+  let placingTab = Promise.resolve();
+  const savedOpens = new Map<string, Promise<PageManagerResult<PageBinding | undefined>>>();
+  const serializePlacement = async <T>(operation: () => Promise<T>): Promise<T> => {
+    const previous = placingTab;
+    let release!: () => void;
+    placingTab = new Promise<void>((resolve) => {
+      release = resolve;
     });
-    sessionQueues.set(tabId, queued);
-    void queued.then(
-      (result) => {
-        if (Result.isError(result))
-          console.debug("mpctl.pages.session_hint_write", {
-            result: "error",
-            code: result.error.code,
-          });
-        if (sessionQueues.get(tabId) === queued) sessionQueues.delete(tabId);
-      },
-      () => {
-        if (sessionQueues.get(tabId) === queued) sessionQueues.delete(tabId);
-      },
-    );
+    await previous;
+    try {
+      return await operation();
+    } finally {
+      release();
+    }
   };
-  const nextSessionRevision = (tabId: number) => {
-    const revision = (sessionRevisions.get(tabId) ?? 0) + 1;
-    sessionRevisions.set(tabId, revision);
-    return revision;
+  const uniquePlacement = async (
+    url: string | undefined,
+    group?: number,
+    tabId?: number,
+  ): Promise<PageManagerResult<void>> => {
+    const identity = managedPageIdentity(url);
+    if (!identity) return pageOk(undefined);
+    const inventory =
+      group !== undefined
+        ? await chromeResult(() => api.queryGroup(group))
+        : api.queryMpTabs
+          ? await chromeResult(() => api.queryMpTabs!())
+          : pageOk([]);
+    if (Result.isError(inventory)) return pageErr(inventory.error);
+    return inventory.value.some(
+      (tab) => tab.id !== tabId && managedPageIdentity(tab.url) === identity,
+    )
+      ? pageErr({ code: "target_ambiguous" })
+      : pageOk(undefined);
   };
-  const removeDocumentHint = (tabId: number) => {
-    nextSessionRevision(tabId);
-    queueSession(tabId, async () => chromeResult(() => api.removeSession(`document:${tabId}`)));
+  const groupManagedTab = (
+    tabId: number,
+    group: number,
+    progress?: NavigationProgress,
+  ): Promise<PageManagerResult<number>> =>
+    serializePlacement(async () => {
+      const tab = await chromeResult(() => api.getTab(tabId));
+      if (Result.isError(tab)) return pageErr(tab.error);
+      const unique = await uniquePlacement(tab.value.url, group, tabId);
+      if (Result.isError(unique)) return pageErr(unique.error);
+      const grouped = await chromeResult(() =>
+        dispatch(progress, "tab_group", () => api.groupTabs(tabId, group)),
+      );
+      if (grouped.isOk()) await progress?.placed?.();
+      return grouped;
+    });
+  const createManagedTab = (
+    url: string,
+    active: boolean,
+    group?: number,
+    source?: PageBinding,
+    progress?: NavigationProgress,
+  ): Promise<PageManagerResult<BrowserTab>> =>
+    serializePlacement(async () => {
+      const unique = await uniquePlacement(url, group);
+      if (Result.isError(unique)) return pageErr(unique.error);
+      if (source) {
+        const current = await manager.isCurrent(source);
+        if (Result.isError(current)) return pageErr(current.error);
+        if (!current.value) return navigationErr("source_changed");
+      }
+      const created = await chromeResult(() =>
+        dispatch(progress, "tab_create", () => api.createTab({ url, active })),
+      );
+      if (Result.isError(created)) return created;
+      if (created.value.id === undefined) {
+        progress?.uncertain("tab_create_end_unverified");
+        return pageErr({ code: "page_failed" });
+      }
+      const kind = classifyAppmsgUrl(url).kind;
+      await progress?.created(
+        kind === "draft-list"
+          ? "draft-list"
+          : kind === "new" || kind === "saved-editor"
+            ? "editor"
+            : "home",
+        created.value.id,
+      );
+      // Identity inspection, creation and group placement are one operation.
+      // Never close or navigate an existing editor to resolve duplicates.
+      if (group !== undefined) {
+        const stillUnique = await uniquePlacement(
+          created.value.url ?? url,
+          group,
+          created.value.id,
+        );
+        if (Result.isError(stillUnique)) return pageErr(stillUnique.error, true);
+        const grouped = await chromeResult(() =>
+          dispatch(progress, "tab_group", () => api.groupTabs(created.value.id!, group)),
+        );
+        if (Result.isError(grouped)) return pageErr(grouped.error, true);
+        await progress?.placed?.();
+      }
+      return created;
+    });
+  const waitForSavedEditor = async (
+    target: SavedEditorTarget,
+    group: number,
+    pageCreated: boolean,
+    progress?: NavigationProgress,
+  ): Promise<PageManagerResult<PageBinding>> => {
+    const deadline = Date.now() + 15_000;
+    while (Date.now() < deadline) {
+      const opened = documents.get(target.tabId);
+      if (opened) {
+        target.firstDocumentId ??= opened.documentId;
+        target.firstRouteRevision ??= opened.routeRevision ?? 0;
+        target.firstUrl ??= opened.url;
+        if (
+          opened.documentId !== target.firstDocumentId ||
+          (opened.routeRevision ?? 0) !== target.firstRouteRevision ||
+          !sameFinalTabUrl(opened.url, target.firstUrl) ||
+          !sameFinalTabUrl(opened.url, target.url)
+        )
+          return navigationErr("target_not_ready", pageCreated);
+        const current = await manager.isCurrent(opened);
+        if (Result.isError(current)) return pageErr(current.error, pageCreated);
+        if (current.value) {
+          await progress?.bound(opened);
+          const status = await manager.pageStatus(opened);
+          if (Result.isError(status)) return pageErr(status.error, pageCreated);
+          if (status.value.state === "not_logged_in")
+            return pageErr({ code: "not_logged_in" }, pageCreated);
+          if (status.value.state === "ready" && status.value.documentReady) {
+            const unique = await uniquePlacement(target.url, group, target.tabId);
+            if (Result.isError(unique)) return pageErr(unique.error, pageCreated);
+            const tabs = await chromeResult(() => api.queryGroup(group));
+            if (Result.isError(tabs)) return pageErr(tabs.error, pageCreated);
+            const tab = tabs.value.find((candidate) => candidate.id === target.tabId);
+            if (!tab || !sameFinalTabUrl(tab.url, opened.url))
+              return navigationErr("target_not_ready", pageCreated);
+            const finalCurrent = await manager.isCurrent(opened);
+            if (Result.isError(finalCurrent)) return pageErr(finalCurrent.error, pageCreated);
+            if (finalCurrent.value) {
+              return pageOk(opened);
+            }
+          }
+        }
+      }
+      await new Promise((resolve) => setTimeout(resolve, 100));
+    }
+    return navigationErr("target_not_ready", pageCreated);
   };
-  const removeHintFromRestore = (tabId: number, revision: number) =>
-    queueSession(
-      tabId,
-      async () => chromeResult(() => api.removeSession(`document:${tabId}`)),
-      () => (sessionRevisions.get(tabId) ?? 0) === revision,
-    );
+  const ownsExactDocument = (binding: PageBinding) =>
+    ownsCurrentDocument(binding) && sameFinalTabUrl(documents.get(binding.tabId)?.url, binding.url);
+  const exactCurrent = async (binding: PageBinding): Promise<PageManagerResult<void>> => {
+    if (!ownsExactDocument(binding)) return navigationErr("source_changed");
+    const tab = await chromeResult(() => api.getTab(binding.tabId));
+    if (tab.isErr()) return tab;
+    return ownsExactDocument(binding) && sameFinalTabUrl(tab.value.url, binding.url)
+      ? pageOk(undefined)
+      : navigationErr("source_changed");
+  };
+  // One owned expired page, one native URL, no retry/replacement. This is shared
+  // only by saved-editor recovery and its expired-list source dependency.
+  const navigateExpiredPage = async (
+    source: PageBinding,
+    expired: PageBinding,
+    url: string,
+    group: number,
+    progress?: NavigationProgress,
+  ): Promise<PageManagerResult<PageBinding>> => {
+    if (!api.updateTab) return pageErr({ code: "not_logged_in" });
+    const revision = groupRevision;
+    source = { ...source };
+    expired = { ...expired };
+    const target: SavedEditorTarget = {
+      tabId: expired.tabId,
+      url,
+      previousDocumentId: expired.documentId,
+    };
+    const unchanged = () =>
+      groupId === group &&
+      groupRevision === revision &&
+      !resolvingGroup &&
+      !restoring &&
+      ownsExactDocument(source) &&
+      ownsExactDocument(expired);
+    const sourceGuard = async (): Promise<PageManagerResult<void>> => {
+      const current = await exactCurrent(source);
+      if (current.isErr()) return current;
+      if (groupId !== group || groupRevision !== revision) return navigationErr("source_changed");
+      const status = await manager.pageStatus(source);
+      if (status.isErr()) return status;
+      if (status.value.state !== "ready" || !status.value.documentReady)
+        return navigationErr("source_changed");
+      const final = await exactCurrent(source);
+      return final.isErr()
+        ? final
+        : groupId === group && groupRevision === revision
+          ? pageOk(undefined)
+          : navigationErr("source_changed");
+    };
+    const guard = async (): Promise<PageManagerResult<void>> => {
+      if (!unchanged()) return navigationErr("source_changed");
+      const freshSource = await sourceGuard();
+      if (freshSource.isErr()) return freshSource;
+      if (classifyAppmsgUrl(url).kind === "saved-editor") {
+        const candidates = await manager.listDraftGroups(source);
+        if (candidates.isErr()) return candidates;
+        if (
+          candidates.value.filter((candidate) => isSavedEditorForGroup(url, candidate.groupId))
+            .length !== 1
+        )
+          return navigationErr("source_changed");
+      }
+      const unique = await uniquePlacement(expired.url, group, expired.tabId);
+      if (unique.isErr()) return unique;
+      const members = await chromeResult(() => api.queryGroup(group));
+      if (members.isErr()) return members;
+      if (
+        !members.value.some(
+          (tab) => tab.id === source.tabId && sameFinalTabUrl(tab.url, source.url),
+        ) ||
+        !members.value.some(
+          (tab) => tab.id === expired.tabId && sameFinalTabUrl(tab.url, expired.url),
+        )
+      )
+        return navigationErr("source_changed");
+      const current = await exactCurrent(expired);
+      if (current.isErr()) return current;
+      const sourceAtDispatch = await exactCurrent(source);
+      if (sourceAtDispatch.isErr()) return sourceAtDispatch;
+      const targetAtDispatch = await exactCurrent(expired);
+      if (targetAtDispatch.isErr()) return targetAtDispatch;
+      const statusAtDispatch = await manager.pageStatus(expired);
+      if (statusAtDispatch.isErr()) return statusAtDispatch;
+      if (statusAtDispatch.value.state !== "not_logged_in") return navigationErr("source_changed");
+      return unchanged() ? pageOk(undefined) : navigationErr("source_changed");
+    };
+    let complete: ((binding: PageBinding) => void) | undefined;
+    try {
+      const dispatched = await serializePlacement(async () => {
+        const before = await guard();
+        if (before.isErr()) return before;
+        return chromeResult(() =>
+          dispatch(progress, "relogin_navigation", async () => {
+            const final = await guard();
+            if (final.isErr()) return final;
+            if (!unchanged()) return navigationErr("source_changed");
+            savedOpenTargets.add(target);
+            complete = progress?.reloading?.(expired);
+            if (!unchanged()) return navigationErr("source_changed");
+            invalidated.add(`${expired.tabId}:${expired.documentId}`);
+            documents.delete(expired.tabId);
+            checkEditorWaits();
+            await api.updateTab!(expired.tabId, { url });
+            return pageOk(undefined);
+          }),
+        ).then((result) => (result.isErr() ? pageErr(result.error) : result.value));
+      });
+      if (dispatched.isErr()) return dispatched;
+      let fresh: PageManagerResult<PageBinding>;
+      if (classifyAppmsgUrl(url).kind === "saved-editor") {
+        fresh = await waitForSavedEditor(target, group, false);
+      } else {
+        const deadline = Date.now() + 15_000;
+        fresh = navigationErr("target_not_ready");
+        while (Date.now() < deadline) {
+          const binding = documents.get(expired.tabId);
+          if (binding) {
+            target.firstDocumentId ??= binding.documentId;
+            target.firstRouteRevision ??= binding.routeRevision ?? 0;
+            target.firstUrl ??= binding.url;
+            if (
+              binding.documentId === expired.documentId ||
+              binding.documentId !== target.firstDocumentId ||
+              (binding.routeRevision ?? 0) !== target.firstRouteRevision ||
+              !sameFinalTabUrl(binding.url, url) ||
+              !sameFinalTabUrl(binding.url, target.firstUrl)
+            )
+              break;
+            const current = await exactCurrent(binding);
+            if (current.isErr()) {
+              fresh = current;
+              break;
+            }
+            const status = await manager.pageStatus(binding);
+            if (status.isErr()) {
+              fresh = status;
+              break;
+            }
+            if (status.value.state === "not_logged_in") {
+              fresh = pageErr({ code: "not_logged_in" });
+              break;
+            }
+            if (status.value.state === "ready" && status.value.documentReady) {
+              fresh = pageOk(binding);
+              break;
+            }
+          }
+          await new Promise((resolve) => setTimeout(resolve, 100));
+        }
+      }
+      if (fresh.isErr()) return fresh;
+      const binding = fresh.value;
+      if (target.changed || binding.documentId === expired.documentId)
+        return navigationErr("target_not_ready");
+      const sourceBeforeBinding = await sourceGuard();
+      if (sourceBeforeBinding.isErr()) return sourceBeforeBinding;
+      const targetBeforeBinding = await exactCurrent(binding);
+      if (targetBeforeBinding.isErr()) return targetBeforeBinding;
+      if (classifyAppmsgUrl(url).kind === "saved-editor") await progress?.bound(binding);
+      const provenSource = await sourceGuard();
+      if (provenSource.isErr()) return provenSource;
+      const unique = await uniquePlacement(url, group, expired.tabId);
+      if (unique.isErr()) return unique;
+      const members = await chromeResult(() => api.queryGroup(group));
+      if (members.isErr()) return members;
+      if (
+        !members.value.some(
+          (tab) => tab.id === source.tabId && sameFinalTabUrl(tab.url, source.url),
+        )
+      )
+        return navigationErr("source_changed");
+      const finalSource = await exactCurrent(source);
+      if (finalSource.isErr()) return finalSource;
+      const final = await exactCurrent(binding);
+      if (final.isErr()) return final;
+      const ready = await manager.pageStatus(binding);
+      if (ready.isErr()) return ready;
+      if (ready.value.state !== "ready" || !ready.value.documentReady)
+        return navigationErr("target_not_ready");
+      const currentAtReturn = await exactCurrent(binding);
+      if (currentAtReturn.isErr()) return currentAtReturn;
+      const sourceAtReturn = await exactCurrent(source);
+      if (sourceAtReturn.isErr()) return sourceAtReturn;
+      if (
+        !ownsExactDocument(source) ||
+        !ownsExactDocument(binding) ||
+        target.changed ||
+        groupId !== group ||
+        groupRevision !== revision ||
+        binding.documentId !== target.firstDocumentId ||
+        (binding.routeRevision ?? 0) !== target.firstRouteRevision ||
+        !sameFinalTabUrl(binding.url, url)
+      )
+        return navigationErr("target_not_ready");
+      complete?.(binding); // Only fresh observed proof ends BG's navigation reservation.
+      if (classifyAppmsgUrl(url).kind === "draft-list") progress?.sourceReady(binding);
+      return pageOk(binding);
+    } finally {
+      savedOpenTargets.delete(target);
+    }
+  };
   api.onBeforeNavigate?.(({ tabId, frameId }) => {
     if (frameId !== 0) return;
     const navigationId = (navigationPending.get(tabId) ?? 0) + 1;
     navigationPending.set(tabId, navigationId);
+    checkEditorWaits();
     navigationStartDocument.set(tabId, documents.get(tabId)?.documentId);
     navigationCommit.delete(tabId);
   });
@@ -508,7 +1250,7 @@ export function createPageManager(
     if (current && current.documentId !== documentId) {
       invalidated.add(`${current.tabId}:${current.documentId}`);
       documents.delete(tabId);
-      removeDocumentHint(tabId);
+      checkEditorWaits();
     }
     if (
       current?.documentId === documentId &&
@@ -540,10 +1282,9 @@ export function createPageManager(
       return;
     invalidated.add(`${latest.tabId}:${latest.documentId}`);
     documents.delete(tabId);
+    checkEditorWaits();
     frameCheckPending.delete(tabId);
     frameCheckErrors.set(tabId, { documentId: binding.documentId, error });
-    removeDocumentHint(tabId);
-    console.debug("mpctl.pages.frame_check", { result: "error", code: error.code });
   };
   api.onTabUpdated?.((tabId, status) => {
     if (status !== "loading") return;
@@ -552,6 +1293,7 @@ export function createPageManager(
     const checkId = (frameChecks.get(tabId) ?? 0) + 1;
     frameChecks.set(tabId, checkId);
     frameCheckPending.add(tabId);
+    checkEditorWaits();
     frameCheckErrors.delete(tabId);
     const navigationId = navigationPending.get(tabId) ?? 0;
     const resolveFrame = api.getFrame;
@@ -583,19 +1325,22 @@ export function createPageManager(
     });
   });
   api.onTabRemoved?.((tabId) => {
+    for (const observer of navigationObservers) observer.tabRemoved?.(tabId);
     const current = documents.get(tabId);
     if (current) {
       invalidated.add(`${current.tabId}:${current.documentId}`);
     }
     documents.delete(tabId);
+    checkEditorWaits();
     navigationPending.delete(tabId);
     navigationStartDocument.delete(tabId);
     navigationCommit.delete(tabId);
     frameCheckPending.delete(tabId);
     frameChecks.delete(tabId);
-    removeDocumentHint(tabId);
   });
-  const resolveManagedGroup = async (): Promise<PageManagerResult<number>> => {
+  const resolveManagedGroup = async (
+    progress?: NavigationProgress,
+  ): Promise<PageManagerResult<number>> => {
     if (groupId !== undefined) {
       const cached = groupId;
       const checked = await chromeResult(() => api.getGroup(cached));
@@ -612,10 +1357,14 @@ export function createPageManager(
       if (Result.isError(checked)) {
         if (checked.error.code !== "missing_group") return pageErr(checked.error);
         if (recoveryCandidate === candidate) recoveryCandidate = undefined;
-        return recoverManagedGroup();
+        return recoverManagedGroup(progress);
       }
       if (!candidate.updated) {
-        const updated = await chromeResult(() => api.updateGroup(candidate.id, { title: "mpctl" }));
+        const updated = await chromeResult(() =>
+          dispatch(progress, "group_update", () =>
+            api.updateGroup(candidate.id, { title: "mpctl" }),
+          ),
+        );
         if (Result.isError(updated)) return pageErr(updated.error);
         candidate.updated = true;
       }
@@ -635,7 +1384,7 @@ export function createPageManager(
       if (Result.isError(checked)) {
         if (checked.error.code !== "missing_group") return pageErr(checked.error);
         if (savedGroupHint === candidate) savedGroupHint = undefined;
-        return recoverManagedGroup();
+        return recoverManagedGroup(progress);
       }
       if (api.setLocal) {
         const saved = await chromeResult(() => api.setLocal!({ managedGroupId: candidate }));
@@ -646,7 +1395,7 @@ export function createPageManager(
       groupRevision++;
       return pageOk(candidate);
     }
-    return recoverManagedGroup();
+    return recoverManagedGroup(progress);
   };
   const readGroupLock = async (): Promise<PageManagerResult<Record<string, unknown>>> => {
     if (!api.getLocal) return chromeResult(() => api.getSession("managedGroupId"));
@@ -663,8 +1412,10 @@ export function createPageManager(
     }
     return chromeResult(() => api.setSession({ managedGroupId: id }));
   };
-  const recoverManagedGroup = (): Promise<PageManagerResult<number>> => {
-    if (!api.queryGroups) return createManagedGroup();
+  const recoverManagedGroup = (
+    progress?: NavigationProgress,
+  ): Promise<PageManagerResult<number>> => {
+    if (!api.queryGroups) return createManagedGroup(progress);
     return (async () => {
       const queried = await chromeResult(() => api.queryGroups!());
       if (Result.isError(queried)) return pageErr(queried.error);
@@ -678,13 +1429,15 @@ export function createPageManager(
           return pageErr(checked.error);
         }
         recoveryCandidate = { id: candidate.id, updated: true, saved: false };
-        return resolveManagedGroup();
+        return resolveManagedGroup(progress);
       }
-      return createManagedGroup();
+      return createManagedGroup(progress);
     })();
   };
   let resolvingRevision = 0;
-  const createManagedGroup = async (): Promise<PageManagerResult<number>> => {
+  const createManagedGroup = async (
+    progress?: NavigationProgress,
+  ): Promise<PageManagerResult<number>> => {
     let anchorTabId = acquiringHomeTabId;
     if (anchorTabId === undefined) {
       const tabs = api.queryMpTabs ? await chromeResult(() => api.queryMpTabs!()) : pageOk([]);
@@ -715,20 +1468,29 @@ export function createPageManager(
       }
     }
     if (anchorTabId === undefined) {
-      const created = await chromeResult(() =>
-        api.createTab({ url: "https://mp.weixin.qq.com/", active: false }),
+      const created = await createManagedTab(
+        "https://mp.weixin.qq.com/",
+        false,
+        undefined,
+        undefined,
+        progress,
       );
       if (Result.isError(created)) return pageErr(created.error);
       if (created.value.id === undefined) return pageErr({ code: "page_failed" });
       anchorTabId = created.value.id;
       acquiringHomeTabId = anchorTabId;
     }
-    const grouped = await chromeResult(() => api.groupTabs(anchorTabId!));
+    const grouped = await chromeResult(() =>
+      dispatch(progress, "group_create", () => api.groupTabs(anchorTabId!)),
+    );
     if (Result.isError(grouped)) return pageErr(grouped.error);
+    await progress?.placed?.();
     const id = grouped.value;
     const candidate = { id, updated: false, saved: false };
     recoveryCandidate = candidate;
-    const updated = await chromeResult(() => api.updateGroup(id, { title: "mpctl" }));
+    const updated = await chromeResult(() =>
+      dispatch(progress, "group_update", () => api.updateGroup(id, { title: "mpctl" })),
+    );
     if (Result.isError(updated)) return pageErr(updated.error);
     candidate.updated = true;
     const saved = await saveGroupLock(id);
@@ -743,6 +1505,7 @@ export function createPageManager(
     kind: "home" | "draft-list",
     group: number,
     preferredTabId?: number,
+    progress?: NavigationProgress,
   ): Promise<PageManagerResult<number | undefined>> => {
     if (!api.reloadTab) return pageOk(undefined);
     const queried = api.queryMpTabs
@@ -768,30 +1531,127 @@ export function createPageManager(
       const current = currentResult.value;
       if (current.url !== candidate.url || classifyAppmsgUrl(current.url).kind !== kind)
         return pageOk(undefined);
-      const previousDocumentId = documents.get(candidate.id!)?.documentId;
-      const grouped = await chromeResult(() => api.groupTabs(candidate.id!, group));
+      const grouped = await groupManagedTab(candidate.id!, group, progress);
       if (Result.isError(grouped)) return pageErr(grouped.error);
-      const reloaded = await chromeResult(() => api.reloadTab!(candidate.id!));
+      // Placement and its evidence checkpoint may have observed another document.
+      // Verify that document after every awaited step, then reserve the baseline
+      // in the actual dispatch callback with no await before Chrome reload.
+      const source = documents.get(candidate.id!);
+      if (!source || !ownsCurrentDocument(source)) return pageErr({ code: "target_unavailable" });
+      const tabAtDispatch = await chromeResult(() => api.getTab(candidate.id!));
+      if (tabAtDispatch.isErr()) return pageErr(tabAtDispatch.error);
+      let completeReload: ((binding: PageBinding) => void) | undefined;
+      const reloaded = await chromeResult(() =>
+        dispatch(progress, "source_reload", () => {
+          if (
+            documents.get(candidate.id!) !== source ||
+            !ownsCurrentDocument(source) ||
+            !sameFinalTabUrl(tabAtDispatch.value.url, source.url) ||
+            classifyAppmsgUrl(source.url).kind !== kind ||
+            appmsgRouteIdentity(source.url) !== appmsgRouteIdentity(candidate.url)
+          )
+            return Promise.resolve(pageErr({ code: "target_unavailable" }));
+          completeReload = progress?.reloading?.(source);
+          return api.reloadTab!(candidate.id!).then(() => pageOk(undefined));
+        }),
+      );
       if (Result.isError(reloaded)) return pageErr(reloaded.error);
+      if (reloaded.value.isErr()) return pageErr(reloaded.value.error);
       const deadline = Date.now() + 15_000;
       while (Date.now() < deadline) {
         const binding = documents.get(candidate.id!);
         if (
           binding &&
-          binding.documentId !== previousDocumentId &&
-          classifyAppmsgUrl(binding.url).kind === kind
-        )
+          binding.documentId !== source.documentId &&
+          ownsCurrentDocument(binding) &&
+          classifyAppmsgUrl(binding.url).kind === kind &&
+          appmsgRouteIdentity(binding.url) === appmsgRouteIdentity(source.url)
+        ) {
+          completeReload?.(binding);
+          progress?.sourceReady(binding);
           return pageOk(candidate.id);
+        }
         await new Promise((resolve) => setTimeout(resolve, 100));
       }
       return pageOk(undefined);
     })();
     sourceReloads.set(key, attempt);
-    const result = await attempt;
-    if (sourceReloads.get(key) === attempt) sourceReloads.delete(key);
-    return result;
+    try {
+      return await attempt;
+    } finally {
+      if (sourceReloads.get(key) === attempt) sourceReloads.delete(key);
+    }
+  };
+  const executionReceipt = async <
+    T extends BodyReceipt | FieldsReceipt | UploadReceipt | CoverReceipt | SaveReceipt,
+  >(
+    target: OperationTarget,
+    id: string,
+    codec: { deserialize(value: unknown): Promise<BetterResult<T | null, Failure>> },
+    operation: (connection: Connection) => RemoteValue<unknown>,
+    body = false,
+  ): Promise<BetterResult<T | null, Failure>> => {
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const lookup = async (): Promise<BetterResult<T | null, Failure>> => {
+      try {
+        // Historical bindings are not restored capabilities; validate the current frame on both sides.
+        if (!api.getFrame) return Result.err({ code: "receipt_unreachable" });
+        const tab = await api.getTab(target.tabId);
+        const frame = await api.getFrame({ tabId: target.tabId, frameId: 0 });
+        if (
+          !tab?.url ||
+          frame?.documentId !== target.documentId ||
+          appmsgRouteIdentity(frame.url) !== target.route ||
+          appmsgRouteIdentity(tab.url) !== target.route
+        )
+          return Result.err({ code: "target_unavailable" });
+        const connection = await connectStatus({
+          tabId: target.tabId,
+          documentId: target.documentId,
+          url: tab.url,
+        });
+        if (
+          connection.status !== "connected" ||
+          !hasPreparationVersion(connection.contextMeta) ||
+          (body && !hasReadyEditor(connection.contextMeta))
+        )
+          return Result.err({ code: "receipt_unreachable" });
+        const response = await callPage(operation(connection));
+        if (response.isErr()) return Result.err({ code: "receipt_unreachable" });
+        const receipt = await codec.deserialize(response.value);
+        if (receipt.isErr()) return receipt;
+        const after = await api.getFrame({ tabId: target.tabId, frameId: 0 });
+        if (
+          after?.documentId !== target.documentId ||
+          appmsgRouteIdentity(after.url) !== target.route
+        )
+          return Result.err({ code: "target_unavailable" });
+        if (
+          receipt.value &&
+          (receipt.value.executorId !== target.executorId || receipt.value.operationId !== id)
+        )
+          return Result.err({ code: "evidence_conflict" });
+        return receipt;
+      } catch {
+        return Result.err({ code: "receipt_unreachable" });
+      }
+    };
+    try {
+      return await Promise.race([
+        lookup(),
+        new Promise<BetterResult<T | null, Failure>>((resolve) => {
+          timer = setTimeout(() => resolve(Result.err({ code: "receipt_unreachable" })), 4_000);
+        }),
+      ]);
+    } finally {
+      if (timer !== undefined) clearTimeout(timer);
+    }
   };
   const manager = {
+    observeNavigation(progress: NavigationProgress): () => void {
+      navigationObservers.add(progress);
+      return () => navigationObservers.delete(progress);
+    },
     observe(binding: PageBinding): void {
       this.observeConnection(binding.tabId, binding.documentId, binding.url);
     },
@@ -800,23 +1660,21 @@ export function createPageManager(
       documentId: string | undefined,
       url: string | undefined,
     ): void {
-      if (tabId === undefined || !documentId) {
-        console.debug("mpctl.pages.observe_connection_ignored", {
-          reason: tabId === undefined ? "missing_tab_id" : "missing_document_id",
-          hasUrl: Boolean(url),
-        });
-        return;
-      }
+      if (tabId === undefined || !documentId) return;
       if (invalidated.has(`${tabId}:${documentId}`)) return;
-      const route = classifyAppmsgUrl(url);
-      if (route.kind === "unsupported") {
-        console.debug("mpctl.pages.observe_connection_ignored", {
-          reason: "unsupported_route",
-          hasTabId: true,
-          hasDocumentId: true,
-          hasUrl: Boolean(url),
-        });
+      for (const target of savedOpenTargets) {
+        if (target.tabId !== tabId || target.previousDocumentId === undefined) continue;
+        target.firstDocumentId ??= documentId;
+        target.firstUrl ??= url;
+        target.firstRouteRevision ??= 0;
+        if (
+          target.firstDocumentId !== documentId ||
+          !target.firstUrl ||
+          !sameFinalTabUrl(url, target.firstUrl)
+        )
+          target.changed = true;
       }
+      const route = classifyAppmsgUrl(url);
       const previous = documents.get(tabId);
       if (previous && previous.documentId !== documentId) {
         invalidated.add(`${previous.tabId}:${previous.documentId}`);
@@ -827,6 +1685,7 @@ export function createPageManager(
         if (previous?.documentId === documentId)
           invalidated.add(`${previous.tabId}:${previous.documentId}`);
         documents.delete(tabId);
+        checkEditorWaits();
         return;
       }
       const routeRevision =
@@ -843,7 +1702,7 @@ export function createPageManager(
         ...(routeRevision ? { routeRevision } : {}),
       };
       documents.set(tabId, binding);
-      const sessionRevision = nextSessionRevision(tabId);
+      checkEditorWaits();
       const commit = navigationCommit.get(tabId);
       if (
         commit?.documentId === documentId &&
@@ -854,32 +1713,13 @@ export function createPageManager(
         navigationCommit.delete(tabId);
         frameCheckPending.delete(tabId);
       }
-      console.debug("mpctl.pages.observe_connection_accepted", {
-        route: route.kind,
-        hasTabId: true,
-        hasDocumentId: true,
-      });
-      console.debug("mpctl.pages.session_hint_write", { result: "attempted" });
-      queueSession(
-        tabId,
-        async () => {
-          const saved = await chromeResult(() =>
-            api.setSession({ [`document:${tabId}`]: binding }),
-          );
-          if (Result.isOk(saved)) {
-            console.debug("mpctl.pages.session_hint_write", { result: "success" });
-          }
-          return saved;
-        },
-        () => sessionRevisions.get(tabId) === sessionRevision,
-      );
     },
-    async managedGroup(): Promise<PageManagerResult<number>> {
+    async managedGroup(progress?: NavigationProgress): Promise<PageManagerResult<number>> {
       if (resolvingGroup) return resolvingGroup;
       if (restoring) {
         const restored = await restoring;
         if (Result.isError(restored)) return pageErr(restored.error);
-        return this.managedGroup();
+        return this.managedGroup(progress);
       }
       resolvingRevision = groupRevision;
       const attempt = (async (): Promise<PageManagerResult<number>> => {
@@ -890,27 +1730,110 @@ export function createPageManager(
             typeof saved.value.managedGroupId === "number" ? saved.value.managedGroupId : undefined;
           sessionGroupReadRequired = false;
         }
-        return resolveManagedGroup();
+        return resolveManagedGroup(progress);
       })();
       resolvingGroup = attempt;
-      const result = await attempt;
-      if (resolvingGroup === attempt) resolvingGroup = undefined;
-      return result;
+      try {
+        return await attempt;
+      } finally {
+        if (resolvingGroup === attempt) resolvingGroup = undefined;
+      }
     },
-    async ensureEditorTab(): Promise<PageManagerResult<PageBinding>> {
-      const group = await this.managedGroup();
+    async ensureEditorTab(progress?: NavigationProgress): Promise<PageManagerResult<PageBinding>> {
+      const existing = await this.findCurrentEditor({ new: true });
+      if (existing.isErr()) return pageErr(existing.error);
+      if (existing.value) return pageErr({ code: "target_ambiguous" });
+      const group = await this.managedGroup(progress);
       if (Result.isError(group)) return pageErr(group.error);
-      return this.openFromManagedHome("openNewEditor", "new");
+      return this.openFromManagedHome("openNewEditor", "new", progress);
     },
-    async ensureDraftList(): Promise<PageManagerResult<PageBinding>> {
+    async ensureDraftList(
+      options: { refresh?: boolean } = {},
+      progress?: NavigationProgress,
+    ): Promise<PageManagerResult<PageBinding>> {
+      if (options.refresh) {
+        if (refreshingDraftList) return refreshingDraftList;
+        const attempt = (async (): Promise<PageManagerResult<PageBinding>> => {
+          // A fresh request must not be satisfied by a normal ensure already in flight.
+          if (ensuringDraftList) {
+            const normal = await ensuringDraftList;
+            if (Result.isError(normal)) return pageErr(normal.error);
+          }
+          const group = await this.managedGroup(progress);
+          if (Result.isError(group)) return pageErr(group.error);
+          let existing = await this.findDraftList();
+          if (Result.isError(existing)) return pageErr(existing.error);
+          if (!existing.value) {
+            const acquired = await this.ensureDraftList({}, progress);
+            if (Result.isError(acquired)) return pageErr(acquired.error);
+            return pageOk(acquired.value);
+          }
+          const source = existing.value;
+          const current = await this.isCurrent(source);
+          if (Result.isError(current)) return pageErr(current.error);
+          if (!current.value || classifyAppmsgUrl(source.url).kind !== "draft-list")
+            return pageErr({ code: "target_unavailable" });
+
+          const reloaded = await reloadObservedSource(
+            "draft-list",
+            group.value,
+            source.tabId,
+            progress,
+          );
+          if (Result.isError(reloaded)) return pageErr(reloaded.error);
+          if (reloaded.value !== source.tabId) return pageErr({ code: "page_failed" });
+
+          const refreshed = await this.findDraftList();
+          if (Result.isError(refreshed)) return pageErr(refreshed.error);
+          const binding = refreshed.value;
+          if (
+            !binding ||
+            binding.tabId !== source.tabId ||
+            binding.documentId === source.documentId ||
+            appmsgRouteIdentity(binding.url) !== appmsgRouteIdentity(source.url)
+          )
+            return pageErr({ code: "target_unavailable" });
+          const deadline = Date.now() + 10_000;
+          while (Date.now() < deadline) {
+            const currentBinding = await this.isCurrent(binding);
+            if (Result.isError(currentBinding)) return pageErr(currentBinding.error);
+            if (!currentBinding.value) return pageErr({ code: "target_unavailable" });
+            const currentGroup = await chromeResult(() => api.queryGroup(group.value));
+            if (Result.isError(currentGroup)) return pageErr(currentGroup.error);
+            if (!currentGroup.value.some((tab) => tab.id === binding.tabId))
+              return pageErr({ code: "target_unavailable" });
+            const managedGroup = await this.managedGroup(progress);
+            if (Result.isError(managedGroup)) return pageErr(managedGroup.error);
+            if (managedGroup.value !== group.value) return pageErr({ code: "target_unavailable" });
+            const status = await this.pageStatus(binding);
+            if (Result.isError(status)) return pageErr(status.error);
+            const stillCurrent = await this.isCurrent(binding);
+            if (Result.isError(stillCurrent)) return pageErr(stillCurrent.error);
+            if (!stillCurrent.value) return pageErr({ code: "target_unavailable" });
+            if (status.value.state === "not_logged_in") return pageErr({ code: "not_logged_in" });
+            if (status.value.state === "ready" && status.value.documentReady) {
+              progress?.sourceReady(binding);
+              return pageOk(binding);
+            }
+            await new Promise((resolve) => setTimeout(resolve, 100));
+          }
+          return pageErr({ code: "page_failed" });
+        })();
+        refreshingDraftList = attempt;
+        try {
+          return await attempt;
+        } finally {
+          if (refreshingDraftList === attempt) refreshingDraftList = undefined;
+        }
+      }
       if (ensuringDraftList) return ensuringDraftList;
       const attempt = (async (): Promise<PageManagerResult<PageBinding>> => {
-        const group = await this.managedGroup();
+        const group = await this.managedGroup(progress);
         if (Result.isError(group)) return pageErr(group.error);
         const existing = await this.findDraftList();
         if (Result.isError(existing)) return pageErr(existing.error);
         if (existing.value) {
-          const existingBinding = existing.value;
+          const existingBinding = { ...existing.value };
           const deadline = Date.now() + 10_000;
           while (Date.now() < deadline) {
             const current = await this.isCurrent(existingBinding);
@@ -918,18 +1841,56 @@ export function createPageManager(
             if (!current.value) return pageErr({ code: "target_unavailable" });
             const status = await this.pageStatus(existingBinding);
             if (Result.isError(status)) return pageErr(status.error);
-            if (status.value.state === "not_logged_in") return pageErr({ code: "not_logged_in" });
+            if (status.value.state === "not_logged_in") {
+              const recoveryRevision = groupRevision;
+              const home = await this.findManagedHome();
+              if (home.isErr()) return home;
+              if (!home.value) return pageErr({ code: "not_logged_in" });
+              const source = { ...home.value };
+              const currentHome = await exactCurrent(source);
+              if (currentHome.isErr()) return currentHome;
+              const statusHome = await this.pageStatus(source);
+              if (statusHome.isErr()) return statusHome;
+              if (statusHome.value.state === "not_logged_in")
+                return pageErr({ code: "not_logged_in" });
+              if (statusHome.value.state !== "ready" || !statusHome.value.documentReady)
+                return navigationErr("source_changed");
+              const connected = await this.connectContent(source);
+              if (connected.isErr()) return connected;
+              const native = await decodeRemote(openDraftListResultCodec, () =>
+                connected.value.get(homePageToken).openDraftList(),
+              );
+              if (native.isErr()) return native;
+              if (classifyAppmsgUrl(native.value).kind !== "draft-list")
+                return navigationErr("native_target_unsupported");
+              const currentSource = await exactCurrent(source);
+              if (currentSource.isErr()) return currentSource;
+              const placed = await groupManagedTab(source.tabId, group.value, progress);
+              if (placed.isErr()) return placed;
+              if (groupId !== group.value || groupRevision !== recoveryRevision)
+                return navigationErr("source_changed");
+              return navigateExpiredPage(
+                source,
+                existingBinding,
+                native.value,
+                group.value,
+                progress,
+              );
+            }
             if (status.value.state === "ready") {
               const stillCurrent = await this.isCurrent(existingBinding);
               if (Result.isError(stillCurrent)) return pageErr(stillCurrent.error);
               if (!stillCurrent.value) return pageErr({ code: "target_unavailable" });
-              return pageOk(existingBinding);
+              {
+                progress?.sourceReady(existingBinding);
+                return pageOk(existingBinding);
+              }
             }
             await new Promise((resolve) => setTimeout(resolve, 100));
           }
           return pageErr({ code: "page_failed" });
         }
-        const reloaded = await reloadObservedSource("draft-list", group.value);
+        const reloaded = await reloadObservedSource("draft-list", group.value, undefined, progress);
         if (Result.isError(reloaded)) return pageErr(reloaded.error);
         if (reloaded.value !== undefined) {
           const binding = await this.findDraftList();
@@ -952,12 +1913,14 @@ export function createPageManager(
             }
           }
         }
-        return this.openFromManagedHome("openDraftList", "draft-list");
+        return this.openFromManagedHome("openDraftList", "draft-list", progress);
       })();
       ensuringDraftList = attempt;
-      const result = await attempt;
-      if (ensuringDraftList === attempt) ensuringDraftList = undefined;
-      return result;
+      try {
+        return await attempt;
+      } finally {
+        if (ensuringDraftList === attempt) ensuringDraftList = undefined;
+      }
     },
     async restore(): Promise<PageManagerResult<void>> {
       if (restoring) return restoring;
@@ -1013,18 +1976,6 @@ export function createPageManager(
             savedGroupHint = undefined;
           if (validated !== undefined) groupRevision++;
         }
-        const revisionsBeforeSessionRead = new Map(sessionRevisions);
-        const records = await chromeResult(() => api.getSession(null));
-        if (Result.isError(records)) return pageErr(records.error);
-        for (const [key, value] of Object.entries(records.value)) {
-          if (!key.startsWith("document:") || !isPageBinding(value)) continue;
-          // Chrome's tab API does not expose the active document ID without webNavigation permission.
-          // A restored serialized ID is only a hint; wait for the content-script Nexus connection to re-observe it.
-          const tabId = Number(key.slice("document:".length));
-          if (!Number.isInteger(tabId)) continue;
-          if (documents.has(tabId)) continue;
-          removeHintFromRestore(tabId, revisionsBeforeSessionRead.get(tabId) ?? 0);
-        }
         // Restoring Chrome pointers never creates a WebSocket or revives a Nexus connection.
         return pageOk(undefined);
       })();
@@ -1033,14 +1984,14 @@ export function createPageManager(
       if (restoring === operation) restoring = undefined;
       return result;
     },
-    async cleanupWorkspace(): Promise<
+    async cleanupWorkspace(progress?: NavigationProgress): Promise<
       PageManagerResult<{
         groupsRemoved: number;
         tabsMoved: number;
         groupsRemaining: number;
       }>
     > {
-      const locked = await this.managedGroup();
+      const locked = await this.managedGroup(progress);
       if (Result.isError(locked)) return pageErr(locked.error);
       if (!api.queryGroups) return pageErr({ code: "page_failed" });
       const groupsResult = await chromeResult(() => api.queryGroups!());
@@ -1058,12 +2009,17 @@ export function createPageManager(
         const tabs = tabsResult.value;
         for (const tab of tabs) {
           if (tab.id === undefined) continue;
+          const unique = await uniquePlacement(tab.url, locked.value, tab.id);
+          if (Result.isError(unique)) return pageErr(unique.error);
           if (destination?.windowId !== undefined && duplicate.windowId !== destination.windowId) {
             if (!api.moveTab) return pageErr({ code: "page_failed" });
-            const moved = await chromeResult(() => api.moveTab!(tab.id!, destination.windowId!));
+            const moved = await chromeResult(() =>
+              dispatch(progress, "tab_move", () => api.moveTab!(tab.id!, destination.windowId!)),
+            );
             if (Result.isError(moved)) return pageErr(moved.error);
+            await progress?.placed?.();
           }
-          const moved = await chromeResult(() => api.groupTabs(tab.id!, locked.value));
+          const moved = await groupManagedTab(tab.id!, locked.value, progress);
           if (Result.isError(moved)) return pageErr(moved.error);
           tabsMoved++;
         }
@@ -1081,7 +2037,9 @@ export function createPageManager(
         groupsRemaining: finalGroups.value.filter((group) => group.title === "mpctl").length,
       });
     },
-    async findCurrentEditor(): Promise<PageManagerResult<PageBinding | undefined>> {
+    async findCurrentEditor(
+      selection?: import("@mpctl/contracts").ArticleCurrentInput,
+    ): Promise<PageManagerResult<PageBinding | undefined>> {
       if (groupId === undefined) {
         const restored = await this.restore();
         if (Result.isError(restored)) return pageErr(restored.error);
@@ -1090,7 +2048,15 @@ export function createPageManager(
       if (group === undefined) return pageOk(undefined);
       const queried = await chromeResult(() => api.queryGroup(group));
       if (Result.isError(queried)) return pageErr(queried.error);
-      const tabs = queried.value;
+      const selected = (url: string | undefined) => {
+        const route = classifyAppmsgUrl(url);
+        return selection?.new
+          ? route.kind === "new"
+          : selection?.candidate
+            ? route.kind === "saved-editor" && route.groupId === selection.candidate
+            : isEditorPageUrl(url);
+      };
+      const tabs = queried.value.filter((tab) => !isEditorPageUrl(tab.url) || selected(tab.url));
       if (tabs.filter((tab) => isEditorPageUrl(tab.url)).length > 1)
         return pageErr({ code: "target_ambiguous" });
       const allowed = new Set(tabs.flatMap((tab) => (tab.id === undefined ? [] : [tab.id])));
@@ -1098,32 +2064,83 @@ export function createPageManager(
       for (const [tabId, binding] of documents) {
         // A role/group mismatch is not evidence that this document binding is stale:
         // managed home and draft-list pages are navigation sources and must survive editor lookup.
-        if (!allowed.has(binding.tabId) || !isEditorPageUrl(binding.url)) continue;
+        if (!allowed.has(binding.tabId) || !selected(binding.url)) continue;
         const current = await this.isCurrent(binding);
         if (Result.isError(current)) return pageErr(current.error);
         if (!current.value) {
-          documents.delete(tabId);
+          // Pending identity checks are not evidence of a stale document. Keep
+          // their binding so the frame result/navigation commit can settle it.
+          if (navigationPending.has(tabId) || frameCheckPending.has(tabId))
+            return pageErr({ code: "target_unavailable" });
+          if (documents.get(tabId) === binding) documents.delete(tabId);
+          checkEditorWaits();
           continue;
         }
         matches.push(binding);
       }
       if (matches.length > 1) return pageErr({ code: "target_ambiguous" });
       if (matches.length === 0) {
-        const tab = tabs.find((tab) => isEditorPageUrl(tab.url));
+        const editors = tabs.filter((tab) => isEditorPageUrl(tab.url));
+        if (editors.length > 1) return pageErr({ code: "target_ambiguous" });
+        const tab = editors[0];
         if (tab?.id !== undefined && api.getFrame) {
           const frameResult = await chromeResult(() =>
             api.getFrame!({ tabId: tab.id!, frameId: 0 }),
           );
           if (Result.isError(frameResult)) return pageErr(frameResult.error);
           const frame = frameResult.value;
-          if (frame?.documentId && tab.url) {
-            const binding = { tabId: tab.id, documentId: frame.documentId, url: tab.url };
+          const initialRoute = classifyAppmsgUrl(tab.url ?? "");
+          if (initialRoute.kind !== "saved-editor") return pageErr({ code: "target_unavailable" });
+          const initialGroupId = initialRoute.groupId;
+          if (
+            frame?.documentId &&
+            frame.url &&
+            tab.url &&
+            initialRoute.kind === "saved-editor" &&
+            isSavedEditorForGroup(frame.url, initialGroupId) &&
+            !invalidated.has(`${tab.id}:${frame.documentId}`) &&
+            !navigationPending.has(tab.id) &&
+            !frameCheckPending.has(tab.id)
+          ) {
+            const confirm = await chromeResult(() => api.getTab(tab.id!));
+            if (Result.isError(confirm)) return pageErr(confirm.error);
+            const confirmedFrame = await chromeResult(() =>
+              api.getFrame!({ tabId: tab.id!, frameId: 0 }),
+            );
+            if (Result.isError(confirmedFrame)) return pageErr(confirmedFrame.error);
+            if (
+              confirm.value.url !== tab.url ||
+              confirmedFrame.value?.documentId !== frame.documentId ||
+              confirmedFrame.value.url !== frame.url ||
+              !isEditorPageUrl(confirmedFrame.value.url) ||
+              invalidated.has(`${tab.id}:${frame.documentId}`) ||
+              navigationPending.has(tab.id) ||
+              frameCheckPending.has(tab.id)
+            )
+              return pageErr({ code: "target_unavailable" });
+            const census = await chromeResult(() => api.queryGroup(group));
+            if (Result.isError(census)) return pageErr(census.error);
+            const currentEditors = census.value.filter((candidate) => selected(candidate.url));
+            if (currentEditors.length > 1) return pageErr({ code: "target_ambiguous" });
+            if (currentEditors.length !== 1 || currentEditors[0]?.id !== tab.id)
+              return pageErr({ code: "target_unavailable" });
+            this.observe({ tabId: tab.id, documentId: frame.documentId, url: frame.url });
+            const trusted = documents.get(tab.id);
+            if (!trusted || trusted.documentId !== frame.documentId)
+              return pageErr({ code: "target_unavailable" });
+            const binding = trusted;
             const connected = await this.connectContent(binding);
             if (Result.isError(connected)) return pageErr(connected.error);
-            this.observe(binding);
+            const finalCensus = await chromeResult(() => api.queryGroup(group));
+            if (Result.isError(finalCensus)) return pageErr(finalCensus.error);
+            const finalEditors = finalCensus.value.filter((candidate) => selected(candidate.url));
+            if (finalEditors.length > 1) return pageErr({ code: "target_ambiguous" });
+            if (finalEditors.length !== 1 || finalEditors[0]?.id !== tab.id)
+              return pageErr({ code: "target_unavailable" });
             const current = await this.isCurrent(binding);
             if (Result.isError(current)) return pageErr(current.error);
-            if (current.value) return pageOk(binding);
+            if (!current.value) return pageErr({ code: "target_unavailable" });
+            return pageOk(binding);
           }
         }
         if (tab) return pageErr({ code: "target_unavailable" });
@@ -1186,7 +2203,9 @@ export function createPageManager(
       if (homes.value.length > 1) return navigationErr("source_ambiguous");
       return pageOk(homes.value[0]);
     },
-    async ensureManagedHome(): Promise<PageManagerResult<PageBinding>> {
+    async ensureManagedHome(
+      progress?: NavigationProgress,
+    ): Promise<PageManagerResult<PageBinding>> {
       if (acquiringHome) return acquiringHome;
       const attempt = (async (): Promise<PageManagerResult<PageBinding>> => {
         let existing: PageBinding | undefined;
@@ -1197,8 +2216,11 @@ export function createPageManager(
             return pageErr(found.error);
           existingAmbiguous = true;
         } else existing = found.value;
-        if (existing) return pageOk(existing);
-        const group = await this.managedGroup();
+        if (existing) {
+          progress?.sourceReady(existing);
+          return pageOk(existing);
+        }
+        const group = await this.managedGroup(progress);
         if (Result.isError(group)) return pageErr(group.error);
         const saved = await chromeResult(() => api.getSession("managedHomeTabId"));
         if (Result.isError(saved)) return pageErr(saved.error);
@@ -1229,7 +2251,12 @@ export function createPageManager(
               if (Result.isError(ready)) return pageErr(ready.error);
               if (ready.value) return pageOk(binding);
             }
-            const reloaded = await reloadObservedSource("home", group.value, savedHomeTabId);
+            const reloaded = await reloadObservedSource(
+              "home",
+              group.value,
+              savedHomeTabId,
+              progress,
+            );
             if (Result.isError(reloaded)) return pageErr(reloaded.error);
             if (reloaded.value !== undefined) {
               const reloadDeadline = Date.now() + 15_000;
@@ -1255,8 +2282,10 @@ export function createPageManager(
                     const currentAfterStatus = await this.isCurrent(current);
                     if (Result.isError(currentAfterStatus))
                       return pageErr(currentAfterStatus.error);
-                    if (status.value.state === "ready" && currentAfterStatus.value)
+                    if (status.value.state === "ready" && currentAfterStatus.value) {
+                      progress?.sourceReady(current);
                       return pageOk(current);
+                    }
                   }
                 }
                 await new Promise((resolve) => setTimeout(resolve, 100));
@@ -1275,7 +2304,7 @@ export function createPageManager(
           existingAmbiguous = true;
         } else existingHome = foundHome.value;
         if (existingHome) {
-          const grouped = await chromeResult(() => api.groupTabs(existingHome!.tabId, group.value));
+          const grouped = await groupManagedTab(existingHome!.tabId, group.value, progress);
           if (Result.isError(grouped)) return pageErr(grouped.error);
           return pageOk(existingHome);
         }
@@ -1289,7 +2318,7 @@ export function createPageManager(
         );
         existingAmbiguous ||= homeTabs.length > 1;
         if (!existingAmbiguous) {
-          const reloadedHome = await reloadObservedSource("home", group.value);
+          const reloadedHome = await reloadObservedSource("home", group.value, undefined, progress);
           if (Result.isError(reloadedHome)) return pageErr(reloadedHome.error);
           if (reloadedHome.value !== undefined) {
             const home = documents.get(reloadedHome.value);
@@ -1307,8 +2336,10 @@ export function createPageManager(
               status.value.state === "ready" &&
               Result.isOk(currentHome) &&
               currentHome.value
-            )
+            ) {
+              progress?.sourceReady(home);
               return pageOk(home);
+            }
           }
         }
         const acquireOwnedRoot = async (): Promise<PageManagerResult<PageBinding>> => {
@@ -1320,10 +2351,14 @@ export function createPageManager(
           let ownedTab =
             typeof savedHomeTabId === "number"
               ? tabs.find((tab) => tab.id === savedHomeTabId && isPublicRootUrl(tab.url))
-              : undefined;
+              : tabs.find((tab) => tab.id === acquiringHomeTabId && isPublicRootUrl(tab.url));
           if (!ownedTab) {
-            const created = await chromeResult(() =>
-              api.createTab({ url: "https://mp.weixin.qq.com/", active: true }),
+            const created = await createManagedTab(
+              "https://mp.weixin.qq.com/",
+              true,
+              group.value,
+              undefined,
+              progress,
             );
             if (Result.isError(created)) return pageErr(created.error);
             ownedTab = created.value;
@@ -1335,7 +2370,7 @@ export function createPageManager(
             if (Result.isError(savedHome)) return pageErr(savedHome.error);
           }
           const ownedTabId = ownedTab.id!;
-          const grouped = await chromeResult(() => api.groupTabs(ownedTabId, group.value));
+          const grouped = await groupManagedTab(ownedTabId, group.value, progress);
           if (Result.isError(grouped)) return pageErr(grouped.error);
           const deadline = Date.now() + 15_000;
           while (Date.now() < deadline) {
@@ -1361,8 +2396,10 @@ export function createPageManager(
                 if (Result.isError(status)) return pageErr(status.error);
                 const currentAfterStatus = await this.isCurrent(binding);
                 if (Result.isError(currentAfterStatus)) return pageErr(currentAfterStatus.error);
-                if (status.value.state === "ready" && currentAfterStatus.value)
+                if (status.value.state === "ready" && currentAfterStatus.value) {
+                  progress?.sourceReady(binding);
                   return pageOk(binding);
+                }
               }
             }
             await new Promise((resolve) => setTimeout(resolve, 100));
@@ -1372,30 +2409,24 @@ export function createPageManager(
         return acquireOwnedRoot();
       })();
       acquiringHome = attempt;
-      const result = await attempt;
-      if (acquiringHome === attempt) {
-        acquiringHome = undefined;
-        acquiringHomeTabId = undefined;
+      try {
+        return await attempt;
+      } finally {
+        if (acquiringHome === attempt) {
+          acquiringHome = undefined;
+          acquiringHomeTabId = undefined;
+        }
       }
-      return result;
     },
     async openFromManagedHome(
       action: "openDraftList" | "openNewEditor",
       expected: "draft-list" | "new",
+      progress?: NavigationProgress,
     ): Promise<PageManagerResult<PageBinding>> {
-      const homeResult = await this.ensureManagedHome();
-      if (Result.isError(homeResult)) {
-        console.debug("mpctl.pages.native_navigation", {
-          phase: "source_unavailable",
-          expected,
-        });
-        return homeResult.error.code === "navigation_failed"
-          ? pageErr(homeResult.error)
-          : navigationErr("source_unavailable");
-      }
+      const homeResult = await this.ensureManagedHome(progress);
+      if (Result.isError(homeResult)) return pageErr(homeResult.error);
       const home = homeResult.value;
-      console.debug("mpctl.pages.native_navigation", { phase: "source_ready", expected });
-      const group = await this.managedGroup();
+      const group = await this.managedGroup(progress);
       if (Result.isError(group)) return pageErr(group.error);
       const mpTabsResult = api.queryMpTabs
         ? await chromeResult(() => api.queryMpTabs!())
@@ -1420,14 +2451,14 @@ export function createPageManager(
         const homeAtCapture = await this.isCurrent(home);
         if (Result.isError(homeAtCapture)) return pageErr(homeAtCapture.error);
         if (!homeAtCapture.value) return navigationErr("source_changed");
-        const captureResult = await captureNative(home, captureNativeNewEditorUrl);
-        if (Result.isError(captureResult))
-          return pageErr(
-            captureResult.error.code === "page_failed"
-              ? { code: "page_failed" }
-              : captureResult.error,
-          );
-        const results = captureResult.value;
+        const captureResult = await captureNative(
+          home,
+          captureNativeNewEditorUrl,
+          undefined,
+          progress,
+        );
+        if (Result.isError(captureResult)) return pageErr(captureResult.error);
+        const capture = captureResult.value;
         const sourceTabsAfterResult = api.queryAllTabs
           ? await chromeResult(() => api.queryAllTabs!())
           : pageOk(undefined);
@@ -1440,20 +2471,12 @@ export function createPageManager(
           !homeAfterCapture.value
         )
           return navigationErr("source_changed");
-        const result = results[0];
-        const capture =
-          result && typeof result === "object" && "result" in result ? result.result : undefined;
-        console.debug("mpctl.pages.native_capture", {
-          result:
-            capture && typeof capture === "object" && "kind" in capture ? capture.kind : "missing",
-        });
-        if (!capture || typeof capture !== "object" || !("kind" in capture))
-          return navigationErr("native_target_missing");
+        if (!capture?.hasKind) return navigationErr("native_target_missing");
         if (capture.kind === "control_unavailable")
           return navigationErr("native_control_unavailable");
         if (capture.kind === "ambiguous") return navigationErr("native_target_ambiguous");
         if (capture.kind === "unsupported") return navigationErr("native_target_unsupported");
-        if (capture.kind !== "captured" || !("url" in capture) || typeof capture.url !== "string")
+        if (capture.kind !== "captured" || capture.url === undefined)
           return navigationErr("native_target_missing");
         targetUrl = capture.url;
       } else {
@@ -1464,32 +2487,23 @@ export function createPageManager(
         targetUrl = decoded.value;
       }
       const observedRoute = classifyAppmsgUrl(targetUrl);
-      console.debug("mpctl.pages.native_navigation", {
-        phase: "native_target_captured",
-        expected,
-        targetPresent: Boolean(targetUrl),
-        routeKind: observedRoute.kind,
-        routeMatches: observedRoute.kind === expected,
-      });
       if (!targetUrl) return navigationErr("native_target_missing");
       const targetRoute = observedRoute;
       if (targetRoute.kind !== expected) return navigationErr("native_target_unsupported");
       const homeBeforeOpen = await this.isCurrent(home);
       if (Result.isError(homeBeforeOpen)) return pageErr(homeBeforeOpen.error);
       if (!homeBeforeOpen.value) return navigationErr("source_changed");
-      const openedResult = await chromeResult(() =>
-        api.createTab({ url: targetUrl!, active: true }),
-      );
-      if (Result.isError(openedResult)) return navigationErr("target_tab_create_failed");
+      const openedResult = await createManagedTab(targetUrl, true, group.value, home, progress);
+      if (Result.isError(openedResult))
+        return openedResult.error.code === "target_ambiguous" || openedResult.error.pageCreated
+          ? pageErr(openedResult.error)
+          : pageErr({
+              ...openedResult.error,
+              code: "navigation_failed",
+              stage: "target_tab_create_failed",
+            });
       const openedTab = openedResult.value;
       if (openedTab.id === undefined) return navigationErr("target_tab_create_failed");
-      console.debug("mpctl.pages.native_navigation", {
-        phase: "tab_created",
-        expected,
-        hasTabId: openedTab.id !== undefined,
-      });
-      const groupedTarget = await chromeResult(() => api.groupTabs(openedTab.id!, group.value));
-      if (Result.isError(groupedTarget)) return pageErr(groupedTarget.error, true);
       {
         const deadline = Date.now() + 15_000;
         let observedTarget = false;
@@ -1519,15 +2533,10 @@ export function createPageManager(
               await new Promise((resolve) => setTimeout(resolve, 100));
               continue;
             }
+            if (expected === "new") await progress?.bound(binding);
             const statusResult = await this.pageStatus(binding);
             if (Result.isError(statusResult)) return pageErr(statusResult.error, true);
             const status = statusResult.value;
-            console.debug("mpctl.pages.native_navigation", {
-              phase: "target_status",
-              expected,
-              state: status.state,
-              routeMatches: classifyAppmsgUrl(binding.url).kind === expected,
-            });
             if (status.state === "not_logged_in") {
               return pageErr({ code: "not_logged_in" }, true);
             }
@@ -1547,7 +2556,10 @@ export function createPageManager(
                 !currentAtReturn.value
               )
                 return navigationErr("target_not_ready", true);
-              return pageOk(binding);
+              {
+                if (expected === "draft-list") progress?.sourceReady(binding);
+                return pageOk(binding);
+              }
             }
           }
           if (matches.length > 1) {
@@ -1605,157 +2617,164 @@ export function createPageManager(
     async openDraftGroup(
       binding: PageBinding,
       candidateId: string,
+      progress?: NavigationProgress,
     ): Promise<PageManagerResult<PageBinding | undefined>> {
-      const current = await this.isCurrent(binding);
-      if (Result.isError(current)) return pageErr(current.error);
-      if (
-        !current.value ||
-        classifyAppmsgUrl(binding.url).kind !== "draft-list" ||
-        groupId === undefined
-      )
-        return pageOk(undefined);
-      const connection = await this.connectContent(binding);
-      if (Result.isError(connection)) return pageErr(connection.error);
-      const candidate = await decodeRemote(listDraftsResultCodec, () =>
-        connection.value.get(draftPageToken).listDrafts(),
-      );
-      if (Result.isError(candidate)) return pageErr(candidate.error);
-      if (candidate.value.filter((item) => item.candidate === candidateId).length !== 1) {
-        return pageOk(undefined);
-      }
-      const currentBeforeCapture = await this.isCurrent(binding);
-      if (Result.isError(currentBeforeCapture)) return pageErr(currentBeforeCapture.error);
-      if (!currentBeforeCapture.value) return pageOk(undefined);
-      if (!api.executeMain) return navigationErr("native_control_unavailable");
-      const captured = await captureNative(binding, captureNativeDraftEditorUrl, [candidateId]);
-      if (Result.isError(captured)) return pageErr(captured.error);
-      const results = captured.value;
-      const result = results[0];
-      const capture =
-        result && typeof result === "object" && "result" in result ? result.result : undefined;
-      if (capture && typeof capture === "object" && "kind" in capture) {
-        if (capture.kind === "control_unavailable")
-          return navigationErr("native_control_unavailable");
-        if (capture.kind === "ambiguous") return navigationErr("native_target_ambiguous");
-      }
-      const targetUrl =
-        capture &&
-        typeof capture === "object" &&
-        "kind" in capture &&
-        capture.kind === "captured" &&
-        "url" in capture &&
-        typeof capture.url === "string"
-          ? capture.url
-          : undefined;
-      if (!targetUrl) return navigationErr("native_target_missing");
-      const route = classifyAppmsgUrl(targetUrl);
-      if (route.kind === "unsupported") return navigationErr("native_target_unsupported");
-      if (route.kind !== "saved-editor" || route.groupId !== candidateId)
-        return navigationErr("native_target_missing");
-      const currentAfterCapture = await this.isCurrent(binding);
-      if (Result.isError(currentAfterCapture)) return pageErr(currentAfterCapture.error);
-      if (!currentAfterCapture.value) return navigationErr("source_changed");
-      if (!api.queryAllTabs) return pageOk(undefined);
-      const baselineResult = await chromeResult(() => api.queryAllTabs!());
-      if (Result.isError(baselineResult)) return pageErr(baselineResult.error);
-      const baseline = baselineResult.value;
-      const currentAfterBaseline = await this.isCurrent(binding);
-      if (Result.isError(currentAfterBaseline)) return pageErr(currentAfterBaseline.error);
-      if (!currentAfterBaseline.value) return pageOk(undefined);
-      const tabIds = baseline.flatMap((tab) => (tab.id === undefined ? [] : [tab.id]));
-      if (tabIds.length !== baseline.length) return pageOk(undefined);
-      const openedResult = await chromeResult(() =>
-        api.createTab({ url: targetUrl!, active: true }),
-      );
-      if (Result.isError(openedResult)) return navigationErr("target_tab_create_failed");
-      const opened = openedResult.value;
-      if (opened.id === undefined || tabIds.includes(opened.id))
-        return navigationErr("target_tab_create_failed");
-      const target = {
-        tabId: opened.id,
-        url: targetUrl,
-        ...(documents.get(opened.id)?.documentId
-          ? {
-              firstDocumentId: documents.get(opened.id)!.documentId,
-              firstRouteRevision: documents.get(opened.id)!.routeRevision ?? 0,
-            }
-          : {}),
-      };
-      savedOpenTargets.add(target);
-      try {
-        const workspaceGroupResult = await this.managedGroup();
-        if (Result.isError(workspaceGroupResult)) {
-          savedOpenTargets.delete(target);
-          return pageErr(workspaceGroupResult.error);
-        }
-        const workspaceGroupId = workspaceGroupResult.value;
-        const grouped = await chromeResult(() => api.groupTabs(opened.id!, workspaceGroupId));
-        if (Result.isError(grouped)) {
-          savedOpenTargets.delete(target);
-          return pageErr(grouped.error, true);
-        }
-        const deadline = Date.now() + 15_000;
-        while (Date.now() < deadline) {
-          const opened = documents.get(target.tabId);
-          const route = classifyAppmsgUrl(opened?.url);
-          if (opened && route.kind === "saved-editor" && route.groupId === candidateId) {
-            target.firstDocumentId ??= opened.documentId;
-            target.firstRouteRevision ??= opened.routeRevision ?? 0;
-            if (
-              opened.documentId !== target.firstDocumentId ||
-              (opened.routeRevision ?? 0) !== target.firstRouteRevision ||
-              !sameFinalTabUrl(opened.url, target.url)
-            ) {
-              return navigationErr("target_not_ready", true);
-            }
-            const currentOpened = await this.isCurrent(opened);
-            if (Result.isError(currentOpened)) return pageErr(currentOpened.error, true);
-            if (!currentOpened.value) {
-              await new Promise((resolve) => setTimeout(resolve, 100));
-              continue;
-            }
-            const statusResult = await this.pageStatus(opened);
-            if (Result.isError(statusResult)) return pageErr(statusResult.error, true);
-            const status = statusResult.value;
-            if (status.state === "not_logged_in") return pageErr({ code: "not_logged_in" }, true);
-            if (status.state !== "ready") {
-              await new Promise((resolve) => setTimeout(resolve, 100));
-              continue;
-            }
-            const groupedAgain = await chromeResult(() =>
-              api.groupTabs(opened.tabId, workspaceGroupId),
+      binding = { ...binding };
+      const key = `${binding.tabId}:${binding.documentId}:${candidateId}`;
+      const pending = savedOpens.get(key);
+      if (pending) return pending;
+      const attempt = (async (): Promise<PageManagerResult<PageBinding | undefined>> => {
+        const workspaceGroup = groupId;
+        const revision = groupRevision;
+        const source = await this.isCurrent(binding);
+        if (Result.isError(source)) return pageErr(source.error);
+        if (
+          !source.value ||
+          classifyAppmsgUrl(binding.url).kind !== "draft-list" ||
+          groupId === undefined
+        )
+          return pageErr({ code: "target_unavailable" });
+        const sourceUrl = await exactCurrent(binding);
+        if (sourceUrl.isErr()) return sourceUrl;
+        const candidates = await this.listDraftGroups(binding);
+        if (Result.isError(candidates)) return pageErr(candidates.error);
+        if (candidates.value.filter((draft) => draft.groupId === candidateId).length !== 1)
+          return pageOk(undefined);
+        const tabs = await chromeResult(() => api.queryGroup(groupId!));
+        if (Result.isError(tabs)) return pageErr(tabs.error);
+        const matches = tabs.value.filter((tab) =>
+          isSavedEditorForGroup(tab.url ?? "", candidateId),
+        );
+        if (matches.length > 1) return pageErr({ code: "target_ambiguous" });
+        let expired: PageBinding | undefined;
+        if (matches.length === 1) {
+          const existing = documents.get(matches[0]!.id!);
+          if (!existing) return pageErr({ code: "target_unavailable" });
+          const valid = await this.validateSavedArticle(existing, candidateId);
+          if (valid.isErr() && valid.error.code !== "not_logged_in") return pageErr(valid.error);
+          if (valid.isErr()) expired = { ...existing };
+          else {
+            const members = await chromeResult(() => api.queryGroup(groupId!));
+            if (Result.isError(members)) return pageErr(members.error);
+            const sameDraft = members.value.filter((tab) =>
+              isSavedEditorForGroup(tab.url ?? "", candidateId),
             );
-            if (Result.isError(groupedAgain)) return pageErr(groupedAgain.error, true);
-            const finalTabResult = await chromeResult(() => api.getTab(target.tabId));
-            if (Result.isError(finalTabResult)) return pageErr(finalTabResult.error, true);
-            const finalTab = finalTabResult.value;
-            if (!sameFinalTabUrl(finalTab.url, target.url)) {
-              return navigationErr("target_not_ready", true);
-            }
-            const currentOpenedFinal = await this.isCurrent(opened);
-            if (Result.isError(currentOpenedFinal)) return pageErr(currentOpenedFinal.error, true);
-            if (!currentOpenedFinal.value) {
-              const latest = documents.get(target.tabId);
-              if (
-                !latest ||
-                latest.documentId !== target.firstDocumentId ||
-                (latest.routeRevision ?? 0) !== target.firstRouteRevision
-              )
-                return navigationErr("target_not_ready", true);
-              await new Promise((resolve) => setTimeout(resolve, 100));
-              continue;
-            }
-            return pageOk(opened);
+            if (sameDraft.length > 1) return pageErr({ code: "target_ambiguous" });
+            const editorCurrent = await this.isCurrent(existing);
+            if (Result.isError(editorCurrent)) return pageErr(editorCurrent.error);
+            const sourceAfter = await this.isCurrent(binding);
+            if (Result.isError(sourceAfter)) return pageErr(sourceAfter.error);
+            if (
+              valid.value.valid &&
+              editorCurrent.value &&
+              sameDraft[0]?.id === existing.tabId &&
+              sourceAfter.value
+            )
+              await progress?.bound(existing);
+            return valid.value.valid &&
+              editorCurrent.value &&
+              sameDraft[0]?.id === existing.tabId &&
+              sourceAfter.value
+              ? pageOk(existing)
+              : pageErr({ code: "target_unavailable" });
           }
-          // A navigation commit can precede the first content Nexus session.
-          // Wait for that pinned document's services, never adopt a replacement.
-          if (opened && target.firstDocumentId !== undefined)
-            return navigationErr("target_not_ready", true);
-          await new Promise((resolve) => setTimeout(resolve, 100));
         }
-        return navigationErr("target_not_ready", true);
+        const currentBeforeCapture = await this.isCurrent(binding);
+        if (Result.isError(currentBeforeCapture)) return pageErr(currentBeforeCapture.error);
+        if (!currentBeforeCapture.value) return pageOk(undefined);
+        if (expired) {
+          const exactSource = await exactCurrent(binding);
+          if (exactSource.isErr()) return exactSource;
+          const readySource = await this.pageStatus(binding);
+          if (readySource.isErr()) return readySource;
+          if (
+            readySource.value.state !== "ready" ||
+            !readySource.value.documentReady ||
+            !ownsExactDocument(binding)
+          )
+            return navigationErr("source_changed");
+        }
+        if (!api.executeMain) return navigationErr("native_control_unavailable");
+        const captured = await captureNative(
+          binding,
+          captureNativeDraftEditorUrl,
+          [candidateId],
+          progress,
+        );
+        if (Result.isError(captured)) return pageErr(captured.error);
+        const capture = captured.value;
+        if (capture?.hasKind) {
+          if (capture.kind === "control_unavailable")
+            return navigationErr("native_control_unavailable");
+          if (capture.kind === "ambiguous") return navigationErr("native_target_ambiguous");
+        }
+        const targetUrl = capture?.kind === "captured" ? capture.url : undefined;
+        if (!targetUrl) return navigationErr("native_target_missing");
+        if (expired && capture?.ended !== true) return navigationErr("native_target_missing");
+        const route = classifyAppmsgUrl(targetUrl);
+        if (route.kind === "unsupported") return navigationErr("native_target_unsupported");
+        if (route.kind !== "saved-editor" || route.groupId !== candidateId)
+          return navigationErr("native_target_missing");
+        const currentAfterCapture = await this.isCurrent(binding);
+        if (Result.isError(currentAfterCapture)) return pageErr(currentAfterCapture.error);
+        if (!currentAfterCapture.value) return navigationErr("source_changed");
+        if (expired) {
+          if (
+            groupId !== workspaceGroup ||
+            groupRevision !== revision ||
+            workspaceGroup === undefined
+          )
+            return navigationErr("source_changed");
+          return navigateExpiredPage(binding, expired, targetUrl, workspaceGroup, progress);
+        }
+        if (!api.queryAllTabs) return pageOk(undefined);
+        const baselineResult = await chromeResult(() => api.queryAllTabs!());
+        if (Result.isError(baselineResult)) return pageErr(baselineResult.error);
+        const baseline = baselineResult.value;
+        const currentAfterBaseline = await this.isCurrent(binding);
+        if (Result.isError(currentAfterBaseline)) return pageErr(currentAfterBaseline.error);
+        if (!currentAfterBaseline.value) return pageOk(undefined);
+        const tabIds = baseline.flatMap((tab) => (tab.id === undefined ? [] : [tab.id]));
+        if (tabIds.length !== baseline.length) return pageOk(undefined);
+        const openedResult = await createManagedTab(targetUrl, true, groupId, binding, progress);
+        if (Result.isError(openedResult))
+          return openedResult.error.code === "target_ambiguous" || openedResult.error.pageCreated
+            ? pageErr(openedResult.error)
+            : pageErr({
+                ...openedResult.error,
+                code: "navigation_failed",
+                stage: "target_tab_create_failed",
+              });
+        const opened = openedResult.value;
+        if (opened.id === undefined || tabIds.includes(opened.id))
+          return navigationErr("target_tab_create_failed");
+        const target = {
+          tabId: opened.id,
+          url: targetUrl,
+          ...(documents.get(opened.id)?.documentId
+            ? {
+                firstDocumentId: documents.get(opened.id)!.documentId,
+                firstRouteRevision: documents.get(opened.id)!.routeRevision ?? 0,
+              }
+            : {}),
+        };
+        savedOpenTargets.add(target);
+        try {
+          const workspaceGroupResult = await this.managedGroup(progress);
+          if (Result.isError(workspaceGroupResult)) {
+            return pageErr(workspaceGroupResult.error, true);
+          }
+          const workspaceGroupId = workspaceGroupResult.value;
+          return await waitForSavedEditor(target, workspaceGroupId, true, progress);
+        } finally {
+          savedOpenTargets.delete(target);
+        }
+      })();
+      savedOpens.set(key, attempt);
+      try {
+        return await attempt;
       } finally {
-        savedOpenTargets.delete(target);
+        if (savedOpens.get(key) === attempt) savedOpens.delete(key);
       }
     },
     async validateSavedArticle(
@@ -1772,12 +2791,18 @@ export function createPageManager(
       if (page.state !== "ready") return pageOk({ valid: false, title: "" });
       const connection = await this.connectContent(binding);
       if (Result.isError(connection)) return pageErr(connection.error);
-      const draft = connection.value.get(draftPageToken);
-      const state = await decodeRemote(validateDraftResultCodec, () =>
-        draft.validateDraft(groupId),
-      );
+      const draft = connection.value.safeGet(draftPageToken);
+      if (Result.isError(draft))
+        return pageErr({ code: "page_failed", observedFailure: observedFailure(draft.error) });
+      const validated = await callPage(draft.value.validateDraft(groupId));
+      if (Result.isError(validated))
+        return pageErr({ code: "page_failed", observedFailure: observedFailure(validated.error) });
+      const state = await decodePageReply(validateDraftResultCodec, validated.value);
       if (Result.isError(state)) return pageErr(state.error);
-      const count = await decodeRemote(currentItemCountResultCodec, () => draft.currentItemCount());
+      const counted = await callPage(draft.value.currentItemCount());
+      if (Result.isError(counted))
+        return pageErr({ code: "page_failed", observedFailure: observedFailure(counted.error) });
+      const count = await decodePageReply(currentItemCountResultCodec, counted.value);
       if (Result.isError(count)) return pageErr(count.error);
       const currentAfterRead = await this.isCurrent(binding);
       if (Result.isError(currentAfterRead)) return pageErr(currentAfterRead.error);
@@ -1799,18 +2824,130 @@ export function createPageManager(
         title: state.value.title,
       });
     },
-    async open(
-      binding: PageBinding,
-    ): Promise<PageManagerResult<PageEditorService | PageEditorServiceRemote>> {
+    async getExecutionReceipt(
+      target: OperationTarget,
+      id: string,
+      operation: "body" | "fields" | "upload" | "cover" | "save",
+    ): Promise<
+      BetterResult<
+        BodyReceipt | FieldsReceipt | UploadReceipt | CoverReceipt | SaveReceipt | null,
+        Failure
+      >
+    > {
+      switch (operation) {
+        case "body":
+          return this.getBodyReceipt(target, id);
+        case "fields":
+          return this.getFieldsReceipt(target, id);
+        case "upload":
+          return this.getUploadReceipt(target, id);
+        case "cover":
+          return executionReceipt(target, id, coverReceiptResultCodec, (c) =>
+            c.get(articleCoverPageToken, { callTimeout: 2_000 }).getReceipt(id),
+          );
+        case "save":
+          return executionReceipt(target, id, saveReceiptResultCodec, (c) =>
+            c.get(articleCoverPageToken, { callTimeout: 2_000 }).getReceipt(id),
+          );
+      }
+    },
+    async getBodyReceipt(
+      target: OperationTarget,
+      id: string,
+    ): Promise<BetterResult<BodyReceipt | null, Failure>> {
+      return executionReceipt(
+        target,
+        id,
+        pageEditorReceiptResultCodec,
+        (c) => c.get(pageEditorToken, { callTimeout: 2_000 }).getReceipt(id),
+        true,
+      );
+    },
+    async open(binding: PageBinding) {
       if (!isEditorPageUrl(binding.url)) return pageErr({ code: "target_unavailable" });
       const current = await this.isCurrent(binding);
       if (Result.isError(current)) return pageErr(current.error);
       if (!current.value) return pageErr({ code: "target_unavailable" });
+      const deadline = Date.now() + 10_000;
       const connected = await Result.tryPromise({
-        try: () => connectPage(binding),
-        catch: () => ({ code: "page_failed" as const }),
+        try: async () => {
+          if (connectPage) return pageOk(await connectPage(binding));
+          const connection = await connectStatus(binding);
+          const ready = await waitForEditor(connection, binding, deadline);
+          if (ready.isErr()) return pageErr(ready.error);
+          if (!ownsCurrentDocument(binding)) return pageErr({ code: "target_unavailable" });
+          if (
+            connection.status !== "connected" ||
+            !hasPreparationVersion(connection.contextMeta) ||
+            !hasReadyEditor(connection.contextMeta)
+          )
+            return pageErr({
+              code: "page_failed",
+              readFailure: {
+                stage: "page_acquire",
+                kind: "runtime",
+                causeCode: "editor_readiness_lost",
+                component: "body",
+              },
+            });
+          const acquired = connection.safeGet(pageEditorToken);
+          if (acquired.isErr())
+            return pageErr({
+              code: "page_failed",
+              observedFailure: observedFailure(acquired.error),
+              readFailure: {
+                stage: "page_acquire",
+                ...observedFailure(acquired.error),
+                component: "body",
+              },
+            });
+          return pageOk(acquired.value);
+        },
+        catch: (error) => ({
+          code: "page_failed" as const,
+          observedFailure:
+            error instanceof PageAdmissionError
+              ? { kind: "protocol" as const, causeCode: "version_mismatch" }
+              : observedFailure(error),
+        }),
       });
-      return Result.isError(connected) ? pageErr(connected.error) : pageOk(connected.value);
+      if (Result.isError(connected)) return pageErr(connected.error);
+      if (connected.value.isErr()) return pageErr(connected.value.error);
+      const editor = connected.value.value;
+      const afterConnect = await this.isCurrent(binding);
+      if (afterConnect.isErr()) return pageErr(afterConnect.error);
+      if (!afterConnect.value) return pageErr({ code: "target_unavailable" });
+      const session = editor.ready().connection;
+      if (!hasPreparationVersion(session.contextMeta))
+        return pageErr({
+          code: "page_failed",
+          observedFailure: { kind: "protocol", causeCode: "version_mismatch" },
+        });
+      if (!connectPage && (session.status !== "connected" || !hasReadyEditor(session.contextMeta)))
+        return pageErr({
+          code: "page_failed",
+          readFailure: {
+            stage: "page_acquire",
+            kind: "runtime",
+            causeCode: "editor_readiness_lost",
+            component: "body",
+          },
+        });
+      return pageOk({
+        ready: () => decodeRemote(pageEditorReadyResultCodec, () => editor.ready(), "body"),
+        getContent: () =>
+          decodeRemote(pageEditorContentResultCodec, () => editor.getContent(), "body"),
+        setContent: (
+          html: string,
+          expectedHash: string,
+          execution: import("./page-contracts").BodyExecution,
+        ) =>
+          mutationReply(pageEditorWriteResultCodec, () =>
+            editor.setContent(html, expectedHash, execution),
+          ),
+        setCoverFromBody: (input: BodyCoverExecution) =>
+          mutationReply(coverWriteResultCodec, () => editor.setCoverFromBody(input)),
+      });
     },
     async connectContent(binding: PageBinding): Promise<PageManagerResult<Connection>> {
       const current = await this.isCurrent(binding);
@@ -1818,9 +2955,332 @@ export function createPageManager(
       if (!current.value) return pageErr({ code: "target_unavailable" });
       const connected = await Result.tryPromise({
         try: () => connectStatus(binding),
-        catch: () => ({ code: "page_failed" as const }),
+        catch: (error) => ({
+          code: "page_failed" as const,
+          observedFailure:
+            error instanceof PageAdmissionError
+              ? { kind: "protocol" as const, causeCode: "version_mismatch" }
+              : observedFailure(error),
+        }),
       });
-      return Result.isError(connected) ? pageErr(connected.error) : pageOk(connected.value);
+      if (Result.isError(connected)) return pageErr(connected.error);
+      const afterConnect = await this.isCurrent(binding);
+      if (afterConnect.isErr()) return pageErr(afterConnect.error);
+      if (!afterConnect.value) return pageErr({ code: "target_unavailable" });
+      if (!hasPreparationVersion(connected.value.contextMeta))
+        return pageErr({
+          code: "page_failed",
+          observedFailure: { kind: "protocol", causeCode: "version_mismatch" },
+        });
+      return pageOk(connected.value);
+    },
+    async readArticleFields(
+      binding: PageBinding,
+    ): Promise<PageManagerResult<{ title: string; author: string; summary: string }>> {
+      const connected = await this.connectContent(binding);
+      if (Result.isError(connected)) return pageErr(connected.error);
+      const acquired = connected.value.safeGet(articleFieldsToken);
+      if (acquired.isErr())
+        return pageErr({
+          code: "page_failed",
+          observedFailure: observedFailure(acquired.error),
+          readFailure: {
+            stage: "page_acquire",
+            ...observedFailure(acquired.error),
+            component: "fields",
+          },
+        });
+      return decodeRemote(
+        articleFieldsResultCodec,
+        () => acquired.value.readArticleFields(),
+        "fields",
+      );
+    },
+    async readArticleCover(binding: PageBinding) {
+      const connected = await this.connectContent(binding);
+      if (Result.isError(connected)) return pageErr(connected.error);
+      const acquired = connected.value.safeGet(articleCoverPageToken);
+      if (acquired.isErr())
+        return pageErr({
+          code: "page_failed",
+          observedFailure: observedFailure(acquired.error),
+          readFailure: {
+            stage: "page_acquire",
+            ...observedFailure(acquired.error),
+            component: "cover",
+          },
+        });
+      return decodeRemote(articleCoverHashResultCodec, () => acquired.value.read(), "cover");
+    },
+    async coverIdentity(
+      binding: PageBinding,
+    ): Promise<BetterResult<{ executorId: string }, Failure>> {
+      let at: NonNullable<Failure["cause"]>["at"] = "bg.page_connect";
+      try {
+        const connected = await this.connectContent(binding);
+        if (connected.isErr()) return Result.err(materialBoundaryFailure(connected.error, at));
+        at = "bg.page_acquire";
+        const acquired = connected.value.safeGet(articleCoverPageToken);
+        if (acquired.isErr()) return Result.err(materialBoundaryFailure(acquired.error, at));
+        at = "bg.page_call";
+        const response = await callPage(acquired.value.identity());
+        if (response.isErr()) return Result.err(materialBoundaryFailure(response.error, at));
+        at = "bg.page_decode";
+        const decoded = await fieldsIdentityResultCodec.deserialize(response.value);
+        return decoded.isErr() && decoded.error.code === "invalid_result_envelope"
+          ? Result.err({
+              code: "invalid_result_envelope",
+              cause: { at, kind: "protocol", code: "invalid_result_envelope" },
+            })
+          : decoded;
+      } catch (error) {
+        return Result.err(materialBoundaryFailure(error, at));
+      }
+    },
+    async setCoverFromBody(
+      binding: PageBinding,
+      input: BodyCoverExecution,
+    ): Promise<BetterResult<CoverReceipt, MaterialCallFailure>> {
+      try {
+        const editor = await this.open(binding);
+        if (editor.isErr())
+          return Result.err({
+            ...materialBoundaryFailure(editor.error, "bg.page_connect"),
+            notInvoked: true,
+          });
+        return editor.value.setCoverFromBody(input);
+      } catch (error) {
+        return Result.err({
+          ...materialBoundaryFailure(error, "bg.page_connect"),
+          notInvoked: true,
+        });
+      }
+    },
+    async setArticleCover(
+      binding: PageBinding,
+      candidate: { filename: string; thumbnailUrl: string },
+      expectedHash: string,
+      execution: CoverExecution,
+    ): Promise<BetterResult<CoverReceipt, MaterialCallFailure>> {
+      let at: NonNullable<Failure["cause"]>["at"] = "bg.page_connect";
+      let invoked = false;
+      let receipt: BetterResult<CoverReceipt, MaterialCallFailure> | undefined;
+      const boundary = (error: unknown): MaterialCallFailure => ({
+        ...materialBoundaryFailure(error, at),
+        ...(!invoked ? { notInvoked: true as const } : {}),
+      });
+      try {
+        const connected = await this.connectContent(binding);
+        if (connected.isErr()) return Result.err(boundary(connected.error));
+        at = "bg.page_acquire";
+        const acquired = connected.value.safeGet(articleCoverPageToken, { callTimeout: 25_000 });
+        if (acquired.isErr()) return Result.err(boundary(acquired.error));
+        const coverPage = acquired.value;
+        const guard = async (): Promise<BetterResult<void, { code: string }>> => {
+          const current = await this.isCurrent(binding);
+          if (current.isErr() || !current.value) return Result.err({ code: "target_unavailable" });
+          const group = await this.managedGroup();
+          if (group.isErr()) return Result.err({ code: "target_unavailable" });
+          const membership = await chromeResult(() => api.queryGroup(group.value));
+          if (membership.isErr() || !membership.value.some((tab) => tab.id === binding.tabId))
+            return Result.err({ code: "target_unavailable" });
+          const route = classifyAppmsgUrl(binding.url);
+          if (route.kind === "saved-editor") {
+            const saved = await this.validateSavedArticle(binding, route.groupId);
+            if (saved.isErr() || !saved.value.valid)
+              return Result.err({ code: "target_unavailable" });
+          }
+          const final = await this.isCurrent(binding);
+          return final.isOk() && final.value
+            ? Result.ok(undefined)
+            : Result.err({ code: "target_unavailable" });
+        };
+        const checked = await guard();
+        if (checked.isErr()) return Result.err(boundary(checked.error));
+        at = "bg.page_call";
+        const called = await callPage(coverPage.set(candidate, expectedHash, execution), () => {
+          invoked = true;
+        });
+        if (called.isErr()) return Result.err(boundary(called.error));
+        at = "bg.page_decode";
+        receipt = await coverWriteResultCodec.deserialize(called.value);
+        if (receipt.isErr() && receipt.error.code === "invalid_result_envelope")
+          return Result.err({
+            code: "invalid_result_envelope",
+            cause: { at, kind: "protocol", code: "invalid_result_envelope" },
+          });
+        return receipt;
+      } catch (error) {
+        return receipt ?? Result.err(boundary(error));
+      }
+    },
+    async saveArticle(
+      binding: PageBinding,
+      execution: SaveExecution,
+    ): Promise<BetterResult<SaveReceipt, MaterialCallFailure>> {
+      try {
+        const connected = await this.connectContent(binding);
+        if (connected.isErr())
+          return Result.err({
+            ...materialBoundaryFailure(connected.error, "bg.page_connect"),
+            notInvoked: true,
+          });
+        const group = await this.managedGroup();
+        if (group.isErr())
+          return Result.err({
+            ...materialBoundaryFailure(group.error, "bg.page_connect"),
+            notInvoked: true,
+          });
+        const unique = await uniquePlacement(binding.url, group.value, binding.tabId);
+        if (unique.isErr())
+          return Result.err({
+            ...materialBoundaryFailure(unique.error, "bg.page_connect"),
+            notInvoked: true,
+          });
+        return mutationReply(
+          saveWriteResultCodec,
+          () => {
+            const acquired = connected.value.safeGet(articleCoverPageToken, {
+              callTimeout: 25_000,
+            });
+            if (acquired.isErr()) throw acquired.error;
+            return acquired.value.save(execution);
+          },
+          25_000,
+        );
+      } catch (error) {
+        return Result.err({
+          ...materialBoundaryFailure(error, "bg.page_connect"),
+          notInvoked: true,
+        });
+      }
+    },
+    async listMaterials(binding: PageBinding, onInvoke?: () => void) {
+      const connected = await this.connectContent(binding);
+      if (Result.isError(connected)) return pageErr({ ...connected.error, ended: true });
+      return decodeRemote(
+        materialListResultCodec,
+        () => connected.value.get(materialPageToken).list(),
+        undefined,
+        onInvoke,
+      );
+    },
+    async uploadMaterial(
+      binding: PageBinding,
+      payload: import("@mpctl/contracts").AssetPayload,
+      execution: import("./background-contracts").UploadExecution,
+    ): Promise<BetterResult<UploadReceipt, MaterialCallFailure>> {
+      try {
+        const connected = await this.connectContent(binding);
+        if (connected.isErr())
+          return Result.err({
+            ...materialBoundaryFailure(connected.error, "bg.page_connect"),
+            notInvoked: true,
+          });
+        return mutationReply(
+          materialUploadResultCodec,
+          () => {
+            const acquired = connected.value.safeGet(materialPageToken, { callTimeout: 20_000 });
+            if (acquired.isErr()) throw acquired.error;
+            return acquired.value.upload(payload, execution);
+          },
+          20_000,
+        );
+      } catch (error) {
+        return Result.err({
+          ...materialBoundaryFailure(error, "bg.page_connect"),
+          notInvoked: true,
+        });
+      }
+    },
+    async materialIdentity(
+      binding: PageBinding,
+    ): Promise<BetterResult<{ executorId: string }, Failure>> {
+      let at: NonNullable<Failure["cause"]>["at"] = "bg.page_connect";
+      try {
+        const connected = await this.connectContent(binding);
+        if (connected.isErr()) return Result.err(materialBoundaryFailure(connected.error, at));
+        at = "bg.page_acquire";
+        const acquired = connected.value.safeGet(materialPageToken);
+        if (acquired.isErr()) return Result.err(materialBoundaryFailure(acquired.error, at));
+        at = "bg.page_call";
+        const called = await callPage(acquired.value.identity());
+        if (called.isErr()) return Result.err(materialBoundaryFailure(called.error, at));
+        at = "bg.page_decode";
+        try {
+          const decoded = await materialIdentityResultCodec.deserialize(called.value);
+          return decoded.isErr() && decoded.error.code === "invalid_result_envelope"
+            ? Result.err({
+                code: "invalid_result_envelope",
+                cause: { at, kind: "protocol", code: "invalid_result_envelope" },
+              })
+            : decoded;
+        } catch {
+          return Result.err({
+            code: "invalid_result_envelope",
+            cause: { at, kind: "protocol", code: "invalid_result_envelope" },
+          });
+        }
+      } catch (error) {
+        return Result.err(materialBoundaryFailure(error, at));
+      }
+    },
+    async getUploadReceipt(
+      target: OperationTarget,
+      id: string,
+    ): Promise<BetterResult<UploadReceipt | null, Failure>> {
+      return executionReceipt(target, id, uploadReceiptResultCodec, (c) =>
+        c.get(materialPageToken, { callTimeout: 2_000 }).getReceipt(id),
+      );
+    },
+    async fieldsIdentity(
+      binding: PageBinding,
+    ): Promise<BetterResult<{ executorId: string }, Failure>> {
+      try {
+        const connected = await this.connectContent(binding);
+        if (connected.isErr()) return Result.err({ code: "target_unavailable" });
+        const acquired = connected.value.safeGet(articleFieldsToken);
+        if (acquired.isErr()) return Result.err({ code: "receipt_unreachable" });
+        const called = await callPage(acquired.value.identity());
+        return called.isErr()
+          ? Result.err({ code: "receipt_unreachable" })
+          : fieldsIdentityResultCodec.deserialize(called.value);
+      } catch {
+        return Result.err({ code: "receipt_unreachable" });
+      }
+    },
+    async getFieldsReceipt(
+      target: OperationTarget,
+      id: string,
+    ): Promise<BetterResult<FieldsReceipt | null, Failure>> {
+      return executionReceipt(target, id, fieldsReceiptResultCodec, (c) =>
+        c.get(articleFieldsToken, { callTimeout: 2_000 }).getReceipt(id),
+      );
+    },
+    async updateArticleFields(
+      binding: PageBinding,
+      fields: { title?: string; author?: string; summary?: string },
+      expectedHash: string,
+      execution: FieldsExecution,
+    ): Promise<BetterResult<FieldsReceipt, MaterialCallFailure>> {
+      try {
+        const connected = await this.connectContent(binding);
+        if (connected.isErr())
+          return Result.err({
+            ...materialBoundaryFailure(connected.error, "bg.page_connect"),
+            notInvoked: true,
+          });
+        return mutationReply(articleFieldUpdateResultCodec, () => {
+          const acquired = connected.value.safeGet(articleFieldsToken);
+          if (acquired.isErr()) throw acquired.error;
+          return acquired.value.updateArticleFields(fields, expectedHash, execution);
+        });
+      } catch (error) {
+        return Result.err({
+          ...materialBoundaryFailure(error, "bg.page_connect"),
+          notInvoked: true,
+        });
+      }
     },
     async pageStatus(binding: PageBinding): Promise<
       PageManagerResult<{
@@ -1841,15 +3301,22 @@ export function createPageManager(
       if (readPageStatus) {
         const read = await Result.tryPromise({
           try: () => readPageStatus(binding),
-          catch: () => ({ code: "page_failed" as const }),
+          catch: (error) => ({
+            code: "page_failed" as const,
+            observedFailure: observedFailure(error),
+          }),
         });
         result = Result.isError(read) ? pageErr(read.error) : pageOk(read.value);
       } else {
         const connected = await this.connectContent(binding);
         if (Result.isError(connected)) return pageErr(connected.error);
-        result = await decodeRemote(contentStatusResultCodec, () =>
-          connected.value.get(contentStatusToken).status(),
-        );
+        const status = connected.value.safeGet(contentStatusToken);
+        if (Result.isError(status))
+          return pageErr({ code: "page_failed", observedFailure: observedFailure(status.error) });
+        const invoked = await callPage(status.value.status());
+        if (Result.isError(invoked))
+          return pageErr({ code: "page_failed", observedFailure: observedFailure(invoked.error) });
+        result = await decodePageReply(contentStatusResultCodec, invoked.value);
       }
       if (Result.isError(result)) return pageErr(result.error);
       const currentAfterStatus = await this.isCurrent(binding);
@@ -1865,28 +3332,14 @@ export function createPageManager(
       return pageOk(result.value);
     },
     async isCurrent(binding: PageBinding): Promise<PageManagerResult<boolean>> {
-      const current = documents.get(binding.tabId);
-      if (
-        !current ||
-        current.documentId !== binding.documentId ||
-        (current.routeRevision ?? 0) !== (binding.routeRevision ?? 0) ||
-        invalidated.has(`${binding.tabId}:${binding.documentId}`) ||
-        navigationPending.has(binding.tabId) ||
-        frameCheckPending.has(binding.tabId)
-      )
-        return pageOk(false);
+      if (!ownsCurrentDocument(binding)) return pageOk(false);
       const tabResult = await chromeResult(() => api.getTab(binding.tabId));
       if (Result.isError(tabResult)) {
         const latestAfterFailure = documents.get(binding.tabId);
         const observedRouteAfterFailure = appmsgRouteIdentity(latestAfterFailure?.url);
         const bindingRoute = appmsgRouteIdentity(binding.url);
         if (
-          !latestAfterFailure ||
-          latestAfterFailure.documentId !== binding.documentId ||
-          (latestAfterFailure.routeRevision ?? 0) !== (binding.routeRevision ?? 0) ||
-          invalidated.has(`${binding.tabId}:${binding.documentId}`) ||
-          navigationPending.has(binding.tabId) ||
-          frameCheckPending.has(binding.tabId) ||
+          !ownsCurrentDocument(binding) ||
           !bindingRoute ||
           observedRouteAfterFailure !== bindingRoute
         )
@@ -1895,16 +3348,8 @@ export function createPageManager(
       }
       const tab = tabResult.value;
       const latest = documents.get(binding.tabId);
-      if (
-        !latest ||
-        latest.documentId !== binding.documentId ||
-        (latest.routeRevision ?? 0) !== (binding.routeRevision ?? 0) ||
-        invalidated.has(`${binding.tabId}:${binding.documentId}`) ||
-        navigationPending.has(binding.tabId) ||
-        frameCheckPending.has(binding.tabId)
-      )
-        return pageOk(false);
-      const observedRoute = appmsgRouteIdentity(latest.url);
+      if (!ownsCurrentDocument(binding)) return pageOk(false);
+      const observedRoute = appmsgRouteIdentity(latest?.url);
       const bindingRoute = appmsgRouteIdentity(binding.url);
       const currentRoute = appmsgRouteIdentity(tab?.url);
       return pageOk(
@@ -1919,25 +3364,26 @@ export function createPageManager(
     },
     dispose() {
       documents.clear();
+      checkEditorWaits();
     },
   };
   return manager;
 }
 
 async function connectChromeStatus(binding: PageBinding): Promise<Connection> {
-  return backgroundNexus.connect({
+  const connected = await backgroundNexus.safeConnect({
     target: chromeTarget.contentDocument({
       tabId: binding.tabId,
       documentId: binding.documentId,
     }),
     timeout: 1_000,
   });
+  if (Result.isError(connected)) throw connected.error;
+  if (!hasPreparationVersion(connected.value.contextMeta)) throw new PageAdmissionError();
+  return connected.value;
 }
 
-async function connectChromePage(binding: PageBinding): Promise<PageEditorServiceRemote> {
-  const connection = await connectChromeStatus(binding);
-  return connection.get(pageEditorToken);
-}
+class PageAdmissionError extends Error {}
 
 function isExactMissingGroupError(error: unknown, id?: number): boolean {
   if (!(error instanceof Error)) return false;
@@ -1947,16 +3393,6 @@ function isExactMissingGroupError(error: unknown, id?: number): boolean {
 
 function missingGroupId(error: unknown): number {
   return error instanceof Error ? Number(/^No group with id: (\d+)/.exec(error.message)?.[1]) : NaN;
-}
-
-function isPageBinding(value: unknown): value is PageBinding {
-  if (!value || typeof value !== "object") return false;
-  const binding = value as Partial<PageBinding>;
-  return (
-    Number.isInteger(binding.tabId) &&
-    typeof binding.documentId === "string" &&
-    typeof binding.url === "string"
-  );
 }
 
 function sameFinalTabUrl(currentValue: string | undefined, bindingValue: string): boolean {
