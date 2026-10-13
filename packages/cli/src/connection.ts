@@ -24,6 +24,7 @@ import {
   type OperationReply,
   type InteractionIssue,
   articleFieldsResultCodec,
+  articleStateResultCodec,
   articleCheckResultCodec,
   assetListResultCodec,
   articleCoverResultCodec,
@@ -92,7 +93,8 @@ type DecodedWorkspace = {
   getOperation(id: string): Promise<Outcome<OperationReply>>;
   inspectArticle(
     article: string,
-  ): Promise<Outcome<{ title: string; author: string; summary: string; fieldsHash: string }>>;
+    options?: { all?: true },
+  ): Promise<Outcome<import("@mpctl/contracts").ArticleInspection>>;
   updateArticleFields(input: UpdateFieldsInput): Promise<Outcome<OperationReply>>;
   checkArticle(article: string): Promise<Outcome<import("@mpctl/contracts").ArticleCheckResult>>;
   listAssets(article: string): Promise<Outcome<import("@mpctl/contracts").AssetList>>;
@@ -314,8 +316,14 @@ export async function withBroker<T>(
             writeBody: (input) =>
               decodeOperation(() => workspace.writeBody(input), input.operationId),
             getOperation: (id) => decodeOperation(() => workspace.getOperation(id), id),
-            inspectArticle: (article) =>
-              decode(articleFieldsResultCodec, () => workspace.inspectArticle(article), true),
+            inspectArticle: (article, options) =>
+              options?.all
+                ? decode(
+                    articleStateResultCodec,
+                    () => workspace.inspectArticle(article, options),
+                    true,
+                  )
+                : decode(articleFieldsResultCodec, () => workspace.inspectArticle(article), true),
             updateArticleFields: (input) =>
               decodeOperation(() => workspace.updateArticleFields(input), input.operationId),
             checkArticle: (article) =>

@@ -475,8 +475,10 @@ for (const boundary of [
         });
         const listBefore = await cli("article", "list");
         expect(listBefore.code, listBefore.stderr).toBe(0);
-        const fields = JSON.parse((await cli("article", "inspect", article.article)).stdout);
-        const cover = JSON.parse((await cli("article", "cover", article.article)).stdout);
+        const state = await cli("article", "inspect", article.article, "--all");
+        expect(state.code, state.stderr).toBe(0);
+        const stateFile = path.join(temp, "state.json");
+        await writeFile(stateFile, state.stdout);
         const ledgerId = await popup.evaluate(async () => {
           const db = await new Promise<IDBDatabase>((resolve) => {
             const request = indexedDB.open("mpctl.operations");
@@ -490,19 +492,7 @@ for (const boundary of [
           return meta.ledgerId as string;
         });
         const id = `op:${ledgerId}:${crypto.randomUUID()}`;
-        const args = [
-          "article",
-          "save",
-          article.article,
-          "--expected-body-hash",
-          article.bodyHash,
-          "--expected-fields-hash",
-          fields.fieldsHash,
-          "--expected-cover-hash",
-          cover.coverHash,
-          "--operation",
-          id,
-        ];
+        const args = ["article", "save", article.article, "--expect", stateFile, "--operation", id];
         const readRow = () =>
           popup.evaluate(async (id) => {
             const db = await new Promise<IDBDatabase>((resolve) => {

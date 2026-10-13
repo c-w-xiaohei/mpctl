@@ -109,7 +109,7 @@ test("body cover requires exclusive positive index and both version guards", () 
   expect(v.safeParse(articleCoverSetInputSchema, incomplete).success).toBe(false);
 });
 
-test("G1/B-N navigation requires typed original operation identity and success has no writable handle", async () => {
+test("navigation history stays handle-free; only confirmed live replies may carry a matching reference", async () => {
   const operationId = createOperationId(crypto.randomUUID());
   expect(v.safeParse(articleNewInputSchema, {}).success).toBe(false);
   expect(v.safeParse(articleOpenInputSchema, "A").success).toBe(false);
@@ -149,6 +149,25 @@ test("G1/B-N navigation requires typed original operation identity and success h
       effect: { ...reply.snapshot.effect, targetBound: false },
     }).success,
   ).toBe(false);
+  const live = { ...reply, article: "ephemeral:live", bodyHash: "a".repeat(64) };
+  expect((await operationResultCodec.deserialize({ status: "ok", value: live })).isOk()).toBe(true);
+  for (const change of [
+    { bodyHash: "b".repeat(64) },
+    { bodyHash: undefined },
+    { issue: { failure: { code: "storage_failed" } } },
+    {
+      snapshot: {
+        ...reply.snapshot,
+        state: "unresolved",
+        result: { status: "error", error: { code: "operation_unresolved" } },
+      },
+    },
+  ])
+    expect(
+      (
+        await operationResultCodec.deserialize({ status: "ok", value: { ...live, ...change } })
+      ).isErr(),
+    ).toBe(true);
 });
 import {
   articleCandidateSchema,
@@ -707,7 +726,7 @@ describe("preparation operation error codecs", () => {
   } as const;
 
   test("advertises the coordinated breaking wire version", () => {
-    expect(protocolVersion).toBe("0.14.0");
+    expect(protocolVersion).toBe("0.15.0");
   });
 
   test("current mutation errors reject the retired top-level forwarding shapes", async () => {

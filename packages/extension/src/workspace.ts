@@ -3,6 +3,7 @@ import { NexusError } from "@nexus-js/core";
 import {
   articleResultCodec,
   articleFieldsResultCodec,
+  articleStateResultCodec,
   articleCheckResultCodec,
   articleCoverResultCodec,
   articleCoverSetInputSchema,
@@ -96,6 +97,7 @@ type FailureCode =
   | "cover_update_unknown"
   | "save_control_unavailable"
   | "history_unavailable"
+  | "hash_failed"
   | "save_unknown";
 type ObservedFailure = { kind: "domain" | "nexus" | "protocol" | "runtime"; causeCode: string };
 type ValidationError = import("@mpctl/contracts").ServiceError<
@@ -170,7 +172,7 @@ export function createWorkspace({
       readFailure?: import("@mpctl/contracts").ReadFailure;
     },
     at: NonNullable<Failure["cause"]>["at"],
-  ): BodyObservation => {
+  ): BodyObservation & { result: { status: "error"; error: Failure } } => {
     const code: Failure["code"] =
       error.code === "not_logged_in" ||
       error.code === "content_conflict" ||
@@ -531,6 +533,7 @@ export function createWorkspace({
     const initialized = await ledger();
     if (initialized.isErr()) return encodeOperation(initialized);
     let owns = false;
+    let opened: { binding: Binding; bodyHash: string; groupId?: string } | undefined;
     const result = await initialized.value.run(input, async (execution) => {
       activeNavigation.set(input.operationId, undefined);
       owns = true;
@@ -722,6 +725,7 @@ export function createWorkspace({
             const final = await validate(reference);
             if (final.isErr()) return refused(final.error);
             effect = { ...effect, outcome: "confirmed", bodyHash: hash.value };
+            opened = { ...reference, bodyHash: hash.value };
             return observation();
           } finally {
             stopObserving?.();
@@ -730,6 +734,29 @@ export function createWorkspace({
       );
     });
     if (owns) activeNavigation.delete(input.operationId);
+    if (
+      result.isOk() &&
+      opened &&
+      result.value.snapshot.state === "settled" &&
+      result.value.snapshot.result.status === "ok" &&
+      !result.value.issue
+    ) {
+      const valid = await validate(opened);
+      if (valid.isErr())
+        return encodeOperation(
+          Result.ok({
+            ...result.value,
+            issue: {
+              operationId: input.operationId,
+              failure: bodyBoundaryError(valid.error, "bg.preflight").result.error,
+            },
+          }),
+        );
+      const live = remember(opened.binding, "", opened.bodyHash, opened.groupId).unwrap();
+      return encodeOperation(
+        Result.ok({ ...result.value, article: live.article, bodyHash: live.bodyHash }),
+      );
+    }
     return encodeOperation(result);
   };
   const maintain = async <T>(
@@ -1031,7 +1058,54 @@ export function createWorkspace({
         ok({ html: content.value, bodyHash: bodyHash.value }),
       );
     },
-    async inspectArticle(article) {
+    async inspectArticle(article, options) {
+      if (options?.all) {
+        const reference = references.get(article);
+        if (!reference) return encodeWorkspace(articleStateResultCodec, fail("target_unavailable"));
+        const read = async (): Promise<
+          import("@mpctl/contracts").WorkspaceResult<import("@mpctl/contracts").ArticleState>
+        > => {
+          const valid = await validate(reference);
+          if (valid.isErr()) return valid;
+          const fields = await pages.readArticleFields(reference.binding);
+          if (fields.isErr()) return pageFailureResult(fields.error);
+          const afterFields = await validate(reference);
+          if (afterFields.isErr()) return afterFields;
+          const editor = await pages.open(reference.binding);
+          if (editor.isErr()) return pageFailureResult(editor.error);
+          const content = await editor.value.getContent();
+          if (content.isErr()) return pageFailureResult(content.error);
+          const afterBody = await validate(reference);
+          if (afterBody.isErr()) return afterBody;
+          const cover = await pages.readArticleCover(reference.binding);
+          if (cover.isErr()) return pageFailureResult(cover.error);
+          const body = await hashBody(content.value);
+          const digest = await hashArticleFields(fields.value);
+          if (body.isErr() || digest.isErr()) return fail("hash_failed");
+          const after = await validate(reference);
+          if (after.isErr()) return after;
+          return ok({
+            article,
+            ...fields.value,
+            bodyHash: body.value,
+            fieldsHash: digest.value,
+            coverHash: cover.value,
+          });
+        };
+        const before = await read();
+        if (before.isErr()) return encodeWorkspace(articleStateResultCodec, before);
+        const after = await read();
+        return encodeWorkspace(
+          articleStateResultCodec,
+          after.isErr()
+            ? after
+            : before.value.bodyHash === after.value.bodyHash &&
+                before.value.fieldsHash === after.value.fieldsHash &&
+                before.value.coverHash === after.value.coverHash
+              ? after
+              : fail("content_conflict"),
+        );
+      }
       const reference = references.get(article);
       if (!reference) return encodeWorkspace(articleFieldsResultCodec, fail("target_unavailable"));
       const valid = await validate(reference);
@@ -1223,6 +1297,9 @@ export function createWorkspace({
       });
       let ownsAdmission = false;
       let releaseQueue: (() => void) | undefined;
+      let uploaded:
+        | { reference: ArticleBinding; filename: string; thumbnailUrl: string }
+        | undefined;
       const result = await initialized.value.run(input, async (execution) => {
         const reference = references.get(input.article);
         if (!reference) return refuse({ code: "target_unavailable" });
@@ -1281,12 +1358,50 @@ export function createWorkspace({
                 effect: receipt.value.effect,
                 ended: receipt.value.ended,
               };
+            if (receipt.value.effect.outcome === "confirmed")
+              uploaded = {
+                reference,
+                filename: receipt.value.effect.filename,
+                thumbnailUrl: receipt.value.effect.thumbnailUrl,
+              };
           }
           return receiptObservation(receipt.value);
         });
       });
       if (ownsAdmission) activeWrites.delete(input.operationId);
       releaseQueue?.();
+      if (
+        result.isOk() &&
+        uploaded &&
+        result.value.snapshot.state === "settled" &&
+        result.value.snapshot.result.status === "ok" &&
+        !result.value.issue
+      ) {
+        const valid = await validate(uploaded.reference);
+        if (valid.isErr())
+          return encodeOperation(
+            Result.ok({
+              ...result.value,
+              issue: {
+                operationId: input.operationId,
+                failure: bodyBoundaryError(valid.error, "bg.preflight").result.error,
+              },
+            }),
+          );
+        const asset = `ephemeral:${crypto.randomUUID()}`;
+        assetReferences.set(asset, {
+          article: input.article,
+          binding: uploaded.reference.binding,
+          filename: uploaded.filename,
+          thumbnailUrl: uploaded.thumbnailUrl,
+        });
+        return encodeOperation(
+          Result.ok({
+            ...result.value,
+            asset: { asset, filename: uploaded.filename, thumbnailUrl: uploaded.thumbnailUrl },
+          }),
+        );
+      }
       return encodeOperation(result);
     },
     async writeBody(input) {

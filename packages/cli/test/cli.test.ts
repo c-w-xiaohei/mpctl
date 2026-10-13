@@ -19,6 +19,7 @@ import {
   articleResultCodec,
   workspaceResultCodec,
   articleFieldsResultCodec,
+  articleStateResultCodec,
   articleCheckResultCodec,
   assetListResultCodec,
   operationResultCodec,
@@ -81,6 +82,140 @@ afterEach(async () => {
 });
 
 describe("CLI over Nexus Node IPC", () => {
+  test("open's confirmed live reference crosses IPC and is directly usable without current", async () => {
+    const restore = installIdbFixture();
+    const f = await navigationFixture();
+    const directory = await tempDir();
+    const socket = path.join(directory, "live-open.sock");
+    f.addSaved("A");
+    const nexus = new Nexus();
+    const config = usingNodeIpcDaemon({
+      appId: "mpctl",
+      address: { kind: "path", path: socket },
+      configure: false,
+      providers: [
+        { token: workspaceToken, service: f.workspace },
+        {
+          token: connectionToken,
+          service: {
+            getStatus: async () => ({
+              status: "ok" as const,
+              value: {
+                connected: true,
+                brokerVersion: protocolVersion,
+                extensionVersion: protocolVersion,
+                ledgerId: f.operations.ledgerId,
+                keyLedgerId: f.operations.ledgerId,
+              },
+            }),
+          },
+        },
+      ],
+    });
+    nexus.configure(config);
+    await nexus.ready();
+    try {
+      const opened = await runCli(["article", "open", "A"], socket);
+      expect(opened.exitCode).toBe(0);
+      const reply = JSON.parse(opened.stdout);
+      expect(reply.article).toMatch(/^ephemeral:/);
+      const file = path.join(directory, "body.html");
+      expect(
+        (await runCli(["article", "pull", reply.article, "--body", file], socket)).exitCode,
+      ).toBe(0);
+      expect(await readFile(file, "utf8")).toBe("dirty content retained");
+      const history = await runCli(
+        ["article", "open", "A", "--operation", reply.snapshot.operationId],
+        socket,
+      );
+      expect(JSON.parse(history.stdout).article).toBeUndefined();
+      expect(JSON.parse(history.stdout).snapshot).toEqual(reply.snapshot);
+    } finally {
+      (config.endpoint!.implementation as UnixSocketServerEndpoint).close();
+      f.dispose();
+      restore();
+    }
+  });
+
+  test("complete inspect stdout is a SAVE input; malformed or foreign state fails locally", async () => {
+    const directory = await tempDir();
+    const socket = path.join(directory, "complete-inspect.sock");
+    const state = {
+      article: "article-ref",
+      title: " Title ",
+      author: "",
+      summary: "Summary",
+      bodyHash: "a".repeat(64),
+      fieldsHash: "b".repeat(64),
+      coverHash: "c".repeat(64),
+    };
+    let saved = 0;
+    activeServers.push(
+      await startProvider(socket, {
+        async inspectArticle(article, options) {
+          expect(article).toBe(state.article);
+          expect(options).toEqual({ all: true });
+          return Result.ok(state);
+        },
+        async saveArticle(article, bodyHash, fieldsHash, coverHash) {
+          expect(article).toBe(state.article);
+          expect([bodyHash, fieldsHash, coverHash]).toEqual([
+            state.bodyHash,
+            state.fieldsHash,
+            state.coverHash,
+          ]);
+          saved++;
+          return Result.ok({ article, title: state.title, bodyHash });
+        },
+      }),
+    );
+    const inspected = await runCli(["article", "inspect", state.article, "--all"], socket);
+    expect(inspected.exitCode).toBe(0);
+    expect(JSON.parse(inspected.stdout)).toEqual(state);
+    const file = path.join(directory, "state.json");
+    await writeFile(file, inspected.stdout);
+    expect(
+      (await runCli(["article", "save", state.article, "--expect", file], socket)).exitCode,
+    ).toBe(0);
+    expect(saved).toBe(1);
+    for (const contents of [
+      "{",
+      JSON.stringify({ ...state, article: "other" }),
+      JSON.stringify({ ...state, bodyHash: "invalid" }),
+      JSON.stringify({ title: "", author: "", summary: "", fieldsHash: state.fieldsHash }),
+    ]) {
+      await writeFile(file, contents);
+      const rejected = await runCli(["article", "save", state.article, "--expect", file], socket);
+      expect(rejected.exitCode).toBe(1);
+      expect(JSON.parse(rejected.stderr).error.code).toBe("invalid_command");
+    }
+    expect(saved).toBe(1);
+  });
+
+  test("complete inspection refuses a fields-only or different-article reply", async () => {
+    const directory = await tempDir();
+    const socket = path.join(directory, "incomplete-state.sock");
+    let foreign = false;
+    activeServers.push(
+      await startProvider(socket, {
+        async inspectArticle() {
+          const fields = { title: "Title", author: "", summary: "", fieldsHash: "b".repeat(64) };
+          return Result.ok(
+            foreign
+              ? { ...fields, article: "other", bodyHash: "a".repeat(64), coverHash: "c".repeat(64) }
+              : fields,
+          );
+        },
+      }),
+    );
+    for (foreign of [false, true]) {
+      const result = await runCli(["article", "inspect", "ref", "--all"], socket);
+      expect(result.exitCode).toBe(1);
+      expect(result.stdout).toBe("");
+      expect(JSON.parse(result.stderr).error.code).toBe("invalid_result_envelope");
+    }
+  });
+
   test("F1 actual cleanup CLI retains original committed placement/cause/key and status adds zero effects", async () => {
     const restore = installIdbFixture();
     const f = await navigationFixture();
@@ -1127,20 +1262,20 @@ describe("CLI over Nexus Node IPC", () => {
         effect: { cover: true, outcome: "confirmed", coverHash: "b".repeat(64) },
       },
     });
-    const save = await runCli(
-      [
-        "article",
-        "save",
-        "old-ref",
-        "--expected-body-hash",
-        "a".repeat(64),
-        "--expected-fields-hash",
-        "b".repeat(64),
-        "--expected-cover-hash",
-        "c".repeat(64),
-      ],
-      socket,
+    const stateFile = path.join(directory, "state.json");
+    await writeFile(
+      stateFile,
+      JSON.stringify({
+        article: "old-ref",
+        title: "Title",
+        author: "",
+        summary: "",
+        bodyHash: "a".repeat(64),
+        fieldsHash: "b".repeat(64),
+        coverHash: "c".repeat(64),
+      }),
     );
+    const save = await runCli(["article", "save", "old-ref", "--expect", stateFile], socket);
     expect(JSON.parse(save.stdout)).toMatchObject({
       snapshot: {
         operation: "save",
@@ -1232,17 +1367,20 @@ describe("CLI over Nexus Node IPC", () => {
       "--expected-hash",
       "a".repeat(64),
     ];
-    const saveArgs = [
-      "article",
-      "save",
-      "article-ref",
-      "--expected-body-hash",
-      "a".repeat(64),
-      "--expected-fields-hash",
-      "b".repeat(64),
-      "--expected-cover-hash",
-      "c".repeat(64),
-    ];
+    const stateFile = path.join(directory, "state.json");
+    await writeFile(
+      stateFile,
+      JSON.stringify({
+        article: "article-ref",
+        title: "Title",
+        author: "",
+        summary: "",
+        bodyHash: "a".repeat(64),
+        fieldsHash: "b".repeat(64),
+        coverHash: "c".repeat(64),
+      }),
+    );
+    const saveArgs = ["article", "save", "article-ref", "--expect", stateFile];
     const knownSave = await runCli(saveArgs, socket);
     expect(knownSave.exitCode).toBe(1);
     expect(JSON.parse(knownSave.stderr.trim().split("\n").at(-1)!).error).toMatchObject({
@@ -1818,6 +1956,9 @@ describe("CLI over Nexus Node IPC", () => {
       ["article", "new", "extra"],
       ["article", "open", " "],
       ["article", "pull", "ref", "--body", ""],
+      ["article", "current", "--new", "--candidate", "A"],
+      ["article", "cover", "ref", "--operation", createOperationId(fixtureLedgerId)],
+      ["article", "save", "ref"],
     ]) {
       const result = await runCli(args, socket);
       expect(result.exitCode).not.toBe(0);
@@ -1861,7 +2002,7 @@ describe("CLI over Nexus Node IPC", () => {
     expect(existsSync(socket)).toBe(false);
   }, 15_000);
 
-  test("article help groups field inspection separately and documents the supported field contract", async () => {
+  test("article help follows selection/edit/save workflow and discloses version safety", async () => {
     const directory = await tempDir();
     const socket = path.join(directory, "help-must-not-start.sock");
     const root = await runCli(["--help"], socket);
@@ -1872,19 +2013,23 @@ describe("CLI over Nexus Node IPC", () => {
     const saveHelp = await runCli(["article", "save", "--help"], socket);
 
     expect(root.exitCode).toBe(0);
-    expect(root.stdout).toContain("本地 HTML 文件");
-    expect(root.stdout).toContain("作者和摘要");
     expect(root.stderr).toBe("");
     expect(articleHelp.exitCode).toBe(0);
     expect(articleHelp.stdout).toContain("选择文章：");
     expect(articleHelp.stdout).toContain("正文文件：");
     expect(articleHelp.stdout).toContain("文章字段：");
-    expect(articleHelp.stdout.indexOf("文章字段：")).toBeLessThan(
-      articleHelp.stdout.indexOf("选择文章："),
+    expect(articleHelp.stdout.indexOf("选择文章：")).toBeLessThan(
+      articleHelp.stdout.indexOf("正文文件："),
     );
-    const fieldCommands = articleHelp.stdout.split("文章字段：")[1]!.split("选择文章：")[0]!;
+    expect(articleHelp.stdout.indexOf("正文文件：")).toBeLessThan(
+      articleHelp.stdout.indexOf("文章字段："),
+    );
+    expect(articleHelp.stdout.indexOf("文章字段：")).toBeLessThan(
+      articleHelp.stdout.indexOf("检查与保存："),
+    );
+    const fieldCommands = articleHelp.stdout.split("文章字段：")[1]!.split("图片封面：")[0]!;
     const selectionCommands = articleHelp.stdout.split("选择文章：")[1]!.split("正文文件：")[0]!;
-    expect(fieldCommands).toContain("inspect <article>");
+    expect(fieldCommands).toContain("inspect [options] <article>");
     expect(fieldCommands).toContain("update [options] <article>");
     expect(selectionCommands).not.toMatch(/^\s+inspect\b/m);
     expect(selectionCommands).not.toMatch(/^\s+update\b/m);
@@ -1896,26 +2041,15 @@ describe("CLI over Nexus Node IPC", () => {
       expect(result.exitCode).toBe(0);
       expect(result.stderr).toBe("");
     }
-    expect(inspectHelp.stdout).toContain("title、author、summary");
     expect(inspectHelp.stdout).toContain("Usage: mpctl article inspect [options] <article>");
-    expect(inspectHelp.stdout).toContain("仅基于这三个原始字段的 fieldsHash");
-    expect(inspectHelp.stdout).toContain("不读取正文、封面或其他设置，也不写入页面");
-    expect(updateHelp.stdout).toContain("title（最多 64 个 UTF-16 单元）");
-    expect(updateHelp.stdout).toContain("title 清空后的镜像读取可能为换行");
-    expect(updateHelp.stdout).toContain("fieldsHash");
-    expect(updateHelp.stdout).toContain("Usage: mpctl article update [options] <article>");
+    expect(inspectHelp.stdout).toContain("--all");
+    expect(inspectHelp.stdout).toContain("不是原子快照或云端证明");
     expect(updateHelp.stdout).toContain("--fields <json-file>");
     expect(updateHelp.stdout).toContain("--expected-hash <fieldsHash>");
-    expect(updateHelp.stdout).toContain("支持 title（最多 64 个 UTF-16 单元）");
-    expect(updateHelp.stdout).toContain("author（最多 8 个）与 summary（最多 120 个）");
-    expect(updateHelp.stdout).toContain("不保存或发表");
-    expect(checkHelp.stdout).toContain("只返回精确的 errors 与 warnings 数组");
-    expect(checkHelp.stdout).toContain("不会保存、聚焦页面或派发修改");
-    expect(saveHelp.stdout).toContain("bodyHash 来自已读正文，不是修改后本地文件的 hash");
-    expect(saveHelp.stdout).toContain("fieldsHash 来自 article inspect");
-    expect(saveHelp.stdout).toContain("coverHash 来自 article cover 只读结果");
-    expect(saveHelp.stdout).toContain("不刷新草稿列表、不重载编辑页、不做独立云端重开验收");
-    expect(saveHelp.stdout).toContain("persistence 为 unverified，不代表平台级准备就绪");
+    expect(checkHelp.stdout).toContain("不是保存前置步骤");
+    expect(saveHelp.stdout).toContain("--expect <json-file>");
+    expect(saveHelp.stdout).not.toContain("--expected-fields-hash");
+    expect(saveHelp.stdout).toContain("persistence:unverified");
     expect(existsSync(socket)).toBe(false);
   });
 
@@ -1929,12 +2063,10 @@ describe("CLI over Nexus Node IPC", () => {
       expect(result.stderr).toBe("");
     }
     expect(listed.stdout).toContain("visible-page");
-    expect(listed.stdout).toContain("临时句柄");
-    expect(listed.stdout).toContain("缩略图，不是正文原图地址");
     expect(uploaded.stdout).toContain("--file <path>");
-    expect(uploaded.stdout).toContain("snapshot.effect");
-    expect(uploaded.stdout).toContain("不换键或重传");
-    expect(uploaded.stdout).toContain("上传不保存或发表");
+    expect(uploaded.stdout).toContain("首次确认成功返回 asset");
+    expect(uploaded.stdout).toContain("历史重提只返回持久结果");
+    expect(uploaded.stdout).toContain("缩略图不是正文原图");
     expect(existsSync(socket)).toBe(false);
   });
 
@@ -2673,9 +2805,10 @@ async function startProvider(
     >;
     inspectArticle(
       article: string,
+      options?: { all?: true },
     ): Promise<
       import("better-result").Result<
-        { title: string; author: string; summary: string; fieldsHash: string },
+        import("@mpctl/contracts").ArticleInspection,
         import("@mpctl/contracts").WorkspaceError
       >
     >;
@@ -2943,8 +3076,11 @@ function encodeWorkspaceProvider(
       status: "error",
       error: { failure: { code: "operation_not_found" } },
     }),
-    inspectArticle: async (article) =>
-      encodeResult(articleFieldsResultCodec, await workspace.inspectArticle!(article)),
+    inspectArticle: async (article, options) =>
+      encodeResult(
+        options?.all ? articleStateResultCodec : articleFieldsResultCodec,
+        await workspace.inspectArticle!(article, options),
+      ),
     updateArticleFields: async (input) => {
       const result = await workspace.updateArticleFields!(
         input.article,

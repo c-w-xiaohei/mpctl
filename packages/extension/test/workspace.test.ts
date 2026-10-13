@@ -42,6 +42,7 @@ import {
   listArticlesResultCodec,
   workspaceResultCodec,
   articleFieldsResultCodec,
+  articleStateResultCodec,
   articleCheckResultCodec,
   assetListResultCodec,
   operationResultCodec,
@@ -495,6 +496,119 @@ function fixture(
 }
 
 describe("article-scoped asset workspace", () => {
+  test("complete inspect provides matching SAVE versions without adopting later changes", async () => {
+    const f = fixture({ saved: true });
+    const article = await readValue(f.workspace.currentArticle(), articleResultCodec);
+    const state = (
+      await articleStateResultCodec.deserialize(
+        await f.workspace.inspectArticle(article.article, { all: true }),
+      )
+    ).unwrap();
+    expect(state).toMatchObject({
+      article: article.article,
+      bodyHash: article.bodyHash,
+      coverHash: "c".repeat(64),
+      title: " Title ",
+      author: "作者",
+    });
+    const before = f.pages.nativeSaveCount();
+    f.setBody("<p>changed after inspection</p>");
+    const reply = await receipt(
+      f.workspace.saveArticle({
+        operationId: await operationId(f.operations),
+        article: article.article,
+        expectedBodyHash: state.bodyHash,
+        expectedFieldsHash: state.fieldsHash,
+        expectedCoverHash: state.coverHash,
+      }),
+    );
+    expect(reply.snapshot).toMatchObject({
+      result: { status: "error", error: { code: "content_conflict" } },
+    });
+    expect(f.pages.nativeSaveCount()).toBe(before);
+  });
+
+  test("complete inspect rejects drift between observations; fields-only inspect does not read cover", async () => {
+    const f = fixture({ saved: true });
+    const article = await readValue(f.workspace.currentArticle(), articleResultCodec);
+    const cover = f.pages.readArticleCover;
+    let reads = 0;
+    f.pages.readArticleCover = async () => {
+      const result = await cover();
+      if (++reads === 1) f.setBody("<p>later body</p>");
+      return result;
+    };
+    expect(await f.workspace.inspectArticle(article.article, { all: true })).toMatchObject({
+      status: "error",
+      error: { code: "content_conflict" },
+    });
+    reads = 0;
+    expect((await f.workspace.inspectArticle(article.article)).status).toBe("ok");
+    expect(reads).toBe(0);
+  });
+
+  test("confirmed upload returns a live asset usable for cover; replay/status keep only original facts", async () => {
+    const f = fixture({ saved: true });
+    const article = await readValue(f.workspace.currentArticle(), articleResultCodec);
+    const input = {
+      operationId: await operationId(f.operations),
+      article: article.article,
+      blob: new Blob([new Uint8Array([137, 80, 78, 71, 13, 10, 26, 10])], { type: "image/png" }),
+      filename: "new.png",
+      mimeType: "image/png" as const,
+    };
+    const first = await receipt(f.workspace.uploadAsset(input));
+    expect(first.asset?.asset).toMatch(/^ephemeral:/);
+    expect(f.calls).not.toContain("materials-list");
+    f.pages.setMaterials([
+      { filename: first.asset!.filename, thumbnailUrl: first.asset!.thumbnailUrl },
+    ]);
+    const listed = await readValue(f.workspace.listAssets(article.article), assetListResultCodec);
+    expect(listed.cards[0]?.asset).toBe(first.asset!.asset);
+    const set = await receipt(
+      f.workspace.setArticleCover({
+        operationId: await operationId(f.operations),
+        article: article.article,
+        asset: first.asset!.asset,
+        expectedCoverHash: "c".repeat(64),
+      }),
+    );
+    expect(set.snapshot.effect.outcome).toBe("confirmed");
+    const repeated = await receipt(f.workspace.uploadAsset(input));
+    expect(repeated.snapshot).toEqual(first.snapshot);
+    expect(repeated.asset).toBeUndefined();
+    expect((await receipt(f.workspace.getOperation(input.operationId))).asset).toBeUndefined();
+    expect(f.calls.filter((call) => call === "materials-upload")).toHaveLength(1);
+  });
+
+  test("confirmed upload loses its live handle if the document vanishes before return, not its committed effect", async () => {
+    const f = fixture({ saved: true });
+    const article = await readValue(f.workspace.currentArticle(), articleResultCodec);
+    const operations = (await f.operations).unwrap();
+    const originalRun = operations.run;
+    operations.run = async (...args) => {
+      const result = await originalRun(...args);
+      f.pages.isCurrent = async () => Result.ok(false);
+      return result;
+    };
+    const input = {
+      operationId: await operationId(f.operations),
+      article: article.article,
+      blob: new Blob([new Uint8Array([137, 80, 78, 71, 13, 10, 26, 10])], { type: "image/png" }),
+      filename: "new.png",
+      mimeType: "image/png" as const,
+    };
+    const reply = await receipt(f.workspace.uploadAsset(input));
+    expect(reply.asset).toBeUndefined();
+    expect(reply).toMatchObject({
+      snapshot: { state: "settled", effect: { outcome: "confirmed" }, result: { status: "ok" } },
+      issue: { failure: { code: "target_unavailable" } },
+    });
+    expect((await receipt(f.workspace.getOperation(input.operationId))).snapshot).toEqual(
+      reply.snapshot,
+    );
+    expect(f.calls.filter((call) => call === "materials-upload")).toHaveLength(1);
+  });
   test.each([
     "unknown",
     "cleanup",

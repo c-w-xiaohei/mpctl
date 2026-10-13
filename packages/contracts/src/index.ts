@@ -6,7 +6,7 @@ import {
   type SerializedResult,
 } from "better-result";
 import * as v from "valibot";
-export const protocolVersion = "0.14.0";
+export const protocolVersion = "0.15.0";
 export function hasProtocolVersion(identity: unknown): boolean {
   if (typeof identity !== "object" || identity === null || !("app" in identity)) return false;
   const app = identity.app;
@@ -137,6 +137,14 @@ export const articleResultSchema = v.strictObject({
 export const articleInputSchema = v.strictObject({
   article: articleReferenceSchema,
 });
+export const articleStateSchema = v.strictObject({
+  article: articleReferenceSchema,
+  ...articleFieldsSchema.entries,
+  bodyHash: bodyHashSchema,
+  coverHash: articleCoverHashSchema,
+});
+export type ArticleState = v.InferOutput<typeof articleStateSchema>;
+export type ArticleInspection = v.InferOutput<typeof articleFieldsSchema> | ArticleState;
 export const articleCoverResultSchema = v.strictObject({ coverHash: articleCoverHashSchema });
 export const assetCardSchema = v.strictObject({
   asset: v.pipe(v.string(), v.minLength(1)),
@@ -738,10 +746,34 @@ export const interactionIssueSchema = v.strictObject({
   ),
 });
 export type InteractionIssue = v.InferOutput<typeof interactionIssueSchema>;
-export const operationReplySchema = v.strictObject({
-  snapshot: operationSnapshotSchema,
-  issue: v.optional(interactionIssueSchema),
-});
+export const operationReplySchema = v.pipe(
+  v.strictObject({
+    snapshot: operationSnapshotSchema,
+    issue: v.optional(interactionIssueSchema),
+    // Call-local handles are never stored in the operation snapshot/ledger.
+    article: v.optional(articleReferenceSchema),
+    bodyHash: v.optional(bodyHashSchema),
+    asset: v.optional(assetCardSchema),
+  }),
+  v.check((reply) => {
+    if ((reply.article === undefined) !== (reply.bodyHash === undefined)) return false;
+    if (reply.article === undefined && reply.asset === undefined) return true;
+    if (reply.issue || reply.snapshot.state !== "settled" || reply.snapshot.result.status !== "ok")
+      return false;
+    if (reply.article !== undefined)
+      return (
+        reply.asset === undefined &&
+        (reply.snapshot.operation === "new" || reply.snapshot.operation === "open") &&
+        reply.snapshot.effect.bodyHash === reply.bodyHash
+      );
+    return (
+      reply.snapshot.operation === "upload" &&
+      reply.snapshot.effect.outcome === "confirmed" &&
+      reply.asset?.filename === reply.snapshot.effect.filename &&
+      reply.asset?.thumbnailUrl === reply.snapshot.effect.thumbnailUrl
+    );
+  }),
+);
 export type OperationReply = v.InferOutput<typeof operationReplySchema>;
 export type OperationWireResult = SerializedResult<OperationReply, ServiceError<InteractionIssue>>;
 export const operationResultCodec = createServiceResultCodec(
@@ -756,6 +788,7 @@ const createWorkspaceResultCodec = <
   valueSchema: TSchema,
 ) => createServiceResultCodec(valueSchema, workspaceErrorSchema);
 export const articleFieldsResultCodec = createWorkspaceResultCodec(articleFieldsSchema);
+export const articleStateResultCodec = createWorkspaceResultCodec(articleStateSchema);
 export const articleCheckResultCodec = createWorkspaceResultCodec(articleCheckResultSchema);
 export const articleCoverResultCodec = createWorkspaceResultCodec(articleCoverResultSchema);
 export type ArticleCoverSetInput = v.InferOutput<typeof articleCoverSetInputSchema>;
@@ -798,7 +831,8 @@ export interface WorkspaceService {
   getOperation(operationId: string): Promise<OperationWireResult>;
   inspectArticle(
     article: string,
-  ): Promise<WorkspaceWireResult<v.InferOutput<typeof articleFieldsSchema>>>;
+    options?: { all?: true },
+  ): Promise<WorkspaceWireResult<ArticleInspection>>;
   updateArticleFields(input: UpdateFieldsInput): Promise<OperationWireResult>;
   checkArticle(
     article: string,

@@ -240,6 +240,9 @@ export async function navigationFixture(database = `navigation:${crypto.randomUU
       materialWire = reply;
     },
     id: () => createOperationId(operations.ledgerId),
+    endCapture() {
+      captureEnded = true;
+    },
     decode,
     holdGroup() {
       held = true;

@@ -1,5 +1,6 @@
 import { afterEach, beforeEach, expect, test, spyOn } from "bun:test";
 import { Result } from "better-result";
+import { workspaceResultCodec } from "@mpctl/contracts";
 import { createReloadControl } from "../src/reload";
 import { installIdbFixture } from "./idb-fixture";
 import { navigationFixture } from "./browser/fixtures/navigation-workspace";
@@ -9,6 +10,96 @@ beforeEach(() => {
 });
 afterEach(() => {
   restore();
+});
+
+test("open returns its exact live article without current; history never revives the handle", async () => {
+  const f = await navigationFixture();
+  try {
+    f.addSaved("A");
+    f.addSaved("B");
+    const input = { operationId: f.id(), candidate: "A" };
+    const first = await f.decode(await f.workspace.openArticle(input));
+    expect(first.article).toMatch(/^ephemeral:/);
+    expect(first.bodyHash).toBe(
+      "navigation" in first.snapshot.effect ? first.snapshot.effect.bodyHash : undefined,
+    );
+    const body = (
+      await workspaceResultCodec.deserialize(await f.workspace.readBody(first.article!))
+    ).unwrap();
+    expect(body.html).toBe("dirty content retained");
+    const before = { ...f.counters };
+    f.expire();
+    const repeated = await f.decode(await f.workspace.openArticle(input));
+    expect(repeated.snapshot).toEqual(first.snapshot);
+    expect(repeated.article).toBeUndefined();
+    expect(repeated.bodyHash).toBeUndefined();
+    expect(f.counters).toEqual(before);
+  } finally {
+    f.dispose();
+  }
+});
+
+test("confirmed new returns a usable reference without another editor lookup/read", async () => {
+  const f = await navigationFixture();
+  f.endCapture();
+  try {
+    const reply = await f.decode(await f.workspace.newArticle({ operationId: f.id() }));
+    expect(reply.snapshot.state).toBe("settled");
+    expect(reply.article).toMatch(/^ephemeral:/);
+    expect(f.counters.read).toBe(1);
+    expect(
+      (await workspaceResultCodec.deserialize(await f.workspace.readBody(reply.article!))).isOk(),
+    ).toBe(true);
+  } finally {
+    f.dispose();
+  }
+});
+
+test("same-key concurrent open supplies a handle only to the owner, not its waiter", async () => {
+  const f = await navigationFixture();
+  f.addSaved("A");
+  f.holdRead();
+  try {
+    const input = { operationId: f.id(), candidate: "A" };
+    const owner = f.workspace.openArticle(input);
+    await f.readReached();
+    const waiter = f.workspace.openArticle(input);
+    f.releaseRead();
+    const first = await f.decode(await owner);
+    const duplicate = await f.decode(await waiter);
+    expect(first.article).toMatch(/^ephemeral:/);
+    expect(duplicate.article).toBeUndefined();
+    expect(duplicate.snapshot).toEqual(first.snapshot);
+    expect(f.counters.read).toBe(1);
+  } finally {
+    f.releaseRead();
+    f.dispose();
+  }
+});
+
+test("page lost after navigation settlement adds a call issue without a handle or rewriting history", async () => {
+  const f = await navigationFixture();
+  f.addSaved("A");
+  const run = f.operations.run;
+  f.operations.run = async (...args) => {
+    const result = await run(...args);
+    f.manager.isCurrent = async () => Result.ok(false);
+    return result;
+  };
+  try {
+    const input = { operationId: f.id(), candidate: "A" };
+    const reply = await f.decode(await f.workspace.openArticle(input));
+    expect(reply.article).toBeUndefined();
+    expect(reply).toMatchObject({
+      snapshot: { state: "settled", result: { status: "ok" } },
+      issue: { failure: { code: "target_unavailable" } },
+    });
+    expect((await f.decode(await f.workspace.getOperation(input.operationId))).snapshot).toEqual(
+      reply.snapshot,
+    );
+  } finally {
+    f.dispose();
+  }
 });
 
 test("B-N1/K0/K3/TM3 new created once; historical dead source needs no handle or reads", async () => {

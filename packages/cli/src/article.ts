@@ -1,7 +1,11 @@
 import { readFile } from "node:fs/promises";
 import { Result } from "better-result";
 import type { Result as BetterResult } from "better-result";
-import { articleNavigationTimeoutMs, articleFieldUpdateInputSchema } from "@mpctl/contracts";
+import {
+  articleNavigationTimeoutMs,
+  articleFieldUpdateInputSchema,
+  articleStateSchema,
+} from "@mpctl/contracts";
 import * as v from "valibot";
 import {
   withConnection,
@@ -39,8 +43,8 @@ export function articleCommand(
     asset?: string;
     fromBody?: string;
     expectedBodyHash?: string;
-    expectedFieldsHash?: string;
-    expectedCoverHash?: string;
+    expect?: string;
+    all?: boolean;
     operation?: string;
     candidate?: string;
     new?: boolean;
@@ -59,8 +63,14 @@ export function articleCommand(
 
   if (command === "inspect")
     return withConnection(async ({ workspace }) => {
-      const result = await workspace.inspectArticle(ref!);
-      if (Result.isOk(result)) return Result.ok(result.value);
+      const result = await workspace.inspectArticle(ref!, options.all ? { all: true } : undefined);
+      if (Result.isOk(result)) {
+        if (options.all) {
+          if (!("article" in result.value) || result.value.article !== ref)
+            return Result.err(cliError("invalid_result_envelope"));
+        }
+        return Result.ok(result.value);
+      }
       const error = result.error;
       const instruction =
         error.code === "target_unavailable"
@@ -84,6 +94,15 @@ export function articleCommand(
       options.asset !== undefined ||
       options.expectedHash !== undefined ||
       options.expectedBodyHash !== undefined;
+    if (!writing && options.operation !== undefined)
+      return Promise.resolve(
+        Result.err(
+          cliError(
+            "invalid_command",
+            "只读 cover 不接受 --operation；设置封面请指定 --asset 或 --from-body。",
+          ),
+        ),
+      );
     if (
       writing &&
       (!/^[0-9a-f]{64}$/.test(options.expectedHash ?? "") ||
@@ -123,28 +142,40 @@ export function articleCommand(
   }
 
   if (command === "save") {
-    if (
-      ![options.expectedBodyHash, options.expectedFieldsHash, options.expectedCoverHash].every(
-        (hash) => /^[0-9a-f]{64}$/.test(hash ?? ""),
-      )
-    )
+    if (!options.expect)
       return Promise.resolve(
         Result.err(
-          cliError(
-            "invalid_command",
-            "save 需要 expected body、fields、cover 三个 64 位小写 SHA-256",
-          ),
+          cliError("invalid_command", "save 需要 --expect 指向 inspect --all 输出的 JSON 文件"),
         ),
       );
-    return submitSave(
-      {
-        article: ref!,
-        expectedBodyHash: options.expectedBodyHash!,
-        expectedFieldsHash: options.expectedFieldsHash!,
-        expectedCoverHash: options.expectedCoverHash!,
-      },
-      options.operation,
-    );
+    return Result.tryPromise({
+      try: () => readFile(options.expect!, "utf8"),
+      catch: () => cliError("file_error", "检查 --expect 状态文件是否存在且可读"),
+    }).then((file) => {
+      if (file.isErr()) return file;
+      const decoded = Result.try({
+        try: () => JSON.parse(file.value) as unknown,
+        catch: () => cliError("invalid_command", "--expect 必须是 inspect --all 输出的 JSON"),
+      });
+      if (decoded.isErr()) return decoded;
+      const state = v.safeParse(articleStateSchema, decoded.value);
+      if (!state.success || state.output.article !== ref)
+        return Result.err(
+          cliError(
+            "invalid_command",
+            "状态文件必须来自同一 article 的 inspect --all；不会自动刷新或替换版本",
+          ),
+        );
+      return submitSave(
+        {
+          article: ref!,
+          expectedBodyHash: state.output.bodyHash,
+          expectedFieldsHash: state.output.fieldsHash,
+          expectedCoverHash: state.output.coverHash,
+        },
+        options.operation,
+      );
+    });
   }
 
   if (command === "update") {
@@ -176,7 +207,9 @@ export function articleCommand(
 
   if (command === "open" || command === "new")
     return submitNavigation(command === "open" ? ref! : undefined, options.operation);
-  if (command === "current")
+  if (command === "current") {
+    if (options.new && options.candidate !== undefined)
+      return Promise.resolve(Result.err(cliError("invalid_command", "--new 与 --candidate 互斥")));
     return withConnection(
       async ({ workspace }) => {
         const result = await workspace.currentArticle({
@@ -197,6 +230,7 @@ export function articleCommand(
       },
       { callTimeout: articleNavigationTimeoutMs },
     );
+  }
 
   if (command === "pull") {
     return checkBodyDestination(options.body!, options.overwrite ?? false).then((checked) => {
@@ -219,7 +253,10 @@ export function articleCommand(
   if (!/^[0-9a-f]{64}$/.test(options.expectedHash ?? ""))
     return Promise.resolve(
       Result.err(
-        cliError("invalid_command", "--expected-hash 必须是 current/pull 返回的 64 位小写 SHA-256"),
+        cliError(
+          "invalid_command",
+          "--expected-hash 必须是 open/new/current/pull 返回的 64 位小写 SHA-256",
+        ),
       ),
     );
 

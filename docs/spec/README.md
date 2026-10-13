@@ -1,6 +1,6 @@
 # mpctl 技术规格
 
-当前设计聚焦文件驱动的公众号正文编辑：将指定文章的正文拉取为本地 HTML，agent 用已有文件工具排版，再推送回编辑器。文章引用确定目标，HTML 文件承载正文，插件组织浏览器操作，微信编辑器负责渲染。
+当前设计聚焦文件驱动的单篇文章工作流：新建／打开、编辑字段和 HTML 正文、配图、封面、显式保存及继续编辑。文章引用确定目标，HTML 文件承载正文，插件组织浏览器操作，微信编辑器负责渲染。
 
 本文区分目标设计与当前实现。RFC 中的架构和流程描述目标边界；各 RFC 状态及“当前实现与证据”段落记录已落地范围和限制。端口、socket 等配置以实现为准。
 
@@ -13,12 +13,12 @@
 5. [RFC 0005 工程结构与测试架构](./0005-engineering-and-testing.zh.md)：workspace 包边界、工具链职责、测试层次及真实浏览器/微信证据范围。
 6. [RFC 0006 公众号发稿准备与管理能力扩展](./0006-article-preparation-and-management.zh.md)：提案；字段、图片／封面、检查／保存与预览的单篇工作流，采用新版 Nexus 二进制能力传图片，区分传输验证与微信上传验证。
 7. [RFC 0007 发稿准备能力实施方案](./0007-article-preparation-implementation-plan.zh.md)：设计草案；命令输入输出、运行时落点、Nexus 升级与页面能力核实、任务依赖和退出条件。
-8. [RFC 0008 分布式执行、幂等记录与异常责任](./0008-distributed-execution-and-errors.zh.md)：收敛提案；IndexedDB 与 BG 防重接口、执行端薄守卫、BODY 冲突／回执查询切片、单一操作快照与交互错误；不默认全局锁。尚未实施。
+8. [RFC 0008 请求防重、页面执行与业务结果](./0008-distributed-execution-and-errors.zh.md)：2026-10-14 重设计；按用例时序划分持久防重、文档协调和 SAVE 同稿风险，舍弃历史未决驱动全局准入及统一执行状态机。方案尚未迁移到代码；保留原文件路径。
 
 ## 已确定的设计
 
 - 一个编辑页可能有多条图文。文章是操作对象，tab 是操作场所；标题、作者、摘要独立于正文 HTML。
-- agent-facing 使用文章引用和本地 HTML 文件。mpctl 不提供正文 patch、光标、选区或段落修改协议。
+- agent-facing 使用文章引用和本地 HTML 文件。正文配图优先复用可靠图片来源与整体 push；若平台仅原生插图可靠，则提供显式插入。不预造通用正文 patch、光标、选区或段落协议。
 - CLI 读取或写入 UTF-8 HTML 片段；插件传递 HTML，不访问本地路径。不增加 manifest、sidecar、排版 DSL 或正文文件仓库。
 - 推送以调用者观察的实际 HTML `expectedHash` 检查正文版本，冲突零写入；成功后整体替换并回读规范化 `bodyHash`。不做合并或强制备份；JSAPI 检查后写入不是原子 CAS。
 - 推送不自动反写本地源文件，不隐含保存草稿或发表。微信会规范化 HTML，实际结果可以再次拉取，视觉效果以编辑器呈现为准。
@@ -28,9 +28,16 @@
 - 守护进程 Relay 唯一插件的稳定工作区入口；文章切换由插件内部处理，不轮换全局页面 Token。
 - 工作组锁和配置放在 `storage.local`，受管 tab 与临时 document 提示放在 `storage.session`，连接/proxy/ref 与文章引用表留在所属运行时内存。后台重启核对工作组并等待 content 上报，不恢复文章引用；CLI 退出和仅 WS 断开不清仍存活 background 的绑定。不重放旧请求。
 - 技术栈为 Bun、TypeScript 7 (`tsgo`)、Oxlint、Oxfmt、Turbo、Valibot，插件采用 WXT、Chrome MV3、React。通信采用 Nexus Node IPC、WS、Chrome 和 mpctl 内部 MAIN 页面桥；当前 WS 宿主使用 `node:http + ws`，普通 HTTP 请求由 `node:http` 返回 404，没有引入 Hono 或正文 HTTP 端点。workspace 与测试约定见 RFC 0005。
-- 需要顺序执行或限制请求量时，在插件业务层排队、做背压。超时或断线后无法确定写入结果时如实报告，不自动重放。
+- 请求记录负责同键防重；文档协调覆盖实际 CONTENT／MAIN 执行和 BG 重启；派发前重验目标及版本。命令之间不持有工作流锁，不扫描全部历史未决记录决定工作区准入。
+- 未决远端 SAVE 由保存能力针对同稿顺序风险判断；不阻止独立文章。保存确认与清理、定位问题分开；首次保存处理身份转换。超时不代表动作停止，页面销毁不代表云端请求取消。
 
 ## 当前状态与范围
+
+截至 2026-10-14：本地接口为 `0.15.0`，已有 `new/open` 直接交付引用、`inspect --all`、`save --expect` 等收敛。真实测试中新建被旧 SAVE 未决记录阻塞，未创建页面；新稿首次 SAVE、上传后正文插图和完整真实闭环仍未交付。RFC 0008 的重设计只是方案修订，尚未改变实现和历史账本。
+
+### 早期实现与验收记录
+
+以下为早期各阶段依据，版本、测试计数及“当前／尚未实现”均指记录当时；不覆盖上述现状或代表最新功能验收。
 
 - 已实现 Bun/TypeScript 7/Oxc/Turbo workspace 的 `cli`、`broker`、`contracts`、`extension` 四个包；扩展使用 WXT、Chrome MV3 与 React，运行时服务经 Nexus IPC、WebSocket、Chrome 和页面桥连接。详见 RFC 0005。
 - 当前支持新稿正文 I/O 与受限 saved 列表/打开及单条可见图文正文 I/O。list 使用实际组定位，重复/失败读取不撤销旧选择；open 当次重查对应组，再经原生 Edit 目标获取实际页面引用。候选和引用都不是永久文章 ID。当前 hash/Relay 清理证据见 `tmp/reports/T76-nexus-cleanup.md`。

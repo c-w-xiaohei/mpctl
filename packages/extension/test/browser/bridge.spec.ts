@@ -477,13 +477,12 @@ test("real CLI, broker, extension and page bridge pull/push UTF-8 HTML on exact 
     ).toBe(true);
     expect(completedNative.code, `${completedNative.stdout}\n${completedNative.stderr}`).toBe(0);
     expect(JSON.parse(completedNative.stdout).snapshot.effect.pageCreated).toBe(true);
-    const nativeCurrent = await cli(temp, socketPath, "article", "current", "--new");
-    expect(nativeCurrent.code, nativeCurrent.stderr).toBe(0);
-    const nativeResult = JSON.parse(nativeCurrent.stdout) as {
+    const nativeResult = JSON.parse(completedNative.stdout) as {
       article: string;
       bodyHash: string;
     };
     const nativeArticle = nativeResult.article;
+    expect(nativeArticle).toMatch(/^ephemeral:/);
     const nativeBodyPath = path.join(temp, "native-click-body.html");
     expect(
       (await cli(temp, socketPath, "article", "pull", nativeArticle, "--body", nativeBodyPath))
@@ -548,6 +547,11 @@ test("real CLI, broker, extension and page bridge pull/push UTF-8 HTML on exact 
     );
     expect(assetUploaded.code, `${assetUploaded.stdout}\n${assetUploaded.stderr}`).toBe(0);
     expect(JSON.parse(assetUploaded.stdout)).toMatchObject({
+      asset: {
+        asset: expect.stringMatching(/^ephemeral:/),
+        filename: "bridge-pipeline-fixture.png",
+        thumbnailUrl: "https://mmbiz.qpic.cn/mmbiz_png/synthetic-library-card/300?wx_fmt=png",
+      },
       snapshot: {
         operation: "upload",
         state: "settled",
@@ -602,6 +606,19 @@ test("real CLI, broker, extension and page bridge pull/push UTF-8 HTML on exact 
       ],
     });
     expect(JSON.parse(afterAssets.stdout).cards[0].thumbnailUrl).not.toContain("/0?");
+    expect(JSON.parse(afterAssets.stdout).cards[0].asset).toBe(
+      JSON.parse(assetUploaded.stdout).asset.asset,
+    );
+    const originalUpload = JSON.parse(assetUploaded.stdout).snapshot;
+    const uploadStatus = await cli(
+      temp,
+      socketPath,
+      "operation",
+      "status",
+      originalUpload.operationId,
+    );
+    expect(uploadStatus.code, uploadStatus.stderr).toBe(0);
+    expect(JSON.parse(uploadStatus.stdout)).toEqual({ snapshot: originalUpload });
     const duplicateUpload = await cli(
       temp,
       socketPath,
@@ -649,18 +666,18 @@ test("real CLI, broker, extension and page bridge pull/push UTF-8 HTML on exact 
 
     // The native-new draft is intentionally unsupported for save and must be rejected
     // before the fixture's native save button is dispatched.
+    const newState = await cli(temp, socketPath, "article", "inspect", nativeArticle, "--all");
+    expect(newState.code, newState.stderr).toBe(0);
+    const newStateFile = path.join(temp, "new-state.json");
+    await writeFile(newStateFile, newState.stdout);
     const newDraftSave = await cli(
       temp,
       socketPath,
       "article",
       "save",
       nativeArticle,
-      "--expected-body-hash",
-      nativeResult.bodyHash,
-      "--expected-fields-hash",
-      JSON.parse(beforeAssetFields.stdout).fieldsHash,
-      "--expected-cover-hash",
-      "0".repeat(64),
+      "--expect",
+      newStateFile,
     );
     expect(newDraftSave.code).toBe(1);
     expect(cliErrorCode(newDraftSave.stderr)).toBe("unsupported");
@@ -683,16 +700,8 @@ test("real CLI, broker, extension and page bridge pull/push UTF-8 HTML on exact 
       .poll(() => savedEditor.evaluate(() => document.documentElement.dataset.mpctlFixtureGroup))
       .toBe("fixture-group-1");
     expect(JSON.parse(savedOpen.stdout).snapshot.effect.pageCreated).toBe(true);
-    const savedCurrent = await cli(
-      temp,
-      socketPath,
-      "article",
-      "current",
-      "--candidate",
-      "fixture-group-1",
-    );
-    expect(savedCurrent.code, savedCurrent.stderr).toBe(0);
-    const savedCoverArticle = (JSON.parse(savedCurrent.stdout) as { article: string }).article;
+    const savedCoverArticle = (JSON.parse(savedOpen.stdout) as { article: string }).article;
+    expect(savedCoverArticle).toMatch(/^ephemeral:/);
     holdEditorImage = false;
     releaseEditorImage();
     const beforeRepeatedOpen = context.pages().length;
@@ -700,16 +709,7 @@ test("real CLI, broker, extension and page bridge pull/push UTF-8 HTML on exact 
     expect(reusedSavedOpen.code, reusedSavedOpen.stderr).toBe(0);
     expect(context.pages().length).toBe(beforeRepeatedOpen);
     expect(JSON.parse(reusedSavedOpen.stdout).snapshot.effect.pageCreated).toBe(false);
-    const reusedCurrent = await cli(
-      temp,
-      socketPath,
-      "article",
-      "current",
-      "--candidate",
-      "fixture-group-1",
-    );
-    expect(reusedCurrent.code, reusedCurrent.stderr).toBe(0);
-    const reusedArticle = (JSON.parse(reusedCurrent.stdout) as { article: string }).article;
+    const reusedArticle = (JSON.parse(reusedSavedOpen.stdout) as { article: string }).article;
     expect((await cli(temp, socketPath, "article", "inspect", reusedArticle)).code).toBe(0);
     // New permission-free official JSAPI branch. This fixture is synthetic;
     // neither native UI/debugger nor SAVE is used by the cover operation.
@@ -1277,18 +1277,35 @@ test("real CLI, broker, extension and page bridge pull/push UTF-8 HTML on exact 
     await savedEditor.evaluate(() => {
       localStorage.setItem("mpctl-fixture-canonical-save-body", "yes");
     });
+    const completeState = await cli(
+      temp,
+      socketPath,
+      "article",
+      "inspect",
+      savedCoverArticle,
+      "--all",
+    );
+    expect(completeState.code, completeState.stderr).toBe(0);
+    expect(JSON.parse(completeState.stdout)).toMatchObject({
+      bodyHash: saveBodyHash,
+      fieldsHash: savedBeforeFields.fieldsHash,
+      coverHash: changedCoverHash,
+    });
+    const stateFile = path.join(temp, "save-state.json");
+    await writeFile(stateFile, completeState.stdout);
+    const staleStateFile = path.join(temp, "stale-state.json");
+    await writeFile(
+      staleStateFile,
+      JSON.stringify({ ...JSON.parse(completeState.stdout), coverHash: originalCoverHash }),
+    );
     const staleCoverSave = await cli(
       temp,
       socketPath,
       "article",
       "save",
       savedCoverArticle,
-      "--expected-body-hash",
-      saveBodyHash,
-      "--expected-fields-hash",
-      savedBeforeFields.fieldsHash,
-      "--expected-cover-hash",
-      originalCoverHash,
+      "--expect",
+      staleStateFile,
     );
     expect(staleCoverSave.code).toBe(1);
     expect(cliErrorCode(staleCoverSave.stderr)).toBe("content_conflict");
@@ -1324,12 +1341,8 @@ test("real CLI, broker, extension and page bridge pull/push UTF-8 HTML on exact 
       "article",
       "save",
       savedCoverArticle,
-      "--expected-body-hash",
-      saveBodyHash,
-      "--expected-fields-hash",
-      savedBeforeFields.fieldsHash,
-      "--expected-cover-hash",
-      changedCoverHash,
+      "--expect",
+      stateFile,
     );
     expect(save.code, `${save.stdout}\n${save.stderr}`).toBe(0);
     expect(mpRequests.length).toBe(requestsBeforeNativeSave);
@@ -1358,12 +1371,8 @@ test("real CLI, broker, extension and page bridge pull/push UTF-8 HTML on exact 
       "article",
       "save",
       savedCoverArticle,
-      "--expected-body-hash",
-      saveBodyHash,
-      "--expected-fields-hash",
-      savedBeforeFields.fieldsHash,
-      "--expected-cover-hash",
-      changedCoverHash,
+      "--expect",
+      stateFile,
       "--operation",
       savedSnapshot.operationId,
     );
