@@ -327,8 +327,8 @@ for (const boundary of [
           db.close();
           return record;
         }, operationId);
-        expect(issued.snapshot.state).toBe("issued");
-        expect(issued.snapshot.effect.pageCreated).toBe(boundary === "navigation-reply-lost");
+        expect(issued.snapshot.state).toBe("unresolved");
+        expect(issued.snapshot.effect.pageCreated).toBe(false);
         expect(
           await worker.evaluate(() => ({
             create: (globalThis as any).__t5Create,
@@ -423,8 +423,9 @@ for (const boundary of [
           expect(owner).toBe(issued.owner);
           const newAttempt = await cli("article", "new");
           expect(newAttempt.code).toBe(1);
-          const refusedId = JSON.parse(newAttempt.stderr.trim().split("\n").at(-1)!).error.snapshot
-            .operationId;
+          const refused = JSON.parse(newAttempt.stderr.trim().split("\n").at(-1)!).error;
+          expect(refused.code).toBe("target_unavailable");
+          const refusedId = refused.snapshot.operationId;
           const newOwner = await replacement.evaluate(async (id) => {
             const db = await new Promise<IDBDatabase>((resolve) => {
               const request = indexedDB.open("mpctl.operations", 1);
@@ -439,15 +440,9 @@ for (const boundary of [
           }, refusedId);
           expect(newOwner).not.toBe(issued.owner);
           expect(context.pages()).toHaveLength(before);
-          for (const args of [
-            ["article", "list"],
-            ["workspace", "cleanup"],
-            ["connect", "--reload", "--extension", extensionId],
-          ])
-            expect((await cli(...args)).code).toBe(1);
           const located = await cli("article", "current", "--new");
-          // Created-before-ack tab was never grouped. Pure current cannot repair
-          // placement or claim an old navigation's writable target.
+          // The old ungrouped tab is not adopted. Native placement refuses the
+          // duplicate route; this is target evidence, not a historical lock.
           expect(located.code).toBe(1);
           expect(JSON.parse(located.stderr).error.code).toBe("target_unavailable");
           expect(context.pages()).toHaveLength(before);
@@ -659,7 +654,7 @@ for (const boundary of [
           .toBe(true);
         const beforeStop = await readRow();
         expect(beforeStop.snapshot.effect).toEqual({
-          outcome: boundary === "save-uncommitted-worker-stopped" ? "not_dispatched" : "confirmed",
+          outcome: boundary === "save-uncommitted-worker-stopped" ? "unknown" : "confirmed",
           persistence: "unverified",
         });
         const session = await context.newCDPSession(page);
@@ -706,9 +701,7 @@ for (const boundary of [
           effect: { outcome: "confirmed", persistence: "unverified" },
           state: "settled",
         });
-        expect((await cli(...args)).code).toBe(
-          boundary === "save-confirmed-worker-stopped" ? 0 : 1,
-        );
+        expect((await cli(...args)).code).toBe(0);
         expect(await nativeCounts()).toBe(1);
         expect(await navigationCounts(replacementPopup)).toEqual({
           reload: 0,
@@ -787,7 +780,7 @@ for (const boundary of [
           });
         const original = await readRow(popup);
         const id = original.snapshot.operationId;
-        expect(original.snapshot.state).toBe("issued");
+        expect(original.snapshot.state).toBe("unresolved");
         if (boundary === "upload-worker-stopped" || boundary === "upload-provider-destroyed") {
           await expect
             .poll(() => page.evaluate(() => document.documentElement.dataset.t3CardPending))
@@ -849,10 +842,7 @@ for (const boundary of [
               "list",
               JSON.parse(freshCurrent.stdout).article,
             );
-            expect(JSON.parse(listedBeforeReceipt.stderr).error).toMatchObject({
-              code: "operation_blocked",
-              blockingOperationId: id,
-            });
+            expect(listedBeforeReceipt.code, listedBeforeReceipt.stderr).toBe(0);
             before = await counts();
           }
           const status = await cli("operation", "status", id);
@@ -860,7 +850,7 @@ for (const boundary of [
           expect(JSON.parse(status.stdout).snapshot).toMatchObject({
             state: boundary === "upload-worker-stopped" ? "settled" : "unresolved",
             effect: {
-              outcome: boundary === "upload-worker-stopped" ? "confirmed" : "not_dispatched",
+              outcome: boundary === "upload-worker-stopped" ? "confirmed" : "unknown",
             },
           });
           const repeated = await cli(
@@ -911,7 +901,7 @@ for (const boundary of [
         const error = JSON.parse(failure.stderr.trim().split("\n").at(-1)!).error;
         expect(error.snapshot).toMatchObject({
           operation: "upload",
-          state: "unresolved",
+          state: "settled",
           effect: { outcome: boundary === "upload-cleanup-fails" ? "confirmed" : "unknown" },
         });
         expect(error.snapshot.result.error.cause).toMatchObject({
@@ -950,12 +940,9 @@ for (const boundary of [
         expect(status.code).toBe(0);
         expect(JSON.parse(status.stdout).snapshot).toEqual(error.snapshot);
         const listed = await cli("asset", "list", article.article);
-        expect(JSON.parse(listed.stderr).error).toMatchObject({
-          code: "operation_blocked",
-          blockingOperationId: id,
-        });
+        expect(listed.code).toBe(1);
         const maintained = await cli("workspace", "cleanup");
-        expect(maintained.code).toBe(1);
+        expect(maintained.code, maintained.stderr).toBe(0);
         expect(await counts()).toEqual(before);
         const changed = Uint8Array.from(bytes);
         changed[8] = 43;
@@ -1076,7 +1063,7 @@ for (const boundary of [
         const error = JSON.parse(stopped.stderr.trim().split("\n").at(-1)!).error;
         expect(error.snapshot).toMatchObject({
           operation: "fields",
-          state: "unresolved",
+          state: "settled",
           effect: { attempted: ["title"], confirmed: [], unknown: ["title"] },
           result: {
             status: "error",
@@ -1104,7 +1091,7 @@ for (const boundary of [
               db.close();
             }
           }, id);
-        expect(await pendingCount()).toBe("unresolved");
+        expect(await pendingCount()).toBe("settled");
         await page.evaluate(() => (window as any).__t2ReleaseMirror());
         expect(await page.locator("#title").inputValue()).toBe("Held title");
         const before = await page.evaluate(() => ({
@@ -1140,7 +1127,7 @@ for (const boundary of [
         );
         expect(
           JSON.parse(otherFields.stderr.trim().split("\n").at(-1)!).error.snapshot.result.error,
-        ).toMatchObject({ code: "operation_blocked", blockingOperationId: id });
+        ).toMatchObject({ code: "target_unavailable" });
         await writeFile(file, "must not dispatch");
         const body = await cli(
           "article",
@@ -1153,8 +1140,8 @@ for (const boundary of [
         );
         expect(
           JSON.parse(body.stderr.trim().split("\n").at(-1)!).error.snapshot.result.error,
-        ).toMatchObject({ code: "operation_blocked", blockingOperationId: id });
-        expect(await pendingCount()).toBe("unresolved");
+        ).toMatchObject({ code: "target_unavailable" });
+        expect(await pendingCount()).toBe("settled");
         expect(
           await page.evaluate(() => ({
             counts: { ...(window as any).__t2FieldCounts },
@@ -1313,7 +1300,10 @@ for (const boundary of [
               const method = state === "accepted" ? "add" : "put";
               const original = IDBObjectStore.prototype[method];
               (IDBObjectStore.prototype as any)[method] = function (value: any, ...args: any[]) {
-                if (value.snapshot?.state === state) {
+                if (
+                  value.snapshot?.state === "unresolved" &&
+                  (state === "accepted" ? !value.binding : !!value.binding)
+                ) {
                   const tx = this.transaction;
                   const oncomplete = tx.oncomplete;
                   tx.oncomplete = () => {
@@ -1373,7 +1363,7 @@ for (const boundary of [
             .toBe("function");
         }
         const original = await row(popup, id);
-        expect(original.snapshot.state).toBe(boundary === "accepted" ? "accepted" : "issued");
+        expect(original.snapshot.state).toBe("unresolved");
         const beforeRestart = await counts();
         expect(beforeRestart.set_content ?? 0).toBe(
           boundary === "active-main" || boundary === "both-destroyed" ? 1 : 0,
@@ -1390,7 +1380,7 @@ for (const boundary of [
             .toBe("yes");
           expect((await submitted).code).toBe(1);
           expect((await row(popup, id)).snapshot).toMatchObject({
-            state: "unresolved",
+            state: "settled",
             effect: { outcome: "unknown" },
           });
           const beforeQuery = await counts();
@@ -1399,7 +1389,7 @@ for (const boundary of [
           expect(JSON.parse(status.stdout)).toMatchObject({
             snapshot: {
               state: "settled",
-              effect: { outcome: "unknown" },
+              effect: { outcome: "not_dispatched" },
               result: { status: "error", error: { code: "content_conflict" } },
             },
           });
@@ -1457,7 +1447,7 @@ for (const boundary of [
           "Execution context was destroyed",
         );
         const recovered = await row(freshPopup, id);
-        expect(recovered.snapshot.state).toBe(boundary === "accepted" ? "settled" : "unresolved");
+        expect(recovered.snapshot.state).toBe("unresolved");
         expect(recovered.owner).toBe(original.owner); // historical owner isn't reassigned by recovery
         expect((await submitted).code).not.toBe(0);
         let freshArticle: any;
@@ -1521,15 +1511,14 @@ for (const boundary of [
             "--expected-hash",
             replacementArticle.bodyHash,
           );
-          expect(newIntent.code).toBe(1);
-          expect(JSON.parse(newIntent.stderr.trim().split("\n").at(-1)!).error.code).toBe(
-            "operation_blocked",
-          );
-          const newId = JSON.parse(newIntent.stderr.trim().split("\n").at(-1)!).error.operationId;
+          expect(newIntent.code, newIntent.stderr).toBe(0);
+          const newId = JSON.parse(newIntent.stdout).snapshot.operationId;
           expect((await row(freshPopup, newId)).owner).not.toBe(original.owner);
-          expect(await replacement.evaluate(() => (window as any).__mpctlFixtureCalls)).toEqual(
-            before,
-          );
+          expect(
+            (await replacement.evaluate(() => (window as any).__mpctlFixtureCalls)).filter(
+              (call: string) => call === "set_content",
+            ),
+          ).toHaveLength(1);
         }
         if (freshArticle) {
           const related = await cli(
@@ -1547,10 +1536,10 @@ for (const boundary of [
           const nextId =
             related.code === 0 ? relatedReply.snapshot.operationId : relatedReply.error.operationId;
           expect((await row(freshPopup, nextId)).owner).not.toBe(original.owner);
-          if (boundary === "accepted") {
+          if (boundary === "accepted" || boundary === "issued-before-native") {
             expect(related.code, related.stderr).toBe(0);
             expect((await counts()).set_content).toBe(1);
-            expect(recovered.snapshot.result.error.code).toBe("operation_interrupted");
+            expect(recovered.snapshot.result.error.code).toBe("operation_unresolved");
           } else {
             expect(related.code).toBe(1);
             expect(relatedReply.error.code).toBe("operation_blocked");
@@ -1559,9 +1548,7 @@ for (const boundary of [
             expect(active.code).toBe(0);
             expect(JSON.parse(active.stdout).snapshot.state).toBe("unresolved");
             expect(await counts()).toEqual(beforeStatus);
-            if (boundary === "issued-before-native")
-              expect(JSON.parse(active.stdout).issue.failure.code).toBe("receipt_missing");
-            else {
+            {
               await page.evaluate(() => {
                 delete document.documentElement.dataset.t1Hold;
                 (window as any).__t1ReleaseSetter();
@@ -1672,7 +1659,7 @@ for (const boundary of [
         .poll(() => page.evaluate(() => typeof (window as any).__t1ReleaseSetter))
         .toBe("function");
       const activeStatus = await cli("operation", "status", heldId);
-      expect(JSON.parse(activeStatus.stdout).snapshot.state).toBe("issued");
+      expect(JSON.parse(activeStatus.stdout).snapshot.state).toBe("unresolved");
       abandoned.kill("SIGTERM");
       await abandonedExit;
       await page.evaluate(() => {
@@ -1716,7 +1703,7 @@ for (const boundary of [
         const original = IDBObjectStore.prototype.put;
         IDBObjectStore.prototype.put = function (value: any, ...args: any[]) {
           const request = original.call(this, value, ...args);
-          if (value.snapshot?.state === "settled" || value.snapshot?.state === "unresolved")
+          if (value.snapshot?.state === "settled")
             request.addEventListener("success", () => this.transaction.abort());
           return request;
         };
@@ -1750,20 +1737,17 @@ for (const boundary of [
       const blockedFields = JSON.parse(blocked.stderr.split("\n").slice(1).join("\n")).error;
       // This test still aborts every terminal IDB write. Fields now also own a
       // committed claim, so the zero-dispatch refusal is explicitly uncommitted.
-      expect(blockedFields.code).toBe("storage_failed");
+      expect(blockedFields.code).toBe("operation_unresolved");
+      expect(blockedFields.issue.failure.code).toBe("storage_failed");
       expect(blockedFields.snapshot).toMatchObject({
         operation: "fields",
-        state: "accepted",
+        state: "unresolved",
         effect: { outcome: "not_dispatched", attempted: [] },
       });
-      expect(blockedFields.issue.uncommitted.result.error.code).toBe("operation_blocked");
-      expect(blockedFields.issue.uncommitted.result.error.blockingOperationId).toBe(lostId);
+      expect(blockedFields.issue.uncommitted.result.error.code).toBe("content_conflict");
       expect(await page.locator('[data-placeholder="请在这里输入标题"]').innerText()).not.toBe(
         "must not write",
       );
-      const blockedReload = await cli("connect", "--reload", "--extension", extensionId);
-      expect(blockedReload.code).toBe(1);
-      expect(JSON.parse(blockedReload.stderr).error.code).toBe("reload_failed");
       const beforeOwner = await worker.evaluate(async (id) => {
         const db = await new Promise<IDBDatabase>((resolve) => {
           const request = indexedDB.open("mpctl.operations", 1);
@@ -1776,7 +1760,7 @@ for (const boundary of [
         db.close();
         return { owner: record.owner, state: record.snapshot.state };
       }, lostId);
-      expect(beforeOwner.state).toBe("issued");
+      expect(beforeOwner.state).toBe("unresolved");
       const beforeRestart = await counts();
       const marker = await page.evaluate(
         () => document.documentElement.dataset.mpctlFixtureDocumentId,

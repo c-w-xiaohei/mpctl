@@ -153,6 +153,14 @@ test("W2 default exact-document Chrome acquisition gates every business service 
       });
       const content = new Nexus().configure(contentConfig);
       content.provide(pageEditorToken, {
+        acquireWrite: async () => ({
+          status: "error" as const,
+          error: { code: "unsupported" as const },
+        }),
+        releaseWrite: async () => ({
+          status: "error" as const,
+          error: { code: "unsupported" as const },
+        }),
         async ready() {
           counters.ready++;
           return {
@@ -169,6 +177,10 @@ test("W2 default exact-document Chrome acquisition gates every business service 
         async getReceipt() {
           return { status: "ok" as const, value: null };
         },
+        resolveImage: async () => ({
+          status: "error" as const,
+          error: { code: "unsupported" as const },
+        }),
         setCoverFromBody: async () => ({
           status: "error" as const,
           error: { code: "unsupported" as const },

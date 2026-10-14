@@ -129,26 +129,16 @@ test("G1 workspace old positional BODY invocation is rejected before target acqu
   expect(reply).toEqual({ status: "error", error: { failure: { code: "invalid_operation" } } });
   expect(acquisitions).toBe(0);
 });
-test("F0 unresolved BODY blocks old mutators while pure reads remain available", async () => {
+test("historical BODY uncertainty does not block tab placement", async () => {
   let nativeWrites = 0;
   const operations = (await createOperations()).unwrap();
-  await operations.run(
-    {
-      operationId: `op:${operations.ledgerId}:${crypto.randomUUID()}`,
-      article: "original",
-      html: "x",
-      expectedHash: "a".repeat(64),
-    },
-    (execution) =>
-      execution.issue(
-        { tabId: 2, documentId: "doc", route: "new", executorId: crypto.randomUUID() },
-        async () => ({
-          effect: { outcome: "unknown" },
-          ended: false,
-          result: { status: "error", error: { code: "operation_unresolved" } },
-        }),
-      ),
-  );
+  await operations.claim({
+    operationId: `op:${operations.ledgerId}:${crypto.randomUUID()}`,
+    operation: "body",
+    requestDigest: "a".repeat(64),
+    localRequestDigest: "b".repeat(64),
+    effect: { outcome: "unknown" },
+  });
   const pages = {
     async cleanupWorkspace() {
       nativeWrites++;
@@ -165,9 +155,9 @@ test("F0 unresolved BODY blocks old mutators while pure reads remain available",
   });
   const cleanup = await service.cleanupWorkspace();
   const create = await service.newArticle(undefined as never);
-  expect(cleanup.status === "error" && cleanup.error.code).toBe("operation_blocked");
+  expect(cleanup.status).toBe("ok");
   expect(create).toEqual({ status: "error", error: { failure: { code: "invalid_operation" } } });
-  expect(nativeWrites).toBe(0);
+  expect(nativeWrites).toBe(1);
 });
 
 function fixture(
@@ -238,6 +228,9 @@ function fixture(
     },
   });
   const wireEditor: PageEditorService = {
+    resolveImage: (candidate) => editor.resolveImage(candidate),
+    acquireWrite: (id) => editor.acquireWrite(id),
+    releaseWrite: (token) => editor.releaseWrite(token),
     setCoverFromBody: (input) => editor.setCoverFromBody(input),
     getCoverReceipt: (id) => editor.getCoverReceipt(id),
     ready: () => editor.ready(),
@@ -585,8 +578,8 @@ describe("article-scoped asset workspace", () => {
     const f = fixture({ saved: true });
     const article = await readValue(f.workspace.currentArticle(), articleResultCodec);
     const operations = (await f.operations).unwrap();
-    const originalRun = operations.run;
-    operations.run = async (...args) => {
+    const originalRun = operations.finish;
+    operations.finish = async (...args) => {
       const result = await originalRun(...args);
       f.pages.isCurrent = async () => Result.ok(false);
       return result;
@@ -608,6 +601,87 @@ describe("article-scoped asset workspace", () => {
       reply.snapshot,
     );
     expect(f.calls.filter((call) => call === "materials-upload")).toHaveLength(1);
+  });
+  test("confirmed upload recovery rebinds its exact card after workspace restart without uploading again", async () => {
+    const f = fixture({ saved: true });
+    const binding = (await f.pages.ensureEditorTab()).unwrap();
+    binding.url += "&token=test-account";
+    const article = await readValue(f.workspace.currentArticle(), articleResultCodec);
+    const id = await operationId(f.operations);
+    const reply = await receipt(
+      f.workspace.uploadAsset({
+        operationId: id,
+        article: article.article,
+        blob: new Blob([new Uint8Array([137, 80, 78, 71, 13, 10, 26, 10])], { type: "image/png" }),
+        filename: "recover.png",
+        mimeType: "image/png",
+      }),
+    );
+    const card = { filename: reply.asset!.filename, thumbnailUrl: reply.asset!.thumbnailUrl };
+    f.pages.setMaterials([
+      card,
+      { filename: card.filename, thumbnailUrl: "https://mmbiz.qpic.cn/other/300" },
+    ]);
+    const restarted = createWorkspace({ pages: f.pages as never, operations: f.operations });
+    const current = await readValue(restarted.currentArticle(), articleResultCodec);
+    const recovered = await readValue(
+      restarted.listAssets(current.article, { operation: id }),
+      assetListResultCodec,
+    );
+    expect(recovered.cards).toHaveLength(1);
+    expect(recovered.cards[0]).toMatchObject(card);
+    expect(recovered.cards[0]!.asset).not.toBe(reply.asset!.asset);
+    const cover = await receipt(
+      restarted.setArticleCover({
+        operationId: await operationId(f.operations),
+        article: current.article,
+        asset: recovered.cards[0]!.asset,
+        expectedCoverHash: "c".repeat(64),
+      }),
+    );
+    expect(cover.snapshot.effect.outcome).toBe("confirmed");
+    f.pages.setMaterials([
+      { filename: card.filename, thumbnailUrl: "https://mmbiz.qpic.cn/other/300" },
+    ]);
+    expect(await restarted.listAssets(current.article, { operation: id })).toMatchObject({
+      status: "error",
+      error: { code: "target_unavailable" },
+    });
+    binding.url = binding.url.replace("test-account", "other-account");
+    const switched = createWorkspace({ pages: f.pages as never, operations: f.operations });
+    const other = await readValue(switched.currentArticle(), articleResultCodec);
+    const beforeLists = f.calls.filter((call) => call === "materials-list").length;
+    expect(await switched.listAssets(other.article, { operation: id })).toMatchObject({
+      status: "error",
+      error: { code: "relationship_unknown" },
+    });
+    expect(f.calls.filter((call) => call === "materials-list")).toHaveLength(beforeLists);
+    expect(f.calls.filter((call) => call === "materials-upload")).toHaveLength(1);
+    expect((await receipt(restarted.getOperation(id))).snapshot).toEqual(reply.snapshot);
+  });
+  test("upload recovery cannot infer success from a matching card for an unknown request", async () => {
+    const f = fixture({ saved: true });
+    const binding = (await f.pages.ensureEditorTab()).unwrap();
+    binding.url += "&token=test-account";
+    const article = await readValue(f.workspace.currentArticle(), articleResultCodec);
+    const records = (await f.operations).unwrap();
+    const id = await operationId(f.operations);
+    await records.claim({
+      operationId: id,
+      operation: "upload",
+      requestDigest: "a".repeat(64),
+      localRequestDigest: "b".repeat(64),
+      effect: { outcome: "unknown", filename: "recover.png" },
+    });
+    f.pages.setMaterials([
+      { filename: "recover.png", thumbnailUrl: "https://mmbiz.qpic.cn/test/300" },
+    ]);
+    expect(await f.workspace.listAssets(article.article, { operation: id })).toMatchObject({
+      status: "error",
+      error: { code: "asset_upload_unknown" },
+    });
+    expect(f.calls).not.toContain("materials-list");
+    expect(f.calls).not.toContain("materials-upload");
   });
   test.each([
     "unknown",
@@ -669,7 +743,7 @@ describe("article-scoped asset workspace", () => {
     f.calls.length = 0;
     const first = await receipt(f.service.saveArticle(input));
     expect(first.snapshot).toMatchObject({
-      state: mode === "confirmed-failure" || mode === "lost-result" ? "settled" : "unresolved",
+      state: "settled",
       effect: {
         outcome:
           mode === "cleanup" ||
@@ -776,8 +850,9 @@ describe("article-scoped asset workspace", () => {
         result: { status: "ok" },
       });
       expect(open).toHaveBeenCalledTimes(1);
-      expect((await operations.record(id)).unwrap().navigationBinding?.target?.documentId).toBe(
-        "relogin-fresh",
+      expect(result.article).toMatch(/^ephemeral:/);
+      expect((await decode(f.service.readBody(result.article!), workspaceResultCodec)).isOk()).toBe(
+        true,
       );
       expect(f.calls).not.toContain("native-save");
     } finally {
@@ -853,21 +928,6 @@ describe("article-scoped asset workspace", () => {
       const f = fixture({ saved: true });
       const operations = (await f.operations).unwrap();
       const id = `op:${operations.ledgerId}:${crypto.randomUUID()}`;
-      const input =
-        operation === "cover"
-          ? {
-              operationId: id,
-              article: "expired",
-              asset: "expired-asset",
-              expectedCoverHash: "a".repeat(64),
-            }
-          : {
-              operationId: id,
-              article: "expired",
-              expectedBodyHash: "a".repeat(64),
-              expectedFieldsHash: "b".repeat(64),
-              expectedCoverHash: "c".repeat(64),
-            };
       const binding = {
         tabId: 2,
         documentId: "doc",
@@ -878,13 +938,18 @@ describe("article-scoped asset workspace", () => {
         operation === "cover"
           ? { cover: true as const, outcome: "unknown" as const }
           : { outcome: "unknown" as const, persistence: "unverified" as const };
-      await operations.run(input, (execution) =>
-        execution.issue(binding, async () => ({
-          effect,
-          ended: false,
-          result: { status: "error", error: { code: "receipt_unreachable" } },
-        })),
-      );
+      await operations.claim({
+        operationId: id,
+        operation,
+        requestDigest: "a".repeat(64),
+        localRequestDigest: "b".repeat(64),
+        effect,
+      });
+      await operations.bind(id, binding);
+      await operations.finish(id, effect, {
+        status: "error",
+        error: { code: "receipt_unreachable" },
+      });
       const row = (await operations.record(id)).unwrap();
       let receipts = 0;
       let nativeReceipt: any = null;
@@ -1255,6 +1320,18 @@ describe("article-scoped asset workspace", () => {
           ).unwrap();
         },
         getReceipt: async () => ({ status: "ok" as const, value: null }),
+        acquireWrite: async () => ({
+          status: "error" as const,
+          error: { code: "unsupported" as const },
+        }),
+        releaseWrite: async () => ({
+          status: "error" as const,
+          error: { code: "unsupported" as const },
+        }),
+        resolveImage: async () => ({
+          status: "error" as const,
+          error: { code: "unsupported" as const },
+        }),
         setCoverFromBody: async () => ({
           status: "error" as const,
           error: { code: "unsupported" as const },
@@ -1726,17 +1803,7 @@ describe("article-scoped asset workspace", () => {
             },
           },
         });
-      } else if (index === 6)
-        expect(result).toMatchObject({
-          status: "error",
-          error: {
-            code: "page_failed",
-            snapshot: {
-              state: "settled",
-              result: { error: { cause: { kind: "nexus", code: "E_CONN_CLOSED" } } },
-            },
-          },
-        });
+      } else if (index === 6) expect(result).toEqual(Result.err({ code: "page_failed" }));
       else expect(result).toEqual(Result.err({ code: "page_failed" }));
     }
     await expectSnapshot(
@@ -1916,7 +1983,7 @@ describe("article-scoped asset workspace", () => {
     expect(f.calls).toContain("materials-upload");
   });
 
-  test("save rejects a new draft as unsupported without calling native save", async () => {
+  test("first save checks all versions before calling native save", async () => {
     const f = fixture();
     await expectSnapshot(
       f.workspace.newArticle({ operationId: await operationId(f.operations) }),
@@ -1939,14 +2006,14 @@ describe("article-scoped asset workspace", () => {
       result: {
         status: "error",
         error: {
-          code: "unsupported",
+          code: "content_conflict",
         },
       },
     });
-    expect(f.calls).toEqual([]);
+    expect(f.pages.nativeSaveCount()).toBe(0);
   });
 
-  test("legacy confirmed SAVE with pending BG navigation remains unchanged and blocks cover/open", async () => {
+  test("legacy confirmed SAVE with missing BG cleanup preserves history without blocking open", async () => {
     const html = "<p>original</p>";
     const f = fixture({ saved: true, html });
     const article = await readValue(f.workspace.currentArticle(), articleResultCodec);
@@ -1966,35 +2033,36 @@ describe("article-scoped asset workspace", () => {
       expectedFieldsHash: fields.fieldsHash,
       expectedCoverHash: cover.coverHash,
     };
+    const { saveRequestDigest } = await import("../src/background-contracts");
+    const local = await saveRequestDigest(input);
+    await operations.claim({
+      operationId: input.operationId,
+      operation: "save",
+      requestDigest: await bodyRequestDigest(
+        JSON.stringify(["save", input.article, local]),
+        "0".repeat(64),
+      ),
+      localRequestDigest: local,
+      effect: { outcome: "not_dispatched", persistence: "unverified" },
+    });
+    await operations.bind(input.operationId, {
+      tabId: f.editorBinding.tabId,
+      documentId: f.editorBinding.documentId,
+      route: appmsgRouteIdentity(f.editorBinding.url)!,
+      groupId: "g1",
+      executorId: fixtureExecutorId,
+    });
     const legacy = (
-      await operations.run(input, (execution) =>
-        execution.issue(
-          {
-            tabId: f.editorBinding.tabId,
-            documentId: f.editorBinding.documentId,
-            route: appmsgRouteIdentity(f.editorBinding.url)!,
-            groupId: "g1",
-            executorId: fixtureExecutorId,
+      await operations.finish(
+        input.operationId,
+        { outcome: "confirmed", persistence: "unverified" },
+        {
+          status: "error",
+          error: {
+            code: "page_failed",
+            cause: { at: "bg.reload", kind: "domain", code: "navigation_failed" },
           },
-          async () => {
-            const observation = {
-              effect: { outcome: "confirmed" as const, persistence: "unverified" as const },
-              ended: false,
-              result: {
-                status: "error" as const,
-                error: {
-                  code: "page_failed" as const,
-                  cause: {
-                    at: "bg.reload" as const,
-                    kind: "domain" as const,
-                    code: "navigation_failed",
-                  },
-                },
-              },
-            };
-            return observation;
-          },
-        ),
+        },
       )
     ).unwrap();
     const row = (await operations.record(input.operationId)).unwrap();
@@ -2004,7 +2072,7 @@ describe("article-scoped asset workspace", () => {
     });
     await new Promise<void>((resolve) => {
       const tx = db.transaction("operations", "readwrite");
-      tx.objectStore("operations").put({ ...row, bgEffects: "pending" });
+      tx.objectStore("operations").put({ ...row, schemaVersion: 2, bgEffects: "pending" });
       tx.oncomplete = () => resolve();
     });
     db.close();
@@ -2024,21 +2092,6 @@ describe("article-scoped asset workspace", () => {
     expect((await receipt(f.service.saveArticle(input))).snapshot).toEqual(legacy.snapshot);
     expect((await operations.record(input.operationId)).unwrap().bgEffects).toBe("pending");
     expect(f.pages.nativeSaveCount()).toBe(0);
-    const bodyCover = await receipt(
-      f.service.setArticleCover({
-        operationId: `op:${operations.ledgerId}:${crypto.randomUUID()}`,
-        article: article.article,
-        bodyImage: 1,
-        expectedBodyHash: await hash(html),
-        expectedCoverHash: cover.coverHash,
-      }),
-    );
-    expect(bodyCover.snapshot).toMatchObject({
-      operation: "cover",
-      state: "settled",
-      effect: { cover: true, outcome: "not_dispatched" },
-      result: { status: "error", error: { code: "operation_blocked" } },
-    });
     expect(f.calls).toEqual(before);
     f.pages.findCurrentEditor = async () => Result.ok(f.editorBinding);
     const opened = await receipt(
@@ -2050,9 +2103,10 @@ describe("article-scoped asset workspace", () => {
     expect(opened.snapshot).toMatchObject({
       operation: "open",
       state: "settled",
-      result: { status: "error", error: { code: "operation_blocked" } },
+      result: { status: "ok" },
     });
-    expect(f.calls).toEqual(before);
+    expect((await operations.get(input.operationId)).unwrap().snapshot).toEqual(legacy.snapshot);
+    expect(f.pages.nativeSaveCount()).toBe(0);
   });
 
   test("stale pre-save CAS never dispatches native save or canonical read", async () => {
@@ -3036,6 +3090,18 @@ describe("workspace hash and article lifecycle", () => {
           throw new Error("must not write");
         },
         getReceipt: async () => ({ status: "ok" as const, value: null }),
+        acquireWrite: async () => ({
+          status: "error" as const,
+          error: { code: "unsupported" as const },
+        }),
+        releaseWrite: async () => ({
+          status: "error" as const,
+          error: { code: "unsupported" as const },
+        }),
+        resolveImage: async () => ({
+          status: "error" as const,
+          error: { code: "unsupported" as const },
+        }),
         setCoverFromBody: async () => ({
           status: "error" as const,
           error: { code: "unsupported" as const },

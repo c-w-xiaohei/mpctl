@@ -144,7 +144,6 @@ for (const saved of [false, true])
     try {
       f.api.executeMain = async (input: { args?: string[] }) => {
         f.counters.capture++;
-        expect((await f.operations.pending()).unwrap()[0]!.snapshot.state).toBe("issued");
         expect(native.writes).toEqual([]);
         return [{ result: await captureNativeNewEditorUrl(input.args?.[0]) }];
       };
@@ -186,7 +185,7 @@ for (const saved of [false, true])
     }
   });
 
-test("native MAIN reply lost after actual method is unresolved and adds zero calls on history", async () => {
+test("native MAIN reply lost records uncertainty and adds zero calls on history", async () => {
   const restore = installIdbFixture();
   const native = installNativeHandlerFixture(false);
   const f = await navigationFixture();
@@ -198,7 +197,11 @@ test("native MAIN reply lost after actual method is unresolved and adds zero cal
     };
     const input = { operationId: f.id() };
     const first = await f.decode(await f.workspace.newArticle(input));
-    expect(first.snapshot.state).toBe("unresolved");
+    expect(first.snapshot).toMatchObject({
+      state: "settled",
+      effect: { outcome: "unknown" },
+      result: { status: "error" },
+    });
     expect((await f.decode(await f.workspace.newArticle(input))).snapshot).toEqual(first.snapshot);
     expect(native.page.nativeHandlerCounts.invocation).toBe(1);
     expect(f.counters).toEqual({ create: 0, group: 0, capture: 1, reload: 0, read: 0, set: 0 });
@@ -209,7 +212,7 @@ test("native MAIN reply lost after actual method is unresolved and adds zero cal
   }
 });
 
-test("native exception after getter dispatch preserves finite runtime cause and unresolved owner", async () => {
+test("native exception after getter dispatch preserves finite runtime cause", async () => {
   const restore = installIdbFixture();
   const native = installNativeHandlerFixture(true);
   const f = await navigationFixture();
@@ -228,7 +231,7 @@ test("native exception after getter dispatch preserves finite runtime cause and 
       await f.workspace.openArticle({ operationId: f.id(), candidate: "A" }),
     );
     expect(response.snapshot).toMatchObject({
-      state: "unresolved",
+      state: "settled",
       result: {
         error: {
           cause: { at: "bg.navigation", kind: "runtime", code: "native_handler_exception" },

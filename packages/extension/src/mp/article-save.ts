@@ -1,5 +1,8 @@
 import { Result, type Result as BetterResult } from "better-result";
 import type { Failure } from "@mpctl/contracts";
+import { classifyAppmsgUrl } from "./routes";
+import { hasUniqueObservedCurrentItem } from "./drafts";
+import { detectLoginTimeout } from "./editor";
 import {
   hasNewManualSave,
   getHistoryPortal,
@@ -56,6 +59,100 @@ export async function saveArticle(
     observation = next;
     options.publish?.(next);
   };
+  const initialRoute = classifyAppmsgUrl(document.location?.href);
+  if (
+    initialRoute.kind === "new" ||
+    (initialRoute.kind === "saved-editor" && document.querySelector("#js_save_success"))
+  ) {
+    const original = new URL(document.location.href);
+    const checked = targetGuard();
+    const button = findSaveButton(document);
+    const notice = document.querySelector<HTMLElement>("#js_save_success");
+    if (
+      checked.isErr() ||
+      !button ||
+      !notice ||
+      !hasUniqueObservedCurrentItem(document) ||
+      isVisible(notice, document)
+    ) {
+      publish({
+        ...observation,
+        ended: true,
+        result: {
+          status: "error",
+          error: {
+            code: checked.isErr()
+              ? checked.error.code === "target_lost"
+                ? "target_unavailable"
+                : checked.error.code
+              : "save_control_unavailable",
+          },
+        },
+      });
+      return observation;
+    }
+    const timeout = options.timeoutMs ?? MAX_TIMEOUT_MS;
+    if (!Number.isFinite(timeout) || timeout <= 0) {
+      publish({
+        ...observation,
+        ended: true,
+        result: { status: "error", error: { code: "invalid_operation" } },
+      });
+      return observation;
+    }
+    let acknowledged = false;
+    let candidate: string | undefined;
+    const item = document.querySelector(".js_appmsg_item.current");
+    const observe = () => {
+      if (acknowledged) return;
+      // The native success callback changes the same document's route and
+      // shows this notice. A pre-existing toast or a route alone is insufficient.
+      const current = new URL(document.location.href);
+      const route = classifyAppmsgUrl(current.href);
+      acknowledged =
+        document.querySelector("#js_save_success") === notice &&
+        isVisible(notice, document) &&
+        notice.textContent?.trim() === "已保存" &&
+        current.origin === original.origin &&
+        current.searchParams.get("token") === original.searchParams.get("token") &&
+        route.kind === "saved-editor" &&
+        (initialRoute.kind === "new" || route.groupId === initialRoute.groupId) &&
+        item === document.querySelector(".js_appmsg_item.current") &&
+        detectLoginTimeout(document).state !== "not_logged_in" &&
+        hasUniqueObservedCurrentItem(document);
+      if (acknowledged && route.kind === "saved-editor") candidate = route.groupId;
+    };
+    const observer = new document.defaultView!.MutationObserver(observe);
+    observer.observe(document.documentElement, {
+      subtree: true,
+      attributes: true,
+      childList: true,
+      characterData: true,
+    });
+    publish({ effect: { outcome: "unknown", persistence: "unverified" }, ended: false });
+    try {
+      button.click();
+      const deadline = Date.now() + Math.min(timeout, MAX_TIMEOUT_MS);
+      while (!acknowledged && Date.now() < deadline) {
+        observe();
+        if (!acknowledged) await delay(50);
+      }
+      publish(
+        acknowledged
+          ? {
+              effect: { outcome: "confirmed", persistence: "unverified", candidate },
+              ended: true,
+              result: { status: "ok", value: {} },
+            }
+          : { ...observation, result: { status: "error", error: { code: "save_unknown" } } },
+      );
+    } catch {
+      publish({ ...observation, result: { status: "error", error: { code: "save_unknown" } } });
+    } finally {
+      observer.disconnect();
+    }
+    return observation;
+  }
   let guardCause: string | undefined;
   const guard: Guard = () => {
     const checked = targetGuard();
@@ -286,7 +383,10 @@ export async function saveArticle(
   publish({
     ...observation,
     ended: nativeEnded || (!uiDispatched && observation.effect.outcome === "not_dispatched"),
-    result: result.isOk() ? { status: "ok", value: {} } : { status: "error", error: failure },
+    result:
+      observation.effect.outcome === "confirmed"
+        ? { status: "ok", value: result.isErr() ? { cleanup: failure } : {} }
+        : { status: "error", error: failure },
   });
   return observation;
 }

@@ -126,6 +126,7 @@ describe("broker relay integration", () => {
         inspectArticle: denied,
         updateArticleFields: mutationDenied,
         checkArticle: denied,
+        resolveAsset: denied,
         listAssets: denied,
         uploadAsset: mutationDenied,
         readArticleCover: denied,
@@ -459,6 +460,7 @@ describe("broker relay integration", () => {
         inspectArticle: denied,
         checkArticle: denied,
         updateArticleFields: operationDenied,
+        resolveAsset: denied,
         listAssets: denied,
         uploadAsset: operationDenied,
         readArticleCover: denied,
@@ -1251,6 +1253,10 @@ describe("broker relay integration", () => {
           status: "error" as const,
           error: { failure: { code: "operation_not_found" as const } },
         }),
+        resolveAsset: async () => ({
+          status: "error" as const,
+          error: { code: "page_failed" as const },
+        }),
         async listAssets() {
           return encode(assetListResultCodec, Result.ok({ scope: "visible-page", cards: [] }));
         },
@@ -1704,6 +1710,10 @@ function createPlugin(
           getOperation: async () => ({
             status: "error" as const,
             error: { failure: { code: "operation_not_found" as const } },
+          }),
+          resolveAsset: async () => ({
+            status: "error" as const,
+            error: { code: "page_failed" as const },
           }),
           async listAssets() {
             return encode(assetListResultCodec, Result.ok({ scope: "visible-page", cards: [] }));

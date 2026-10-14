@@ -32,6 +32,141 @@ test.beforeAll(async () => {
   jsapi = await readFile("test/browser/fixtures/bridge/jsapi.js", "utf8");
 });
 
+test("native document coordination survives editor replacement and isolates independent documents", async () => {
+  const browser = await chromium.launch({
+    executablePath: process.env.MPCTL_CHROMIUM_EXECUTABLE,
+    args: ["--no-sandbox"],
+  });
+  try {
+    const page = await browser.newPage();
+    await page.route("**/*", (route) => {
+      if (route.request().url().endsWith("/editor.js"))
+        return route.fulfill({ contentType: "text/javascript", body: editorBundle });
+      if (route.request().url().endsWith("/provider.js"))
+        return route.fulfill({ contentType: "text/javascript", body: bundle });
+      if (route.request().url().includes("jsapi.js"))
+        return route.fulfill({ contentType: "text/javascript", body: jsapi });
+      return route.fulfill({ contentType: "text/html", body: html });
+    });
+    await page.goto(
+      "https://mp.weixin.qq.com/cgi-bin/appmsg?t=media/appmsg_edit&action=edit&type=77&appmsgid=fixture&token=synthetic",
+    );
+    const result = await page.evaluate(async () => {
+      const url = "https://mp.weixin.qq.com/editor.js";
+      const { createEditorService } = await import(url);
+      const providerUrl = "https://mp.weixin.qq.com/provider.js";
+      const { createArticleCoverPageService } = await import(providerUrl);
+      const digest = async (text: string) =>
+        [...new Uint8Array(await crypto.subtle.digest("SHA-256", new TextEncoder().encode(text)))]
+          .map((byte) => byte.toString(16).padStart(2, "0"))
+          .join("");
+      const body =
+        '<img class="rich_pages wxw-img" data-src="https://mmbiz.qpic.cn/mmbiz_png/fixture/0" data-imgfileid="123" data-type="png" data-ratio="0.5" data-w="640">';
+      const hash = await digest(body);
+      const coverHash = (await createArticleCoverPageService(document, () => true).read()).value;
+      const callbacks: Array<() => void> = [];
+      let nativeCalls = 0;
+      const makeEditor = (target: Document, hold: boolean) =>
+        createEditorService({
+          document: target,
+          timeoutMs: 15,
+          invoke(request: any) {
+            if (request.apiName === "mp_editor_get_isready")
+              request.sucCb({ isReady: true, isNew: true });
+            else if (request.apiName === "mp_editor_get_content") request.sucCb({ content: body });
+            else {
+              nativeCalls++;
+              if (hold) callbacks.push(() => request.sucCb({}));
+              else request.sucCb({});
+            }
+          },
+        });
+      const first = makeEditor(document, true);
+      const originalId = (await first.ready()).value.executorId;
+      const cover = await first.setCoverFromBody({
+        operationId: `op:${crypto.randomUUID()}:${crypto.randomUUID()}`,
+        executorId: originalId,
+        bodyImage: 1,
+        expectedBodyHash: hash,
+        expectedCoverHash: coverHash,
+      });
+      const replacement = makeEditor(document, true);
+      const replacementId = (await replacement.ready()).value.executorId;
+      const input = () => ({
+        operationId: `op:${crypto.randomUUID()}:${crypto.randomUUID()}`,
+        executorId: replacementId,
+      });
+      const blocked = await replacement.setContent(body, hash, input());
+      const staleInstance = await replacement.setContent(body, hash, {
+        ...input(),
+        executorId: originalId,
+      });
+      const frame = document.createElement("iframe");
+      document.body.append(frame);
+      const independent = makeEditor(frame.contentDocument!, false);
+      const independentResult = await independent.setContent(body, hash, {
+        operationId: `op:${crypto.randomUUID()}:${crypto.randomUUID()}`,
+        executorId: (await independent.ready()).value.executorId,
+      });
+      const beforeRelease = nativeCalls;
+      callbacks[0]!();
+      const next = await replacement.setContent(body, hash, input());
+      // A duplicate late callback from the prior owner cannot free this native write.
+      callbacks[0]!();
+      const stillBlocked = await replacement.setContent(body, hash, input());
+      callbacks[1]!();
+      const finalEditor = makeEditor(document, false);
+      const final = await finalEditor.setContent(body, hash, {
+        operationId: `op:${crypto.randomUUID()}:${crypto.randomUUID()}`,
+        executorId: (await finalEditor.ready()).value.executorId,
+      });
+      return {
+        cover,
+        blocked,
+        staleInstance,
+        independentResult,
+        beforeRelease,
+        next,
+        stillBlocked,
+        final,
+        nativeCalls,
+      };
+    });
+    expect(result.cover).toMatchObject({
+      status: "ok",
+      value: { ended: false, effect: { outcome: "unknown" } },
+    });
+    expect(result.blocked).toMatchObject({
+      status: "ok",
+      value: {
+        effect: { outcome: "not_dispatched" },
+        result: { status: "error", error: { code: "operation_blocked" } },
+      },
+    });
+    expect(result.staleInstance).toMatchObject({
+      status: "error",
+      error: { code: "executor_mismatch" },
+    });
+    expect(result.independentResult).toMatchObject({
+      status: "ok",
+      value: { result: { status: "ok" } },
+    });
+    expect(result.beforeRelease).toBe(2);
+    expect(result.next).toMatchObject({
+      status: "ok",
+      value: { ended: false, effect: { outcome: "unknown" } },
+    });
+    expect(result.stillBlocked).toMatchObject({
+      status: "ok",
+      value: { result: { status: "error", error: { code: "operation_blocked" } } },
+    });
+    expect(result.final).toMatchObject({ status: "ok", value: { result: { status: "ok" } } });
+    expect(result.nativeCalls).toBe(4);
+  } finally {
+    await browser.close();
+  }
+});
+
 for (const mode of [
   "success",
   "same-cover",

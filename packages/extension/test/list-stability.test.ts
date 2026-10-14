@@ -47,12 +47,24 @@ function fixture() {
       endpoint: { implementation: providerEndpoint, meta: { app: { protocolVersion } } },
     })
     .provide(pageEditorToken, {
+      acquireWrite: async () => ({
+        status: "error" as const,
+        error: { code: "unsupported" as const },
+      }),
+      releaseWrite: async () => ({
+        status: "error" as const,
+        error: { code: "unsupported" as const },
+      }),
       ready: async () =>
         encoded(
           pageEditorReadyResultCodec,
           Result.ok({ isReady: true as const, isNew: true, executorId: crypto.randomUUID() }),
         ),
       getReceipt: async () => ({ status: "ok" as const, value: null }),
+      resolveImage: async () => ({
+        status: "error" as const,
+        error: { code: "unsupported" as const },
+      }),
       setCoverFromBody: async () => ({
         status: "error" as const,
         error: { code: "unsupported" as const },
@@ -111,6 +123,9 @@ function fixture() {
       }),
       async ensureDraftList() {
         return Result.ok(list);
+      },
+      async findCurrentEditor() {
+        return Result.ok(undefined);
       },
       async listDraftGroups() {
         if (failList) return Result.err({ code: "page_failed" as const });

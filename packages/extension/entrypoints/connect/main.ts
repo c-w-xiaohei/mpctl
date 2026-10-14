@@ -21,9 +21,7 @@ export async function closeConnectPageTab(
   },
   errorCode?: string,
   reportFailure = report,
-): Promise<
-  ReturnType<typeof Result.ok<void>> | ReturnType<typeof Result.err<void, { code: string }>>
-> {
+): Promise<BetterResult<void, { code: string }>> {
   if (errorCode) reportFailure("connect page", errorCode);
   const tab = await Result.tryPromise({
     try: () => tabs.getCurrent(),

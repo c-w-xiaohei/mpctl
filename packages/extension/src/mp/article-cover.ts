@@ -85,7 +85,7 @@ function readPreviewUrl(element: HTMLElement): string | null | undefined {
   );
   if (!match) return undefined;
   const raw = (match[1] ?? match[2] ?? match[3] ?? "").trim();
-  if (!raw) return undefined;
+  if (!raw) return null;
   let url: URL;
   try {
     url = new URL(raw, element.ownerDocument.baseURI);

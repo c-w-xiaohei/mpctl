@@ -129,6 +129,24 @@ describe("editor readiness classification", () => {
     });
   });
 
+  test("recognizes the observed empty-info re-login page without accepting arbitrary login text", () => {
+    const markers = {
+      bodyClasses: ["page_error", "page_timeout"],
+      infoText: "",
+      headingText: " \n 请重新 登录 ",
+      jumpUrl: "https://mp.weixin.qq.com/cgi-bin/loginpage?url=private",
+    };
+    expect(classifyLoginTimeoutMarkers(markers)).toEqual({ state: "not_logged_in" });
+    for (const changed of [
+      { bodyClasses: [] },
+      { headingText: "登录" },
+      { headingText: undefined },
+      { jumpUrl: "https://other.example/cgi-bin/loginpage" },
+      { infoText: "未知错误" },
+    ])
+      expect(classifyLoginTimeoutMarkers({ ...markers, ...changed })).toEqual({ state: "loading" });
+  });
+
   test("observes late login timeout markers until the runtime watcher is disposed", () => {
     const listeners = new Map<string, () => void>();
     const classes = new Set<string>();

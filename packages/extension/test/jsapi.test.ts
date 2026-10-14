@@ -141,7 +141,13 @@ describe("MAIN editor service", () => {
       expect(sets).toBe(1);
       release();
       await Promise.all([predecessor, successor]);
-      expect(sets).toBe(2);
+      expect(await successor).toMatchObject({
+        value: {
+          effect: { outcome: "not_dispatched" },
+          result: { error: { code: "operation_blocked" } },
+        },
+      });
+      expect(sets).toBe(1);
     } finally {
       digest.mockRestore();
       release();
@@ -249,7 +255,13 @@ describe("MAIN editor service", () => {
       release();
       await Promise.all([first, third]);
       expect(before).toBe(1);
-      expect(sets).toBe(2);
+      expect(await third).toMatchObject({
+        value: {
+          effect: { outcome: "not_dispatched" },
+          result: { error: { code: "operation_blocked" } },
+        },
+      });
+      expect(sets).toBe(1);
     } finally {
       digest.mockRestore();
     }
@@ -329,6 +341,106 @@ describe("MAIN editor service", () => {
     });
     expect(counts).toEqual({ read: 1, set: 1 });
   });
+  test.each(["timeout", "error", "throw"] as const)(
+    "%s refuses queued BODY and cover writes until late native completion",
+    async (failure) => {
+      let content = "before";
+      let complete!: () => void;
+      let sets = 0;
+      let reads = 0;
+      const service = createEditorService({
+        timeoutMs: 10,
+        invoke(request) {
+          if (request.apiName === "mp_editor_get_isready")
+            request.sucCb({ isReady: true, isNew: true });
+          else if (request.apiName === "mp_editor_get_content") {
+            reads++;
+            request.sucCb({ content });
+          } else if (request.apiName === "mp_editor_set_content") {
+            sets++;
+            const next = (request.apiParam as { content: string }).content;
+            if (sets === 1) {
+              complete = () => {
+                content = next;
+                request.sucCb({});
+              };
+              if (failure === "error") request.errCb({});
+              if (failure === "throw") throw new Error("accepted then threw");
+            } else {
+              content = next;
+              request.sucCb({});
+            }
+          }
+        },
+      });
+      const executorId = (await decodeReady(await service.ready())).unwrap().executorId;
+      const execution = () => ({
+        operationId: `op:${crypto.randomUUID()}:${crypto.randomUUID()}`,
+        executorId,
+      });
+      const hash = await hashForTest(content);
+      const firstId = execution();
+      const secondId = execution();
+      const first = service.setContent("late", hash, firstId);
+      const second = service.setContent("successor", hash, secondId);
+      expect((await decodeWrite(await first)).unwrap()).toMatchObject({
+        ended: false,
+        effect: { outcome: "unknown" },
+      });
+      expect((await decodeWrite(await second)).unwrap()).toMatchObject({
+        ended: true,
+        effect: { outcome: "not_dispatched" },
+        result: {
+          status: "error",
+          error: { code: "operation_blocked", blockingOperationId: firstId.operationId },
+        },
+      });
+      expect(
+        await service.setCoverFromBody({
+          ...execution(),
+          bodyImage: 1,
+          expectedBodyHash: hash,
+          expectedCoverHash: hash,
+        }),
+      ).toMatchObject({
+        status: "ok",
+        value: { result: { status: "error", error: { code: "operation_blocked" } } },
+      });
+      expect(sets).toBe(1);
+      expect(reads).toBe(1);
+      // Reads remain available; they do not end the original native action.
+      expect((await decodeContent(await service.getContent())).unwrap()).toBe("before");
+      complete();
+      expect(await service.getReceipt(firstId.operationId)).toMatchObject({
+        status: "ok",
+        value: { ended: true, effect: { outcome: "unknown" } },
+      });
+      expect(reads).toBe(2); // No resumed readback on a late callback.
+      expect(
+        (await decodeWrite(await service.setContent("successor", hash, secondId))).unwrap().result,
+      ).toMatchObject({
+        status: "error",
+        error: { code: "operation_blocked" },
+      });
+      expect(
+        (await decodeWrite(await service.setContent("late", hash, firstId))).unwrap().effect
+          .outcome,
+      ).toBe("unknown");
+      expect(sets).toBe(1);
+      expect(await legacyAssertion(await service.setContent("stale", hash, execution()))).toEqual(
+        Result.err({ code: "content_conflict" }),
+      );
+      expect(
+        (
+          await legacyAssertion(
+            await service.setContent("fresh", await hashForTest(content), execution()),
+          )
+        ).isOk(),
+      ).toBe(true);
+      expect(content).toBe("fresh");
+      expect(sets).toBe(2);
+    },
+  );
   test.each(["before-set", "during-readback"] as const)(
     "V1 %s target invalidation never confirms another document",
     async (boundary) => {
@@ -770,7 +882,9 @@ describe("MAIN editor service", () => {
     ]);
     const decoded = await Promise.all(results.map(legacyAssertion));
     expect(decoded.filter(Result.isOk)).toHaveLength(1);
-    expect(decoded.filter(Result.isError)).toEqual([Result.err({ code: "content_conflict" })]);
+    const refused = decoded.filter(Result.isError);
+    expect(refused).toHaveLength(1);
+    expect(["operation_blocked", "content_conflict"]).toContain(refused[0]!.error.code);
     expect(writeCount).toBe(1);
     expect(decoded.find(Result.isOk)).toEqual(Result.ok({ bodyHash: await hashForTest(body) }));
   });
@@ -897,7 +1011,10 @@ describe("MAIN editor service", () => {
     current = false;
     completeWrite();
     expect(await legacyAssertion(await first)).toEqual(Result.err({ code: "page_failed" }));
-    expect(await legacyAssertion(await second)).toEqual(Result.err({ code: "target_unavailable" }));
+    const refused = await legacyAssertion(await second);
+    expect(refused.isErr()).toBe(true);
+    if (refused.isErr())
+      expect(["operation_blocked", "target_unavailable"]).toContain(refused.error.code);
     expect([reads, writes]).toEqual([1, 1]);
   });
 

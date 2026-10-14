@@ -10,6 +10,7 @@ import {
   operationIdSchema,
   ledgerIdSchema,
   failureSchema,
+  assetImageSchema,
   type Failure,
   type ServiceError,
 } from "@mpctl/contracts";
@@ -65,8 +66,7 @@ export function nativeReceiptSchema<
     v.check(
       (receipt) =>
         (receipt.ended === false || receipt.result !== undefined) &&
-        (receipt.result?.status !== "ok" ||
-          (receipt.ended === true && receipt.effect?.outcome === "confirmed")),
+        (receipt.result?.status !== "ok" || receipt.effect?.outcome === "confirmed"),
     ),
   );
 }
@@ -82,8 +82,29 @@ export const pageEditorWriteResultCodec = createServiceResultCodec(
   bodyReceiptSchema,
   failureSchema,
 );
+export const documentWriteResultCodec = createServiceResultCodec(v.string(), failureSchema);
+export const assetImagePageResultCodec = createServiceResultCodec(assetImageSchema, failureSchema);
+export const documentWriteReleaseResultCodec = createServiceResultCodec(
+  v.strictObject({}),
+  failureSchema,
+);
 
 export interface PageEditorService {
+  resolveImage(candidate: {
+    filename: string;
+    thumbnailUrl: string;
+  }): Promise<
+    SerializedResult<
+      import("@mpctl/contracts").AssetImage,
+      Failure | { code: "invalid_result_envelope" }
+    >
+  >;
+  acquireWrite(
+    operationId: string,
+  ): Promise<SerializedResult<string, Failure | { code: "invalid_result_envelope" }>>;
+  releaseWrite(
+    token: string,
+  ): Promise<SerializedResult<{}, Failure | { code: "invalid_result_envelope" }>>;
   setCoverFromBody(
     input: BodyCoverExecution,
   ): Promise<SerializedResult<CoverReceipt, Failure | { code: "invalid_result_envelope" }>>;

@@ -249,6 +249,76 @@ async function runSave(page: Page, timeoutMs = 250) {
   );
 }
 
+for (const mode of [
+  "confirmed",
+  "saved-confirmed",
+  "saved-wrong-id",
+  "route-only",
+  "toast-only",
+  "old-toast",
+] as const) {
+  test(`first save ${mode} requires fresh native confirmation and a saved identity`, async () => {
+    const browser = await chromium.launch({ executablePath, args: ["--no-sandbox"] });
+    try {
+      const page = await browser.newPage();
+      await page.route("**/*", (route) =>
+        route.fulfill(
+          route.request().url().endsWith("/save.js")
+            ? { contentType: "text/javascript", body: helperBundle }
+            : {
+                contentType: "text/html; charset=utf-8",
+                body: '<meta charset="utf-8"><div class="js_appmsg_item current" data-msgindex="0">draft</div><div id="js_save_success" style="display:none">已保存</div><button>保存为草稿</button>',
+              },
+        ),
+      );
+      await page.goto(
+        mode.startsWith("saved-")
+          ? "https://mp.weixin.qq.com/cgi-bin/appmsg?t=media/appmsg_edit&action=edit&appmsgid=fixture&type=77"
+          : "https://mp.weixin.qq.com/cgi-bin/appmsg?t=media/appmsg_edit_v2&action=edit&isNew=1&type=77",
+      );
+      const result = await page.evaluate(async (mode) => {
+        const url = "https://mp.weixin.qq.com/save.js";
+        const { saveArticle, Result } = await import(url);
+        const notice = document.querySelector<HTMLElement>("#js_save_success")!;
+        let clicks = 0;
+        if (mode === "old-toast") notice.style.display = "block";
+        document.querySelector("button")!.onclick = () => {
+          clicks++;
+          setTimeout(() => {
+            if (mode !== "toast-only")
+              history.replaceState(
+                null,
+                "",
+                `/cgi-bin/appmsg?t=media/appmsg_edit&action=edit&type=77&appmsgid=${mode === "saved-wrong-id" ? "other" : "fixture"}`,
+              );
+            if (mode !== "route-only") notice.style.display = "block";
+          }, 10);
+        };
+        return {
+          receipt: await saveArticle(document, () => Result.ok(), { timeoutMs: 150 }),
+          clicks,
+        };
+      }, mode);
+      expect(result.clicks).toBe(mode === "old-toast" ? 0 : 1);
+      expect(result.receipt.effect.outcome).toBe(
+        mode === "confirmed" || mode === "saved-confirmed"
+          ? "confirmed"
+          : mode === "old-toast"
+            ? "not_dispatched"
+            : "unknown",
+      );
+      expect(result.receipt.ended).toBe(
+        mode === "confirmed" || mode === "saved-confirmed" || mode === "old-toast",
+      );
+      if (mode === "confirmed" || mode === "saved-confirmed")
+        expect(result.receipt.effect.candidate).toBe("fixture");
+      else expect(result.receipt.effect).not.toHaveProperty("candidate");
+    } finally {
+      await browser.close();
+    }
+  });
+}
+
 test("real Chromium DOM confirms delayed identical history after native collapse without mutating content", async () => {
   const { browser, page, blocked } = await openFixture();
   try {
@@ -375,8 +445,8 @@ test("cleanup failure retains only the observed fresh-save stage fact", async ()
     const outcome = await runSave(page);
     expect(outcome).toMatchObject({
       result: {
-        status: "error",
-        error: { code: "cleanup_failed", cleanup: { code: "cleanup_failed" } },
+        status: "ok",
+        value: { cleanup: { code: "cleanup_failed" } },
       },
       effect: { outcome: "confirmed", persistence: "unverified" },
       ended: false,

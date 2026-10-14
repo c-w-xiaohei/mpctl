@@ -109,6 +109,15 @@ export async function selectArticleCoverFromLibrary(
       owner = library;
       transitionPending = true;
       selected.click();
+      if (!selected.classList.contains("selected")) {
+        const selection = await waitFor(
+          () => (selected.classList.contains("selected") ? true : undefined),
+          timeoutMs,
+          guard,
+        );
+        if (selection.isErr()) return Result.err({ code: guardError(selection.error.code) });
+        if (!selection.value) return Result.err({ code: "cover_input_unavailable" });
+      }
       const afterSelectionGuard = guard();
       if (Result.isError(afterSelectionGuard))
         return Result.err({ code: guardError(afterSelectionGuard.error.code) });
@@ -139,9 +148,20 @@ export async function selectArticleCoverFromLibrary(
       flowOwnsDialog = true;
       owner = crop.value;
       ownerKind = "crop";
-      const image = uniqueVisible([
-        ...crop.value.querySelectorAll<HTMLImageElement>(".crop-img"),
-      ]) as HTMLImageElement | undefined;
+      let image = uniqueVisible([...crop.value.querySelectorAll<HTMLImageElement>(".crop-img")]);
+      if (!image || !validCropImage(image)) {
+        const loadedImage = await waitFor(
+          () => {
+            const loaded = uniqueVisible([
+              ...crop.value.querySelectorAll<HTMLImageElement>(".crop-img"),
+            ]);
+            return loaded && validCropImage(loaded) ? loaded : undefined;
+          },
+          timeoutMs,
+          guard,
+        );
+        image = loadedImage.isOk() ? loadedImage.value : undefined;
+      }
       const confirm = uniqueButton(visibleButtons(crop.value), "确认");
       const close = uniqueClose(crop.value);
       if (!image || !validCropImage(image) || !confirm || !close)
@@ -402,6 +422,7 @@ export async function setArticleCover(
   if (before.isErr())
     return refuse(
       before.error.code === "hash_failed" ||
+        before.error.code === "cover_unavailable" ||
         before.error.code === "not_logged_in" ||
         before.error.code === "target_unavailable"
         ? before.error.code
@@ -415,6 +436,37 @@ export async function setArticleCover(
   if (afterRead.isErr()) return refuse(guardError(afterRead.error.code));
   if (configuredHash.isErr()) return refuse(configuredHash.error.code);
   if (configuredHash.value !== expectedHash) return refuse("content_conflict");
+  if (!configured.value.primary.visible && !configured.value.primary.url) {
+    const existing = uniqueDialog(document, "选择图片");
+    if (existing && uniqueButton(visibleButtons(existing), "下一步"))
+      return selectArticleCoverFromLibrary(document, candidate, guard, {
+        timeoutMs: 5_000,
+        publish,
+      });
+    const choices = [
+      ...document.querySelectorAll<HTMLAnchorElement>(
+        "#js_cover_area #js_cover_null a.js_imagedialog",
+      ),
+    ].filter((node) => node.textContent?.trim() === "从图片库选择" && coverPreviewVisible(node));
+    if (choices.length !== 1 || guard().isErr()) return refuse("cover_input_unavailable");
+    uiDispatched = true;
+    choices[0]!.click();
+    const library = await waitFor(
+      () => {
+        const dialog = uniqueDialog(document, "选择图片");
+        return dialog &&
+          [...dialog.querySelectorAll<HTMLElement>(cardSelector)].some((card) =>
+            cardMatches(card, candidate),
+          )
+          ? dialog
+          : undefined;
+      },
+      5_000,
+      guard,
+    );
+    if (library.isErr() || !library.value) return refuse("cover_input_unavailable");
+    return selectArticleCoverFromLibrary(document, candidate, guard, { timeoutMs: 5_000, publish });
+  }
   if (!configured.value.primary.visible || !configured.value.primary.url)
     return refuse("cover_unavailable");
   const owner = readCoverOwner(document);

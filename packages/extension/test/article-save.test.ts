@@ -244,7 +244,7 @@ describe("native article save", () => {
       expect(ended).toBe(0);
       expect(page.saves).toBe(stage === "open" ? 0 : 1);
       expect(toggles).toBe(stage === "open" ? 1 : 2);
-      expect(result.result?.status).toBe("error");
+      expect(result.result?.status).toBe(stage === "restore" ? "ok" : "error");
       release!();
       expect(page.expanded).toBe(stage === "open");
       expect(page.saves).toBe(stage === "open" ? 0 : 1);
@@ -410,8 +410,8 @@ describe("native article save", () => {
       effect: { outcome: "confirmed", persistence: "unverified" },
       ended: false,
       result: {
-        status: "error",
-        error: { code: "cleanup_failed", cleanup: { code: "cleanup_failed" } },
+        status: "ok",
+        value: { cleanup: { code: "cleanup_failed" } },
       },
     });
     expect(page.saves).toBe(1);

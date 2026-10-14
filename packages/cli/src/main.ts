@@ -74,7 +74,7 @@ article.addHelpCommand(true);
 article.action(() => article.help());
 article.addHelpText(
   "after",
-  "\n已有稿：list → open → pull → 编辑文件 → push\n本地新稿：new → push；字段用 inspect → update。\nopen/new 首次确认成功直接返回 article 和 bodyHash，不需要再 current。\n已有编辑页或引用失效时才用 current；历史重提不恢复临时引用。\n所有写入都不隐含保存。已有稿保存：inspect --all > state.json → save --expect state.json。\n新稿首次保存仍未支持；创建的是未保存编辑页。",
+  "\n已有稿：list → open → pull → 编辑文件 → push\n本地新稿：new → push；字段用 inspect → update。\n图片：asset upload → asset list → asset resolve，将返回的 HTML 加入正文后 push。\nopen/new 首次确认成功直接返回 article 和 bodyHash，不需要再 current。\n已有编辑页或引用失效时才用 current；历史重提不恢复临时引用。\n所有编辑都不隐含保存：inspect --all > state.json → save --expect state.json。",
 );
 article
   .command("list")
@@ -105,7 +105,7 @@ article
   .option("--operation <id>", "高级：同次重提使用原操作 ID")
   .addHelpText(
     "after",
-    "\n示例：mpctl article new\n首次确认成功返回 article、bodyHash 和持久 snapshot。已有本地 HTML 可直接 push，不必先拉取空正文。\n已有新稿编辑页时拒绝重复创建；用 current --new 接入原页。不会保存或发表；新稿首次 save 仍未支持。未知结果查询原 operation，不再创建。",
+    "\n示例：mpctl article new\n首次确认成功返回 article、bodyHash 和持久 snapshot。已有本地 HTML 可直接 push，不必先拉取空正文。\n已有新稿编辑页时拒绝重复创建；用 current --new 接入原页。不会保存或发表；编辑完成后显式 save。未知结果查询原 operation，不再创建。",
   )
   .action(async (options) => outputOutcome(await articleCommand("new", undefined, options)));
 article
@@ -199,10 +199,10 @@ article
   .argument("<article>", "临时文章引用", nonBlank)
   .requiredOption("--expect <json-file>", "同一 article 的 inspect --all 输出", nonBlank)
   .option("--operation <id>", "高级：同次重提使用原 ID 和原状态文件")
-  .description("显式保存已存单篇稿，观察原生确认")
+  .description("显式保存单篇稿，观察原生确认")
   .addHelpText(
     "after",
-    "\n示例：\n  mpctl article inspect '<article>' --all > state.json\n  mpctl article save '<article>' --expect state.json\n核对状态文件中的正文、字段、封面三版本，再保存一次。不自动更新文件或采纳最新页面状态，不刷新或重开验收。成功为 settled/confirmed，persistence:unverified，非独立云端证明。\n新稿首次保存仍返回 unsupported。超时或未决查询原 operation；不换键重做，不发表、发送预览或回滚。",
+    "\n示例：\n  mpctl article inspect '<article>' --all > state.json\n  mpctl article save '<article>' --expect state.json\n核对正文、字段、封面三版本，再保存一次。成功为 settled/confirmed，persistence:unverified，非独立云端证明。\n首次保存确认后 snapshot.effect.candidate 返回已存稿定位，可用 article current --candidate '<candidate>' 接入，不必从浏览器 URL 查找。超时或未决查询原 operation；不换键重做，不发表或发送预览。",
   )
   .action(async (ref, options) => outputOutcome(await articleCommand("save", ref, options)));
 
@@ -213,11 +213,12 @@ asset
   .command("list")
   .argument("<article>", "临时文章引用", nonBlank)
   .description("列出当前可见素材页")
+  .option("--operation <id>", "取回已确认上传对应的当前素材句柄，不重新上传")
   .addHelpText(
     "after",
-    "\n返回 scope:visible-page 和 cards，不是全账号素材目录。句柄绑定文章/文档；thumbnailUrl 是缩略图，不是正文原图。不会插入正文、设置封面或保存。",
+    "\n返回 scope:visible-page 和 cards，不是全账号素材目录。句柄绑定文章/文档；thumbnailUrl 是缩略图，不是正文原图。\n上传状态确认成功后：asset list '<article>' --operation '<原ID>'，按原回执精确匹配素材并返回当前句柄。素材不在可见页或账号无法核对时拒绝，不按文件名猜测。不上传、插入正文、设置封面或保存。",
   )
-  .action(async (ref) => outputOutcome(await assetCommand("list", ref)));
+  .action(async (ref, options) => outputOutcome(await assetCommand("list", ref, options)));
 asset
   .command("upload")
   .argument("<article>", "临时文章引用", nonBlank)
@@ -226,11 +227,17 @@ asset
   .description("上传到图片库，不插入正文或设置封面")
   .addHelpText(
     "after",
-    "\n示例：mpctl asset upload '<article>' --file ./image.png\n本地预算 2 MiB，校验格式签名；同名拒绝，不自动改名。首次确认成功返回 asset 素材卡片和 snapshot，可用于封面，无需为取句柄再次 list。\n历史重提只返回持久结果，不恢复句柄。未知结果查询原 operation，不重传；缩略图不是正文原图或源字节持久化证明。不保存或发表。",
+    "\n示例：mpctl asset upload '<article>' --file ./image.png\n本地预算 2 MiB，校验格式签名；同名拒绝，不自动改名。首次确认成功返回 asset 素材卡片和 snapshot，可用于封面，无需为取句柄再次 list。\n历史重提只返回持久结果，不恢复句柄。未知结果查询原 operation，不重传；确认成功后可用 asset list '<article>' --operation '<原ID>' 取回当前句柄。缩略图不是正文原图或源字节持久化证明。不保存或发表。",
   )
   .action(async (ref, options) => outputOutcome(await assetCommand("upload", ref, options)));
 
 const operation = program.command("operation").description("异常恢复：查询原操作，不重放");
+asset
+  .command("resolve")
+  .argument("<article>", "临时文章引用", nonBlank)
+  .requiredOption("--asset <asset>", "asset list 返回的素材句柄", nonBlank)
+  .description("读取原生素材选择产生的正文图片 HTML，不插入或保存")
+  .action(async (ref, options) => outputOutcome(await assetCommand("resolve", ref, options)));
 operation.action(() => operation.help());
 operation
   .command("status")

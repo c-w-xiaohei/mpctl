@@ -361,6 +361,14 @@ test.each(["before-status", "after-status"] as const)(
         },
       })
       .provide(pageEditorToken, {
+        acquireWrite: async () => ({
+          status: "error" as const,
+          error: { code: "unsupported" as const },
+        }),
+        releaseWrite: async () => ({
+          status: "error" as const,
+          error: { code: "unsupported" as const },
+        }),
         async ready() {
           nativeCalls++;
           throw new Error("must not acquire BODY");
@@ -376,6 +384,10 @@ test.each(["before-status", "after-status"] as const)(
         async getReceipt() {
           return { status: "ok" as const, value: null };
         },
+        resolveImage: async () => ({
+          status: "error" as const,
+          error: { code: "unsupported" as const },
+        }),
         setCoverFromBody: async () => ({
           status: "error" as const,
           error: { code: "unsupported" as const },
@@ -643,6 +655,14 @@ test.each([
   };
   const publish = async () => {
     provider.provide(pageEditorToken, {
+      acquireWrite: async () => ({
+        status: "error" as const,
+        error: { code: "unsupported" as const },
+      }),
+      releaseWrite: async () => ({
+        status: "error" as const,
+        error: { code: "unsupported" as const },
+      }),
       async ready() {
         return wire(
           pageEditorReadyResultCodec,
@@ -658,6 +678,10 @@ test.each([
         throw new Error("must not write");
       },
       getReceipt: async () => ({ status: "ok" as const, value: null }),
+      resolveImage: async () => ({
+        status: "error" as const,
+        error: { code: "unsupported" as const },
+      }),
       setCoverFromBody: async () => ({
         status: "error" as const,
         error: { code: "unsupported" as const },
@@ -878,6 +902,14 @@ test.each([
       const bootstrapTimer = timers.mock.results[bootstrapTimerIndex]!.value;
       if (mode === "publish") {
         provider.provide(pageEditorToken, {
+          acquireWrite: async () => ({
+            status: "error" as const,
+            error: { code: "unsupported" as const },
+          }),
+          releaseWrite: async () => ({
+            status: "error" as const,
+            error: { code: "unsupported" as const },
+          }),
           async ready() {
             nativeReads++;
             return wire(
@@ -894,6 +926,10 @@ test.each([
             throw new Error("must not write");
           },
           getReceipt: async () => ({ status: "ok" as const, value: null }),
+          resolveImage: async () => ({
+            status: "error" as const,
+            error: { code: "unsupported" as const },
+          }),
           setCoverFromBody: async () => ({
             status: "error" as const,
             error: { code: "unsupported" as const },
@@ -1998,22 +2034,43 @@ describe("automatic navigation identity and bounded readiness", () => {
     expect(unwrap(await f.manager.isCurrent(old))).toBe(false);
   });
 
-  test("relogin refreshes only the expired owned list from the ready HOME native link", async () => {
+  test.each([false, true])(
+    "relogin refreshes only the expired owned list from the ready HOME native link (refresh=%s)",
+    async (refresh) => {
+      const f = navigationFixture();
+      unwrap(await f.manager.managedGroup());
+      const target = `${draftListUrl}&lang=en_US&token=context`;
+      f.setTargetUrl(target);
+      f.onStatus((binding) =>
+        f.setStatus(binding.documentId === f.list.documentId ? "not_logged_in" : "ready"),
+      );
+      expect(unwrap(await f.manager.ensureDraftList({ refresh }))).toMatchObject({
+        tabId: 2,
+        documentId: "updated-2-1",
+        url: target,
+      });
+      expect(f.navigated).toEqual([{ tabId: 2, url: target }]);
+      expect(f.created).toHaveLength(0);
+      expect(f.reloaded).toHaveLength(0);
+    },
+  );
+
+  test("fresh list recovers once through HOME when reloading reveals expired page credentials", async () => {
     const f = navigationFixture();
     unwrap(await f.manager.managedGroup());
-    const target = `${draftListUrl}&lang=en_US&token=context`;
+    const target = `${draftListUrl}&lang=en_US&token=fresh-context`;
     f.setTargetUrl(target);
     f.onStatus((binding) =>
-      f.setStatus(binding.documentId === f.list.documentId ? "not_logged_in" : "ready"),
+      f.setStatus(binding.documentId.startsWith("reloaded-2-") ? "not_logged_in" : "ready"),
     );
-    expect(unwrap(await f.manager.ensureDraftList())).toMatchObject({
+    expect(unwrap(await f.manager.ensureDraftList({ refresh: true }))).toMatchObject({
       tabId: 2,
       documentId: "updated-2-1",
       url: target,
     });
+    expect(f.reloaded).toEqual([2]);
     expect(f.navigated).toEqual([{ tabId: 2, url: target }]);
     expect(f.created).toHaveLength(0);
-    expect(f.reloaded).toHaveLength(0);
   });
 
   test.each([
@@ -2805,7 +2862,7 @@ describe("page route and document identity", () => {
     const result = await manager.uploadMaterial(binding, uploadPayload(), uploadExecution);
     expect(result).toEqual(Result.err({ code: "asset_ambiguous" }));
   });
-  test("uploadMaterial acquires only the material token with the bounded 20s RPC budget", async () => {
+  test("uploadMaterial leaves time for native upload observation and cleanup in its RPC budget", async () => {
     let options: unknown;
     const binding = {
       tabId: 44,
@@ -2843,7 +2900,10 @@ describe("page route and document identity", () => {
     );
     manager.observe(binding);
     await manager.uploadMaterial(binding, uploadPayload(), uploadExecution);
-    expect(options).toEqual({ callTimeout: 20_000 });
+    const { assetUploadTimeouts } = await import("@mpctl/contracts");
+    expect(options).toEqual({ callTimeout: assetUploadTimeouts.page });
+    expect(assetUploadTimeouts.page).toBeGreaterThan(assetUploadTimeouts.native);
+    expect(assetUploadTimeouts.cli).toBeGreaterThan(assetUploadTimeouts.page);
   });
   test("cover/save calls acquire their one native capability with a finite caller budget", async () => {
     const binding = { tabId: 44, documentId: "action-doc", url: savedUrl };
@@ -3292,7 +3352,7 @@ describe("page route and document identity", () => {
       handler: () => void,
       delay: number,
     ) => {
-      if (delay === 20_000) {
+      if (delay === 105_000) {
         expire ??= handler;
         return realTimer(() => {}, delay);
       }

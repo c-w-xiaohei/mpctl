@@ -126,7 +126,19 @@ test.each(["ready", "during-status", "late-registration", "during-publication"] 
         };
       },
       getReceipt: async () => ({ status: "ok" as const, value: null }),
+      resolveImage: async () => ({
+        status: "error" as const,
+        error: { code: "unsupported" as const },
+      }),
       setCoverFromBody: async () => ({
+        status: "error" as const,
+        error: { code: "unsupported" as const },
+      }),
+      acquireWrite: async () => ({
+        status: "error" as const,
+        error: { code: "unsupported" as const },
+      }),
+      releaseWrite: async () => ({
         status: "error" as const,
         error: { code: "unsupported" as const },
       }),
@@ -300,6 +312,14 @@ test.each([undefined, "", "0.9.0", "0.12.0"])(
         },
       })
       .provide(pageEditorToken, {
+        acquireWrite: async () => ({
+          status: "error" as const,
+          error: { code: "unsupported" as const },
+        }),
+        releaseWrite: async () => ({
+          status: "error" as const,
+          error: { code: "unsupported" as const },
+        }),
         async ready() {
           readyCalls++;
           return {
@@ -316,6 +336,10 @@ test.each([undefined, "", "0.9.0", "0.12.0"])(
         async getReceipt() {
           return { status: "ok" as const, value: null };
         },
+        resolveImage: async () => ({
+          status: "error" as const,
+          error: { code: "unsupported" as const },
+        }),
         setCoverFromBody: async () => ({
           status: "error" as const,
           error: { code: "unsupported" as const },
@@ -447,6 +471,14 @@ test.each([undefined, "", "0.9.0", protocolVersion])(
       },
     });
     content.provide(pageEditorToken, {
+      acquireWrite: async () => ({
+        status: "error" as const,
+        error: { code: "unsupported" as const },
+      }),
+      releaseWrite: async () => ({
+        status: "error" as const,
+        error: { code: "unsupported" as const },
+      }),
       async ready() {
         return {
           status: "ok" as const,
@@ -481,6 +513,10 @@ test.each([undefined, "", "0.9.0", protocolVersion])(
       async getReceipt() {
         return { status: "ok" as const, value: null };
       },
+      resolveImage: async () => ({
+        status: "error" as const,
+        error: { code: "unsupported" as const },
+      }),
       setCoverFromBody: async () => ({
         status: "error" as const,
         error: { code: "unsupported" as const },

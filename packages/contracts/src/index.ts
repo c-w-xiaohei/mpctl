@@ -6,7 +6,7 @@ import {
   type SerializedResult,
 } from "better-result";
 import * as v from "valibot";
-export const protocolVersion = "0.15.0";
+export const protocolVersion = "0.18.0";
 export function hasProtocolVersion(identity: unknown): boolean {
   if (typeof identity !== "object" || identity === null || !("app" in identity)) return false;
   const app = identity.app;
@@ -18,6 +18,9 @@ export function hasProtocolVersion(identity: unknown): boolean {
   );
 }
 export const articleNavigationTimeoutMs = 130_000;
+// Upload observation includes slow platform processing; each enclosing RPC
+// leaves room for preflight, cleanup and serialization.
+export const assetUploadTimeouts = Object.freeze({ native: 90_000, page: 105_000, cli: 120_000 });
 export const assetFileLimits = Object.freeze({ maxBytes: 2 * 1024 * 1024, maxFilenameLength: 255 });
 export const supportedAssetMimeTypes = [
   "image/png",
@@ -651,10 +654,15 @@ export type CoverEffect = v.InferOutput<typeof coverEffectSchema>;
 export const saveEffectSchema = v.variant("outcome", [
   v.strictObject({ outcome: v.literal("not_dispatched"), persistence: v.literal("unverified") }),
   v.strictObject({ outcome: v.literal("unknown"), persistence: v.literal("unverified") }),
-  v.strictObject({ outcome: v.literal("confirmed"), persistence: v.literal("unverified") }),
+  v.strictObject({
+    outcome: v.literal("confirmed"),
+    persistence: v.literal("unverified"),
+    candidate: v.optional(articleCandidateSchema),
+  }),
   v.strictObject({
     outcome: v.literal("confirmed"),
     persistence: v.literal("verified"),
+    candidate: v.optional(articleCandidateSchema),
     bodyHash: bodyHashSchema,
     fieldsHash: articleFieldsHashSchema,
     coverHash: articleCoverHashSchema,
@@ -698,7 +706,10 @@ export const operationEffectSchema = v.union([
 ]);
 export type OperationEffect = v.InferOutput<typeof operationEffectSchema>;
 export const operationResultSchema = v.variant("status", [
-  v.strictObject({ status: v.literal("ok"), value: v.strictObject({}) }),
+  v.strictObject({
+    status: v.literal("ok"),
+    value: v.strictObject({ cleanup: v.optional(failureSchema) }),
+  }),
   v.strictObject({ status: v.literal("error"), error: failureSchema }),
 ]);
 export type OperationResult = v.InferOutput<typeof operationResultSchema>;
@@ -794,6 +805,13 @@ export const articleCoverResultCodec = createWorkspaceResultCodec(articleCoverRe
 export type ArticleCoverSetInput = v.InferOutput<typeof articleCoverSetInputSchema>;
 export type ArticleSaveInput = v.InferOutput<typeof articleSaveInputSchema>;
 export const assetListResultCodec = createWorkspaceResultCodec(assetListSchema);
+export const assetImageSchema = v.strictObject({
+  filename: v.string(),
+  src: v.pipe(v.string(), v.url()),
+  html: v.string(),
+});
+export type AssetImage = v.InferOutput<typeof assetImageSchema>;
+export const assetImageResultCodec = createWorkspaceResultCodec(assetImageSchema);
 
 export type ArticleCandidate = v.InferOutput<typeof articleCandidateResultSchema>;
 export type AssetCard = v.InferOutput<typeof assetCardSchema>;
@@ -837,8 +855,12 @@ export interface WorkspaceService {
   checkArticle(
     article: string,
   ): Promise<WorkspaceWireResult<v.InferOutput<typeof articleCheckResultSchema>>>;
-  listAssets(article: string): Promise<WorkspaceWireResult<v.InferOutput<typeof assetListSchema>>>;
+  listAssets(
+    article: string,
+    options?: { operation: string },
+  ): Promise<WorkspaceWireResult<v.InferOutput<typeof assetListSchema>>>;
   uploadAsset(input: AssetUploadInput): Promise<OperationWireResult>;
+  resolveAsset(article: string, asset: string): Promise<WorkspaceWireResult<AssetImage>>;
   readArticleCover(
     article: string,
   ): Promise<WorkspaceWireResult<v.InferOutput<typeof articleCoverResultSchema>>>;

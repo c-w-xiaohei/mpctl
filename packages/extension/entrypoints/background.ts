@@ -40,16 +40,10 @@ export default defineBackground(() => {
         : Result.ok(undefined);
     },
     reload: async () => {
-      const initialized = await operations;
-      if (initialized.isErr()) return Result.err({ code: "reload_failed" });
-      // Recheck at the actual scheduled dispatch, not only when the marker was stored.
-      const reloaded = await initialized.value.maintenance(async () =>
-        Result.try({
-          try: () => chrome.runtime.reload(),
-          catch: () => ({ code: "reload_failed" as const }),
-        }),
-      );
-      return reloaded.isOk() ? reloaded.value : Result.err({ code: "reload_failed" });
+      return Result.try({
+        try: () => chrome.runtime.reload(),
+        catch: () => ({ code: "reload_failed" as const }),
+      });
     },
     report: (result) => reportResult("scheduled reload", result),
     reportCleanup: (result) => reportResult("reload marker cleanup", result),
@@ -58,12 +52,7 @@ export default defineBackground(() => {
   const control = createBackgroundControl({
     ledger: operations,
     controller: () => controller,
-    reload: async () => {
-      const initialized = await operations;
-      if (initialized.isErr()) return Result.err({ code: "reload_failed" });
-      const reloaded = await initialized.value.maintenance(() => reloadControl.reload());
-      return reloaded.isOk() ? reloaded.value : Result.err({ code: "reload_failed" });
-    },
+    reload: () => reloadControl.reload(),
   });
   controller = createConnectionController({
     ledger: operations,

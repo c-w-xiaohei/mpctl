@@ -484,6 +484,58 @@ describe("CLI over Nexus Node IPC", () => {
     const pushed = operationOutcome({ snapshot }, false);
     expect(pushed.isErr()).toBe(true);
     expect(pushed.isErr() && pushed.error.details?.snapshot).toEqual(snapshot);
+    expect(pushed.isErr() && pushed.error.instruction).toContain("重新读取");
+    expect(pushed.isErr() && pushed.error.instruction).not.toContain("operation status");
+  });
+  test("write recovery instructions distinguish blocking execution, unknown effect and confirmed cleanup failure", () => {
+    const id = `op:${crypto.randomUUID()}:${crypto.randomUUID()}`;
+    const blocker = `op:${crypto.randomUUID()}:${crypto.randomUUID()}`;
+    const base = { operationId: id, operation: "body" as const, state: "settled" as const };
+    const blocked = operationOutcome(
+      {
+        snapshot: {
+          ...base,
+          effect: { outcome: "not_dispatched" },
+          result: {
+            status: "error",
+            error: { code: "operation_blocked", blockingOperationId: blocker },
+          },
+        },
+      },
+      false,
+    );
+    expect(blocked.isErr()).toBe(true);
+    if (blocked.isErr()) {
+      expect(blocked.error.instruction).toContain(blocker);
+      expect(blocked.error.instruction).not.toContain(id);
+    }
+    const unknown = operationOutcome(
+      {
+        snapshot: {
+          ...base,
+          effect: { outcome: "unknown" },
+          result: { status: "error", error: { code: "write_unknown" } },
+        },
+      },
+      false,
+    );
+    expect(unknown.isErr()).toBe(true);
+    if (unknown.isErr()) expect(unknown.error.instruction).toContain(`operation status '${id}'`);
+    const confirmed = operationOutcome(
+      {
+        snapshot: {
+          ...base,
+          effect: { outcome: "confirmed", bodyHash: "a".repeat(64) },
+          result: { status: "error", error: { code: "cleanup_failed" } },
+        },
+      },
+      false,
+    );
+    expect(confirmed.isErr()).toBe(true);
+    if (confirmed.isErr()) {
+      expect(confirmed.error.instruction).toContain("操作效果已确认");
+      expect(confirmed.error.instruction).not.toContain("operation status");
+    }
   });
   test.each(["read-legacy", "read-enriched", "set-legacy", "set-enriched"] as const)(
     "W2 correction cover %s retains primary code and received read facts over IPC",
@@ -1396,7 +1448,7 @@ describe("CLI over Nexus Node IPC", () => {
           },
         },
       },
-      instruction: expect.stringContaining("不要换键重做"),
+      instruction: expect.stringContaining("操作效果已确认"),
     });
     const knownCover = await runCli(coverArgs, socket);
     expect(knownCover.exitCode).toBe(1);
@@ -1437,77 +1489,93 @@ describe("CLI over Nexus Node IPC", () => {
     ).toBe("invalid_result_envelope");
   });
 
-  test("asset upload crosses CLI Node IPC as Blob bytes plus independent filename and MIME", async () => {
-    const directory = await tempDir();
-    const socket = path.join(directory, "asset-upload.sock");
-    const file = path.join(directory, "original-name.png");
-    const bytes = Uint8Array.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 1, 2, 3]);
-    await writeFile(file, bytes);
-    const server = await startProvider(socket, {
-      async uploadAsset(article, payload) {
-        expect(article).toBe("article-ref");
-        expect(payload.filename).toBe("original-name.png");
-        expect(payload.mimeType).toBe("image/png");
-        expect(new Uint8Array(await payload.blob.arrayBuffer())).toEqual(bytes);
-        return Result.ok({
-          asset: "ephemeral:fixture",
-          filename: payload.filename,
-          thumbnailUrl: "https://mmbiz.qpic.cn/thumb/300",
-        });
-      },
-    });
-    activeServers.push(server);
-    const result = await runCli(["asset", "upload", "article-ref", "--file", file], socket);
-    expect(result.exitCode).toBe(0);
-    const reply = JSON.parse(result.stdout);
-    expect(result.stderr).toBe(`operation ${reply.snapshot.operationId}\n`);
-    expect(reply).toMatchObject({
-      snapshot: {
-        operation: "upload",
-        state: "settled",
-        effect: {
-          outcome: "confirmed",
-          filename: "original-name.png",
-          thumbnailUrl: "https://mmbiz.qpic.cn/thumb/300",
+  test.each([0, 21_000])(
+    "asset upload preserves Blob bytes and waits for a %sms provider response without replay",
+    async (delay) => {
+      const directory = await tempDir();
+      const socket = path.join(directory, "asset-upload.sock");
+      const file = path.join(directory, "original-name.png");
+      const bytes = Uint8Array.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 1, 2, 3]);
+      await writeFile(file, bytes);
+      let calls = 0;
+      const server = await startProvider(socket, {
+        async uploadAsset(article, payload) {
+          calls++;
+          expect(article).toBe("article-ref");
+          expect(payload.filename).toBe("original-name.png");
+          expect(payload.mimeType).toBe("image/png");
+          expect(new Uint8Array(await payload.blob.arrayBuffer())).toEqual(bytes);
+          if (delay) await new Promise((resolve) => setTimeout(resolve, delay));
+          return Result.ok({
+            asset: "ephemeral:fixture",
+            filename: payload.filename,
+            thumbnailUrl: "https://mmbiz.qpic.cn/thumb/300",
+          });
         },
-      },
-    });
-    expect(reply.snapshot).not.toHaveProperty("asset");
-    expect(result.stdout).not.toContain(file);
-  });
+      });
+      activeServers.push(server);
+      const result = await runCli(["asset", "upload", "article-ref", "--file", file], socket);
+      expect(result.exitCode).toBe(0);
+      expect(calls).toBe(1);
+      const reply = JSON.parse(result.stdout);
+      expect(result.stderr).toBe(`operation ${reply.snapshot.operationId}\n`);
+      expect(reply).toMatchObject({
+        snapshot: {
+          operation: "upload",
+          state: "settled",
+          effect: {
+            outcome: "confirmed",
+            filename: "original-name.png",
+            thumbnailUrl: "https://mmbiz.qpic.cn/thumb/300",
+          },
+        },
+      });
+      expect(reply.snapshot).not.toHaveProperty("asset");
+      expect(result.stdout).not.toContain(file);
+    },
+    30_000,
+  );
 
-  test("asset list reports only the visible-page scope over CLI IPC", async () => {
-    const directory = await tempDir();
-    const socket = path.join(directory, "asset-list.sock");
-    const server = await startProvider(socket, {
-      async listAssets(article) {
-        expect(article).toBe("article-ref");
-        return Result.ok({
-          scope: "visible-page",
-          cards: [
-            {
-              asset: "ephemeral:visible-card",
-              filename: "visible.png",
-              thumbnailUrl: "https://mmbiz.qpic.cn/thumb/300",
-            },
-          ],
-        });
-      },
-    });
-    activeServers.push(server);
-    const result = await runCli(["asset", "list", "article-ref"], socket);
-    expect(result.exitCode).toBe(0);
-    expect(JSON.parse(result.stdout)).toEqual({
-      scope: "visible-page",
-      cards: [
-        {
-          asset: "ephemeral:visible-card",
-          filename: "visible.png",
-          thumbnailUrl: "https://mmbiz.qpic.cn/thumb/300",
+  test.each([false, true])(
+    "asset list reports visible-page scope and forwards recovery selection=%s over CLI IPC",
+    async (recover) => {
+      const directory = await tempDir();
+      const socket = path.join(directory, "asset-list.sock");
+      const id = `op:${crypto.randomUUID()}:${crypto.randomUUID()}`;
+      const server = await startProvider(socket, {
+        async listAssets(article, options) {
+          expect(article).toBe("article-ref");
+          expect(options).toEqual(recover ? { operation: id } : undefined);
+          return Result.ok({
+            scope: "visible-page",
+            cards: [
+              {
+                asset: "ephemeral:visible-card",
+                filename: "visible.png",
+                thumbnailUrl: "https://mmbiz.qpic.cn/thumb/300",
+              },
+            ],
+          });
         },
-      ],
-    });
-  });
+      });
+      activeServers.push(server);
+      const result = await runCli(
+        ["asset", "list", "article-ref", ...(recover ? ["--operation", id] : [])],
+        socket,
+      );
+      expect(result.exitCode).toBe(0);
+      expect(JSON.parse(result.stdout)).toEqual({
+        scope: "visible-page",
+        cards: [
+          {
+            asset: "ephemeral:visible-card",
+            filename: "visible.png",
+            thumbnailUrl: "https://mmbiz.qpic.cn/thumb/300",
+          },
+        ],
+      });
+    },
+  );
 
   test("asset upload reports an uncertain dispatched outcome and never retries", async () => {
     const directory = await tempDir();
@@ -2832,6 +2900,7 @@ async function startProvider(
     >;
     listAssets(
       article: string,
+      options?: { operation: string },
     ): Promise<
       import("better-result").Result<
         import("@mpctl/contracts").AssetList,
@@ -3126,8 +3195,9 @@ function encodeWorkspaceProvider(
     },
     checkArticle: async (article) =>
       encodeResult(articleCheckResultCodec, await workspace.checkArticle!(article)),
-    listAssets: async (article) =>
-      encodeResult(assetListResultCodec, await workspace.listAssets!(article)),
+    resolveAsset: async () => ({ status: "error", error: { code: "page_failed" } }),
+    listAssets: async (article, options) =>
+      encodeResult(assetListResultCodec, await workspace.listAssets!(article, options)),
     uploadAsset: async (input) => {
       const result = await workspace.uploadAsset!(input.article, input);
       if (result.isOk() && "unexpected" in result.value)

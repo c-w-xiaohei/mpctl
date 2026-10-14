@@ -1,14 +1,16 @@
 import { classifyAppmsgUrl } from "./routes";
 import { hasUniqueObservedCurrentItem } from "./drafts";
+import { createEditorRouteValidator } from "./editor-route";
 
 export type EditorState = "not_logged_in" | "loading" | "ready";
 
 export function createEditorTargetValidator(document: Document): () => boolean {
   const original = classifyAppmsgUrl(document.location.href);
+  const sameRoute = createEditorRouteValidator(document);
   return () => {
     if (detectLoginTimeout(document).state === "not_logged_in") return false;
     const current = classifyAppmsgUrl(document.location.href);
-    if (original.kind === "new") return current.kind === "new";
+    if (original.kind === "new") return sameRoute();
     return (
       original.kind === "saved-editor" &&
       current.kind === "saved-editor" &&
@@ -18,7 +20,12 @@ export function createEditorTargetValidator(document: Document): () => boolean {
   };
 }
 
-export type LoginTimeoutMarkers = { bodyClasses: string[]; infoText: string; jumpUrl: string };
+export type LoginTimeoutMarkers = {
+  bodyClasses: string[];
+  infoText: string;
+  jumpUrl: string;
+  headingText?: string;
+};
 
 export function classifyLoginTimeoutMarkers(markers: LoginTimeoutMarkers): { state: EditorState } {
   let jump: URL;
@@ -30,7 +37,9 @@ export function classifyLoginTimeoutMarkers(markers: LoginTimeoutMarkers): { sta
   const positive =
     markers.bodyClasses.includes("page_error") &&
     markers.bodyClasses.includes("page_timeout") &&
-    markers.infoText.includes("登录超时") &&
+    (markers.infoText.includes("登录超时") ||
+      (markers.infoText.trim() === "" &&
+        markers.headingText?.replace(/\s+/g, "") === "请重新登录")) &&
     jump.origin === "https://mp.weixin.qq.com" &&
     jump.pathname === "/cgi-bin/loginpage";
   return { state: positive ? "not_logged_in" : "loading" };
@@ -41,6 +50,7 @@ export function detectLoginTimeout(document: Document): { state: EditorState } {
   return classifyLoginTimeoutMarkers({
     bodyClasses: [...(document.body?.classList ?? [])],
     infoText: document.querySelector("#info")?.textContent ?? "",
+    headingText: document.querySelector(".page_error_msg .msg_content h2")?.textContent ?? "",
     jumpUrl,
   });
 }

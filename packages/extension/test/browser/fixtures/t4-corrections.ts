@@ -7,6 +7,7 @@ import { createWorkspace } from "../../../src/workspace";
 import { createPageManager, appmsgRouteIdentity } from "../../../src/pages";
 import { createPageEndpoint } from "../../../src/transport/page-bridge";
 import { createEditorService } from "../../../src/mp/jsapi";
+import { readArticleFields } from "../../../src/mp/article-fields";
 import { pageEditorToken } from "../../../src/page-contracts";
 import {
   articleCoverPageToken,
@@ -138,7 +139,7 @@ export async function fixture() {
     },
     readArticleFields: async () => {
       preflight++;
-      return Result.ok({ title: "", author: "", summary: "" });
+      return readArticleFields(document);
     },
     readArticleCover: async () => {
       preflight++;

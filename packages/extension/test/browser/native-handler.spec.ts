@@ -84,7 +84,6 @@ for (const dependency of ["needSplitMsg", "parent.report"] as const)
             counts: f.counters,
             native: state.nativeHandlerCounts,
             getterWrite: localStorage.getItem("previousLength"),
-            pending: (await f.operations.pending()).unwrap().length,
           };
         } finally {
           release();
@@ -103,7 +102,6 @@ for (const dependency of ["needSplitMsg", "parent.report"] as const)
       expect(result.native.invocation).toBe(0);
       expect(result.native.getter).toBe(0);
       expect(result.getterWrite).toBeNull();
-      expect(result.pending).toBe(0);
       expect(result.counts).toEqual({
         create: 0,
         group: 0,

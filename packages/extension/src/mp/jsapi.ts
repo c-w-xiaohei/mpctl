@@ -8,12 +8,17 @@ import {
   pageEditorReceiptResultCodec,
   bodyExecutionSchema,
   bodyRequestDigest,
+  documentWriteResultCodec,
+  documentWriteReleaseResultCodec,
+  assetImagePageResultCodec,
   type BodyReceipt,
   type BodyExecution,
 } from "../page-contracts";
 import * as v from "valibot";
-import type { Failure } from "@mpctl/contracts";
+import { operationIdSchema, type Failure } from "@mpctl/contracts";
 import { hashBody } from "./body-hash";
+import { documentWritesFor } from "./document-writes";
+import { resolveAssetImage } from "./asset-image";
 import { classifyAppmsgUrl } from "./routes";
 import { readArticleCover, hashArticleCover } from "./article-cover";
 import { readArticleFields, hashArticleFields } from "./article-fields";
@@ -53,7 +58,7 @@ type EditorOutcome<T> = Promise<import("better-result").Result<T, PageEditorErro
 export function createEditorService(options: EditorServiceOptions): PageEditorService {
   const timeoutMs = options.timeoutMs ?? 5_000;
   let readyState: { isReady: true; isNew: boolean } | undefined;
-  let writes = Promise.resolve();
+  const writes = documentWritesFor(options.document);
   const executorId = crypto.randomUUID();
   const executions = new Map<
     string,
@@ -108,7 +113,7 @@ export function createEditorService(options: EditorServiceOptions): PageEditorSe
               observation?.failed?.("timeout");
               resolve(Result.err({ code: "page_failed" }));
             }),
-          timeoutMs,
+          options.timeoutMs ?? (apiName === "mp_editor_change_cover" ? 90_000 : timeoutMs),
         );
         const invoked = Result.try({
           try: () => {
@@ -203,6 +208,25 @@ export function createEditorService(options: EditorServiceOptions): PageEditorSe
   }
 
   return {
+    async acquireWrite(operationId: string) {
+      if (!v.safeParse(operationIdSchema, operationId).success)
+        return serialize(
+          documentWriteResultCodec,
+          Result.err({ code: "invalid_operation" as const }),
+        );
+      if (validateTarget().isErr())
+        return serialize(
+          documentWriteResultCodec,
+          Result.err({ code: "target_unavailable" as const }),
+        );
+      return serialize(documentWriteResultCodec, writes.acquire(operationId));
+    },
+    async releaseWrite(token: string) {
+      return serialize(
+        documentWriteReleaseResultCodec,
+        writes.release(token).map(() => ({})),
+      );
+    },
     async getCoverReceipt(operationId) {
       return serialize(
         coverReceiptResultCodec,
@@ -238,12 +262,7 @@ export function createEditorService(options: EditorServiceOptions): PageEditorSe
         }),
       };
       covers.set(input.operationId, entry); // Reserve all inputs before any await.
-      const previous = writes;
-      let release!: () => void;
-      const node = new Promise<void>((done) => {
-        release = done;
-      });
-      writes = previous.then(() => node);
+      const write = writes.reserve(input.operationId);
       const receipt: CoverReceipt = {
         operationId: input.operationId,
         executorId,
@@ -284,7 +303,11 @@ export function createEditorService(options: EditorServiceOptions): PageEditorSe
       try {
         receipt.requestDigest = await bodyCoverRequestDigest(input);
         entry.receipt = receipt;
-        await previous;
+        const entered = await write.enter();
+        if (entered.isErr()) {
+          receipt.result = { status: "error", error: entered.error };
+          return serialize(coverWriteResultCodec, Result.ok({ ...receipt, ended: true }));
+        }
         await (async () => {
           const document = options.document;
           if (!document?.defaultView?.DOMParser) {
@@ -416,11 +439,13 @@ export function createEditorService(options: EditorServiceOptions): PageEditorSe
                 nativeFailure ??= kind;
               },
               dispatched() {
+                write.dispatched();
                 receipt.effect = { cover: true, outcome: "unknown" };
               },
               callback(success) {
                 if (!success) nativeFailure ??= "error";
                 if (success) {
+                  write.confirmed();
                   callbackSuccess = true;
                   if (stopped) receipt.ended = true; // Facts only: no readback or outcome upgrade.
                 }
@@ -497,7 +522,7 @@ export function createEditorService(options: EditorServiceOptions): PageEditorSe
         stopped = true;
         receipt.ended = receipt.effect.outcome === "not_dispatched" || callbackSuccess;
         finish();
-        release();
+        write.finish(receipt.effect.outcome === "not_dispatched");
       }
       return entry.failure
         ? reject(entry.failure.code)
@@ -513,6 +538,44 @@ export function createEditorService(options: EditorServiceOptions): PageEditorSe
     async getContent() {
       const result = await getContent();
       return serialize(pageEditorContentResultCodec, result);
+    },
+    async resolveImage(candidate) {
+      if (
+        !v.safeParse(
+          v.strictObject({
+            filename: v.pipe(v.string(), v.minLength(1)),
+            thumbnailUrl: v.pipe(v.string(), v.url()),
+          }),
+          candidate,
+        ).success
+      )
+        return (
+          await assetImagePageResultCodec.serialize(Result.err({ code: "invalid_payload" }))
+        ).unwrap();
+      const acquired = writes.acquire(`op:${crypto.randomUUID()}:${crypto.randomUUID()}`);
+      if (acquired.isErr()) return (await assetImagePageResultCodec.serialize(acquired)).unwrap();
+      try {
+        if (!options.document) {
+          writes.release(acquired.value);
+          return (
+            await assetImagePageResultCodec.serialize(Result.err({ code: "unsupported" }))
+          ).unwrap();
+        }
+        const result = await resolveAssetImage(
+          options.document,
+          candidate,
+          () =>
+            validateTarget().isOk() ? Result.ok() : Result.err({ code: "target_unavailable" }),
+          () => {
+            writes.release(acquired.value);
+          },
+        );
+        return (await assetImagePageResultCodec.serialize(result)).unwrap();
+      } catch {
+        return (
+          await assetImagePageResultCodec.serialize(Result.err({ code: "page_failed" }))
+        ).unwrap();
+      }
     },
     async getReceipt(operationId: string) {
       const entry = executions.get(operationId);
@@ -574,14 +637,7 @@ export function createEditorService(options: EditorServiceOptions): PageEditorSe
         }),
       };
       executions.set(execution.operationId, entry);
-      const previous = writes;
-      let release!: () => void;
-      const node = new Promise<void>((resolve) => {
-        release = resolve;
-      });
-      // A failed digest may finish this node early, but successors still wait
-      // for its predecessor's native work.
-      writes = previous.then(() => node);
+      const write = writes.reserve(execution.operationId);
       let stopped = false;
       let callbackSuccess = false;
       let receipt: BodyReceipt = {
@@ -611,7 +667,13 @@ export function createEditorService(options: EditorServiceOptions): PageEditorSe
         receipt.requestDigest = await bodyRequestDigest(html, expectedHash);
         resolveDigest(receipt.requestDigest);
         entry.receipt = receipt;
-        await previous;
+        const entered = await write.enter();
+        if (entered.isErr()) {
+          receipt.result = { status: "error", error: entered.error };
+          return (
+            await pageEditorWriteResultCodec.serialize(Result.ok({ ...receipt, ended: true }))
+          ).unwrap();
+        }
         await (async () => {
           const current = await getContent();
           if (current.isErr()) {
@@ -641,10 +703,12 @@ export function createEditorService(options: EditorServiceOptions): PageEditorSe
             { content: html },
             {
               dispatched() {
+                write.dispatched();
                 receipt.effect = { outcome: "unknown" };
               },
               callback(success) {
                 if (!success) return; // Unspecified error callback is not proof native work stopped.
+                write.confirmed();
                 callbackSuccess = true;
                 if (stopped) receipt.ended = true; // Facts only; never resume readback after timeout.
               },
@@ -690,7 +754,7 @@ export function createEditorService(options: EditorServiceOptions): PageEditorSe
         entry.html = undefined;
         if (!entry.failure) entry.receipt = receipt;
         resolve(entry.receipt);
-        release();
+        write.finish(receipt.effect.outcome === "not_dispatched");
       }
       return entry.failure
         ? reject(entry.failure.code)

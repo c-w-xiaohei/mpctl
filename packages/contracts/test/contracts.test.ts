@@ -82,7 +82,6 @@ test("specific native receipt envelopes retain strict effect, identity and termi
       { requestDigest: "bad" },
       { extra: true },
       { result: undefined },
-      { ended: false },
       { effect: { ...effects[index], outcome: "not_dispatched" } },
     ])
       expect(v.safeParse(schema, { ...receipt, ...delta }).success).toBe(false);
@@ -90,6 +89,7 @@ test("specific native receipt envelopes retain strict effect, identity and termi
       if (otherIndex !== index)
         expect(v.safeParse(schema, { ...receipt, effect }).success).toBe(false);
     expect(v.safeParse(schema, { ...receipt, ended: false, result: undefined }).success).toBe(true);
+    expect(v.safeParse(schema, { ...receipt, ended: false }).success).toBe(true);
   }
 });
 
@@ -253,7 +253,7 @@ describe("workspace contracts", () => {
     ])
       expect(v.safeParse(fieldsEffectSchema, effect).success).toBe(false);
   });
-  test("R3 terminal MAIN receipts require a result and confirmed success/end evidence", async () => {
+  test("terminal receipts require a result; success requires confirmation, independently of cleanup", async () => {
     const receipt = {
       operationId: createOperationId(crypto.randomUUID()),
       executorId: crypto.randomUUID(),
@@ -261,20 +261,18 @@ describe("workspace contracts", () => {
       ended: true,
       effect: { outcome: "unknown" },
     };
-    for (const value of [
-      receipt,
-      { ...receipt, result: { status: "ok", value: {} } },
-      {
-        ...receipt,
-        ended: false,
-        effect: { outcome: "confirmed", bodyHash: "b".repeat(64) },
-        result: { status: "ok", value: {} },
-      },
-    ]) {
+    for (const value of [receipt, { ...receipt, result: { status: "ok", value: {} } }]) {
       expect(await pageEditorWriteResultCodec.deserialize({ status: "ok", value })).toEqual(
         Result.err({ code: "invalid_result_envelope" }),
       );
     }
+    const saved = {
+      ...receipt,
+      ended: false,
+      effect: { outcome: "confirmed", persistence: "unverified" },
+      result: { status: "ok", value: { cleanup: { code: "cleanup_failed" } } },
+    };
+    expect(v.safeParse(saveReceiptSchema, saved).success).toBe(true);
   });
   test("E3 status preserves a failed business snapshot as a successful query", async () => {
     const snapshot = {
@@ -726,7 +724,7 @@ describe("preparation operation error codecs", () => {
   } as const;
 
   test("advertises the coordinated breaking wire version", () => {
-    expect(protocolVersion).toBe("0.15.0");
+    expect(protocolVersion).toBe("0.18.0");
   });
 
   test("current mutation errors reject the retired top-level forwarding shapes", async () => {

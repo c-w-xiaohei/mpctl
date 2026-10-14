@@ -77,7 +77,7 @@ test("R1 fields lost actual Nexus reply recovers original receipt through status
     value: {
       snapshot: {
         operation: "fields",
-        state: "unresolved",
+        state: "settled",
         effect: { outcome: "unknown", attempted: [] },
       },
     },

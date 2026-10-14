@@ -2,6 +2,7 @@ import { chromium, expect, test } from "@playwright/test";
 import { execFileSync } from "node:child_process";
 import { mkdtemp, readFile, rm } from "node:fs/promises";
 import path from "node:path";
+
 let temp: string;
 let bundle: string;
 test.beforeAll(async () => {
@@ -17,10 +18,11 @@ test.beforeAll(async () => {
   bundle = await readFile(output, "utf8");
 });
 test.afterAll(async () => {
-  if (temp) await rm(temp, { recursive: true, force: true });
+  await rm(temp, { recursive: true, force: true });
 });
+
 for (const mode of ["normal", "expired-list", "lost", "no-document", "wrong-url"] as const) {
-  test(`relogin original workspace and native IDB ${mode} keep once-only navigation facts`, async () => {
+  test(`relogin ${mode} preserves exact-once navigation and a usable successful reference`, async () => {
     const browser = await chromium.launch({
       executablePath: process.env.MPCTL_CHROMIUM_EXECUTABLE,
       args: ["--no-sandbox"],
@@ -39,27 +41,22 @@ for (const mode of ["normal", "expired-list", "lost", "no-document", "wrong-url"
         const f = await navigationFixture();
         try {
           f.addSaved("A");
-          await f.decode(await f.workspace.openArticle({ operationId: f.id(), candidate: "A" }));
-          const tabId = f.expireSaved(
-            "A",
-            mode === "expired-list" ? "normal" : mode,
-            mode === "expired-list",
-          );
+          await f.workspace.openArticle({ operationId: f.id(), candidate: "A" });
+          f.expireSaved("A", mode === "expired-list" ? "normal" : mode, mode === "expired-list");
           const beforeCurrent = { ...f.counters, update: f.updates };
           const current = await f.workspace.currentArticle({ candidate: "A" });
           const afterCurrent = { ...f.counters, update: f.updates };
           const input = { operationId: f.id(), candidate: "A" };
           const first = await f.decode(await f.workspace.openArticle(input));
-          const record = (await f.operations.record(input.operationId)).unwrap();
+          const body = first.article ? await f.workspace.readBody(first.article) : undefined;
           const beforeReplay = { ...f.counters, update: f.updates };
           const replay = await f.decode(await f.workspace.openArticle(input));
           const status = await f.decode(await f.workspace.getOperation(input.operationId));
           return {
             first,
+            body,
             replay,
             status,
-            record,
-            tabId,
             current,
             beforeCurrent,
             afterCurrent,
@@ -71,10 +68,11 @@ for (const mode of ["normal", "expired-list", "lost", "no-document", "wrong-url"
         }
       }, mode);
       expect(result.current).toMatchObject({ status: "error", error: { code: "not_logged_in" } });
-      expect(result.beforeCurrent).toEqual(result.afterCurrent);
-      expect(result.beforeReplay).toEqual(result.afterReplay);
-      expect(result.first.snapshot).toEqual(result.replay.snapshot);
+      expect(result.afterCurrent).toEqual(result.beforeCurrent);
+      expect(result.afterReplay).toEqual(result.beforeReplay);
+      expect(result.replay.snapshot).toEqual(result.first.snapshot);
       expect(result.status.snapshot).toEqual(result.first.snapshot);
+      expect(result.replay.article).toBeUndefined();
       expect(result.afterReplay).toMatchObject({
         create: 0,
         update: mode === "expired-list" ? 2 : 1,
@@ -83,30 +81,20 @@ for (const mode of ["normal", "expired-list", "lost", "no-document", "wrong-url"
       });
       const success = mode === "normal" || mode === "expired-list";
       expect(result.first.snapshot).toMatchObject({
-        state: success ? "settled" : "unresolved",
+        state: "settled",
         effect: { pageCreated: false, outcome: success ? "confirmed" : "unknown" },
         result: { status: success ? "ok" : "error" },
       });
-      if (success)
-        expect(result.record.navigationBinding?.target).toMatchObject({
-          tabId: result.tabId,
-          documentId: `fresh:${result.tabId}:${mode === "expired-list" ? 2 : 1}`,
-        });
-      else expect(result.record.navigationBinding?.target).toBeUndefined();
+      if (success) expect(result.body.status).toBe("ok");
+      else expect(result.first.article).toBeUndefined();
     } finally {
       await browser.close();
     }
   });
 }
-for (const boundary of [
-  "issue-abort",
-  "creation-checkpoint-abort",
-  "completed-dead-source",
-  "pending-maintenance",
-  "root-checkpoint-abort",
-  "binding-abort",
-] as const) {
-  test(`B-N1/P2/H1/K3/B-N3 native IDB ${boundary}`, async () => {
+
+for (const boundary of ["claim-abort", "result-abort", "completed-dead-source"] as const) {
+  test(`native IDB ${boundary} never repeats navigation`, async () => {
     const browser = await chromium.launch({
       executablePath: process.env.MPCTL_CHROMIUM_EXECUTABLE,
       args: ["--no-sandbox"],
@@ -123,66 +111,43 @@ for (const boundary of [
         const url = "https://navigation.test/navigation.js";
         const { navigationFixture } = await import(url);
         const f = await navigationFixture();
-        if (boundary === "root-checkpoint-abort") f.missingHome();
+        f.endCapture();
+        const method = boundary === "claim-abort" ? "add" : "put";
+        const original = IDBObjectStore.prototype[method];
         let aborted = 0;
-        const original = IDBObjectStore.prototype.put;
-        if (boundary.endsWith("abort"))
-          IDBObjectStore.prototype.put = function (value, key) {
-            const request = original.call(this, value, key);
-            if (
-              this.name === "operations" &&
-              value.snapshot.state === "issued" &&
-              (boundary === "binding-abort"
-                ? !!value.navigationBinding?.target
-                : boundary === "root-checkpoint-abort"
-                  ? value.snapshot.effect.auxiliaryCreated.length > 0
-                  : boundary === "issue-abort"
-                    ? !value.snapshot.effect.pageCreated
-                    : value.snapshot.effect.pageCreated)
-            ) {
-              const tx = this.transaction;
+        if (boundary !== "completed-dead-source")
+          IDBObjectStore.prototype[method] = function (...args) {
+            const request = original.apply(this, args);
+            if (this.name === "operations")
               request.addEventListener("success", () => {
                 aborted++;
-                tx.abort();
+                this.transaction.abort();
               });
-            }
             return request;
           };
         try {
           const input = { operationId: f.id() };
-          if (boundary === "pending-maintenance") f.holdGroup();
-          const first = f.workspace.newArticle(input);
-          let blocked: unknown[] = [];
-          if (boundary === "pending-maintenance") {
-            await f.reached();
-            blocked = await Promise.all([
-              f.workspace.listArticles(),
-              f.workspace.cleanupWorkspace(),
-              f.workspace.newArticle({ operationId: f.id() }),
-            ]);
-            const snapshot = await f.workspace.getOperation(input.operationId);
-            blocked.push(snapshot);
-            f.release();
-          }
-          const reply = await f.decode(await first);
+          const first = await f.workspace.newArticle(input);
+          IDBObjectStore.prototype[method] = original;
           const before = { ...f.counters };
-          if (boundary === "completed-dead-source") f.expire();
-          const repeated = await f.decode(await f.workspace.newArticle(input));
-          const query = await f.decode(await f.workspace.getOperation(input.operationId));
-          const pending = (await f.operations.pending())
-            .unwrap()
-            .map((entry: any) => entry.snapshot.operationId);
-          return { reply, repeated, query, counts: f.counters, before, aborted, blocked, pending };
+          f.expire();
+          // An aborted claim was never admitted; do not submit a new intent in this test.
+          const replay =
+            boundary === "claim-abort" ? undefined : await f.workspace.newArticle(input);
+          const status = await f.workspace.getOperation(input.operationId);
+          return { first, replay, status, before, after: f.counters, aborted };
         } finally {
-          IDBObjectStore.prototype.put = original;
+          IDBObjectStore.prototype[method] = original;
           f.dispose();
         }
       }, boundary);
-      expect(result.counts).toEqual(result.before);
-      expect(result.repeated.snapshot).toEqual(result.query.snapshot);
-      if (boundary === "issue-abort") {
-        expect(result.aborted).toBe(1);
-        expect(result.counts).toEqual({
+      expect(result.after).toEqual(result.before);
+      if (boundary === "claim-abort") {
+        expect(result.first).toMatchObject({
+          status: "error",
+          error: { failure: { code: "storage_failed" } },
+        });
+        expect(result.before).toEqual({
           create: 0,
           group: 0,
           capture: 0,
@@ -190,90 +155,20 @@ for (const boundary of [
           read: 0,
           set: 0,
         });
-        expect(result.reply.snapshot.effect.pageCreated).toBe(false);
-      } else if (boundary === "root-checkpoint-abort") {
         expect(result.aborted).toBe(1);
-        expect(result.counts).toEqual({
-          create: 1,
-          group: 0,
-          capture: 0,
-          reload: 0,
-          read: 0,
-          set: 0,
-        });
-        expect(result.reply.issue).toMatchObject({
-          failure: { code: "storage_failed" },
-          uncommitted: {
-            effect: { auxiliaryCreated: ["home"], pageCreated: false, targetBound: false },
-          },
-        });
-        expect(result.pending).toHaveLength(1);
-      } else if (boundary === "binding-abort") {
-        expect(result.aborted).toBe(1);
-        expect(result.counts).toEqual({
-          create: 1,
-          group: 1,
-          capture: 1,
-          reload: 0,
-          read: 0,
-          set: 0,
-        });
-        expect(result.reply.snapshot).toMatchObject({
-          state: "unresolved",
-          effect: { pageCreated: true, targetBound: false },
-        });
-        expect(result.reply.issue).toMatchObject({
-          failure: { code: "storage_failed" },
-          uncommitted: { effect: { pageCreated: true, targetBound: true } },
-        });
-        expect(result.pending).toHaveLength(1);
-      } else if (boundary === "creation-checkpoint-abort") {
-        expect(result.aborted).toBe(1);
-        expect(result.counts).toEqual({
-          create: 1,
-          group: 0,
-          capture: 1,
-          reload: 0,
-          read: 0,
-          set: 0,
-        });
-        expect(result.reply.snapshot).toMatchObject({
-          state: "unresolved",
-          effect: { pageCreated: false },
-        });
-        expect(result.reply.issue).toMatchObject({
-          failure: { code: "storage_failed" },
-          uncommitted: { effect: { pageCreated: true, targetBound: false } },
-        });
-        expect(result.pending).toHaveLength(1);
       } else {
-        expect(result.counts).toEqual({
-          create: 1,
-          group: 1,
-          capture: 1,
-          reload: 0,
-          read: 1,
-          set: 0,
-        });
-        expect(result.reply.snapshot).toMatchObject({
-          state: "unresolved",
-          effect: { pageCreated: true, targetBound: true },
-          result: { status: "error", error: { code: "operation_unresolved" } },
-        });
-        if (boundary === "pending-maintenance") {
-          expect(result.blocked.slice(0, 2)).toMatchObject([
-            { status: "error" },
-            { status: "error" },
-          ]);
-          expect(result.blocked[2]).toMatchObject({
-            status: "ok",
-            value: { snapshot: { state: "settled", result: { status: "error" } } },
+        expect(result.before).toMatchObject({ create: 1, group: 1, capture: 1, set: 0 });
+        expect(result.replay.value.snapshot).toEqual(result.status.value.snapshot);
+        if (boundary === "result-abort") {
+          expect(result.first.value.issue).toMatchObject({
+            failure: { code: "storage_failed" },
+            uncommitted: {
+              effect: { pageCreated: true, targetBound: true },
+              result: { status: "ok" },
+            },
           });
-          expect(result.blocked[3]).toMatchObject({
-            status: "ok",
-            value: { snapshot: { state: "issued" } },
-          });
-        }
+          expect(result.aborted).toBe(1);
+        } else expect(result.first.value.snapshot.result.status).toBe("ok");
       }
     } finally {
       await browser.close();

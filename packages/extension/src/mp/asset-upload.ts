@@ -1,5 +1,10 @@
 import { Result } from "better-result";
-import { assetPayloadSchema, validAssetSignature, type Failure } from "@mpctl/contracts";
+import {
+  assetPayloadSchema,
+  validAssetSignature,
+  assetUploadTimeouts,
+  type Failure,
+} from "@mpctl/contracts";
 import * as v from "valibot";
 import {
   readMaterialCards,
@@ -21,7 +26,7 @@ export type AssetUploadGuard = () => import("better-result").Result<void, AssetU
 
 const dialogSelector = ".weui-desktop-dialog";
 const inputSelector = '.weui-desktop-upload_global-media input[type="file"][accept*="bmp"]';
-const maxWaitMs = 10_000;
+const maxWaitMs = assetUploadTimeouts.native;
 
 export async function uploadAsset(
   document: Document,
@@ -152,7 +157,10 @@ export async function uploadAsset(
     const currentGuard = guard();
     if (Result.isError(currentGuard))
       return fail("asset_upload_unknown", "upload_confirm", currentGuard.error.code, "unknown");
-    if (!sameDialogAndInput(document, dialog, input))
+    // WebUploader replaces its file input synchronously after accepting change.
+    // From dispatch onward the owned library and the resulting card, not the
+    // consumed input element, identify the native upload we are observing.
+    if (uniqueVisibleDialog(document) !== dialog)
       return fail("asset_upload_unknown", "upload_confirm", "dialog_or_input_changed", "unknown");
     const afterResult = readMaterialCards(dialog);
     // Preflight already proved this exact filename absent. Consume only a
@@ -165,7 +173,7 @@ export async function uploadAsset(
     const postReadGuard = guard();
     if (Result.isError(postReadGuard))
       return fail("asset_upload_unknown", "upload_confirm", postReadGuard.error.code, "unknown");
-    if (!sameDialogAndInput(document, dialog, input))
+    if (uniqueVisibleDialog(document) !== dialog)
       return fail("asset_upload_unknown", "upload_confirm", "dialog_or_input_changed", "unknown");
     if (created.length === 1 && created[0]?.thumbnailUrl) {
       publish({
@@ -278,7 +286,10 @@ export async function uploadMaterial(
       cause: { at: "content.upload_preflight", kind: "runtime", code: "unexpected_exception" },
     };
   }
-  if (opened?.opened) {
+  // Closing an upload dialog destroys its native uploader. Keep it visible
+  // while completion is unknown so observation can continue without cancelling
+  // or concealing the original work.
+  if (opened?.opened && nativeEnded) {
     try {
       const closed = await closeMaterialLibrary(document, opened.dialog, guard, {
         onDispatch: () => {

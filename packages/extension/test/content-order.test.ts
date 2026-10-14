@@ -530,7 +530,7 @@ describe("content-script readiness ordering", () => {
     expect(events).toEqual(["input", "change"]);
     expect(fixture.values).toEqual({ author: "", summary: "" });
   });
-  test("F3 fields failed digest cannot open the queue ahead of a held predecessor", async () => {
+  test("fields hash computation is not resource ownership; actual execution rechecks versions", async () => {
     const fixture = fieldsDocument();
     const service = createArticleFieldsService(fixture.document, () => true);
     const a = await fieldsExecution(service),
@@ -565,27 +565,25 @@ describe("content-script readiness ordering", () => {
         status: "error",
         error: { code: "hash_failed" },
       });
-      let finished = false;
-      const last = service.updateArticleFields({ author: "last" }, hash, c).then((value) => {
-        finished = true;
-        return value;
-      });
-      await new Promise((done) => setTimeout(done, 0));
-      expect(finished).toBe(false);
-      expect(fixture.values.author).toBe("Author");
+      const last = service.updateArticleFields({ author: "last" }, hash, c);
+      await last;
+      expect(fixture.values.author).toBe("last");
       release();
       expect(await first).toMatchObject({
-        status: "ok",
-        value: { effect: { outcome: "confirmed" } },
-      });
-      expect(await last).toMatchObject({
         status: "ok",
         value: {
           effect: { attempted: [] },
           result: { status: "error", error: { code: "content_conflict" } },
         },
       });
-      expect(fixture.values.author).toBe("first");
+      expect(await last).toMatchObject({
+        status: "ok",
+        value: {
+          effect: { outcome: "confirmed" },
+          result: { status: "ok" },
+        },
+      });
+      expect(fixture.values.author).toBe("last");
     } finally {
       release();
       crypto.subtle.digest = digest;
@@ -1120,6 +1118,10 @@ describe("content-script readiness ordering", () => {
           throw new Error("must not write");
         },
         getReceipt: async () => ({ status: "ok" as const, value: null }),
+        resolveImage: async () => ({
+          status: "error" as const,
+          error: { code: "unsupported" as const },
+        }),
         setCoverFromBody: async () => ({
           status: "error" as const,
           error: { code: "unsupported" as const },
@@ -1170,6 +1172,14 @@ describe("content-script readiness ordering", () => {
     });
     const main = new Nexus()
       .provide(token, {
+        acquireWrite: async () => ({
+          status: "error" as const,
+          error: { code: "unsupported" as const },
+        }),
+        releaseWrite: async () => ({
+          status: "error" as const,
+          error: { code: "unsupported" as const },
+        }),
         ready: async () =>
           wire(
             pageEditorReadyResultCodec.serialize(
@@ -1184,6 +1194,10 @@ describe("content-script readiness ordering", () => {
             ),
           ),
         getReceipt: async () => ({ status: "ok" as const, value: null }),
+        resolveImage: async () => ({
+          status: "error" as const,
+          error: { code: "unsupported" as const },
+        }),
         setCoverFromBody: async () => ({
           status: "error" as const,
           error: { code: "unsupported" as const },
@@ -1233,6 +1247,14 @@ describe("content-script readiness ordering", () => {
     let disconnected = 0;
     const peer = localNexusPeer("relay-creation-failure");
     peer.server.provide(token, {
+      acquireWrite: async () => ({
+        status: "error" as const,
+        error: { code: "unsupported" as const },
+      }),
+      releaseWrite: async () => ({
+        status: "error" as const,
+        error: { code: "unsupported" as const },
+      }),
       ready: async () =>
         wire(
           pageEditorReadyResultCodec.serialize(
@@ -1245,6 +1267,10 @@ describe("content-script readiness ordering", () => {
           pageEditorWriteResultCodec.serialize(Result.ok(await bodyReceipt(html, hash, execution))),
         ),
       getReceipt: async () => ({ status: "ok" as const, value: null }),
+      resolveImage: async () => ({
+        status: "error" as const,
+        error: { code: "unsupported" as const },
+      }),
       setCoverFromBody: async () => ({
         status: "error" as const,
         error: { code: "unsupported" as const },
@@ -1277,6 +1303,14 @@ describe("content-script readiness ordering", () => {
     let disconnected = 0;
     const peer = localNexusPeer("relay-creation-cleanup-failure");
     peer.server.provide(token, {
+      acquireWrite: async () => ({
+        status: "error" as const,
+        error: { code: "unsupported" as const },
+      }),
+      releaseWrite: async () => ({
+        status: "error" as const,
+        error: { code: "unsupported" as const },
+      }),
       ready: async () =>
         wire(
           pageEditorReadyResultCodec.serialize(
@@ -1289,6 +1323,10 @@ describe("content-script readiness ordering", () => {
           pageEditorWriteResultCodec.serialize(Result.ok(await bodyReceipt(html, hash, execution))),
         ),
       getReceipt: async () => ({ status: "ok" as const, value: null }),
+      resolveImage: async () => ({
+        status: "error" as const,
+        error: { code: "unsupported" as const },
+      }),
       setCoverFromBody: async () => ({
         status: "error" as const,
         error: { code: "unsupported" as const },
@@ -1355,6 +1393,14 @@ describe("content-script readiness ordering", () => {
     const chrome = localNexusPeer("missing-jsapi");
     const peer = localNexusPeer("missing-jsapi-main");
     peer.server.provide(token, {
+      acquireWrite: async () => ({
+        status: "error" as const,
+        error: { code: "unsupported" as const },
+      }),
+      releaseWrite: async () => ({
+        status: "error" as const,
+        error: { code: "unsupported" as const },
+      }),
       ready: async () =>
         wire(pageEditorReadyResultCodec.serialize(Result.err({ code: "jsapi_unavailable" }))),
       getContent: async () => {
@@ -1364,6 +1410,10 @@ describe("content-script readiness ordering", () => {
         throw new Error("must not write");
       },
       getReceipt: async () => ({ status: "ok" as const, value: null }),
+      resolveImage: async () => ({
+        status: "error" as const,
+        error: { code: "unsupported" as const },
+      }),
       setCoverFromBody: async () => ({
         status: "error" as const,
         error: { code: "unsupported" as const },
@@ -1413,6 +1463,14 @@ describe("content-script readiness ordering", () => {
     let mainWrites = 0;
     const mainRuntime = new Nexus()
       .provide(token, {
+        acquireWrite: async () => ({
+          status: "error" as const,
+          error: { code: "unsupported" as const },
+        }),
+        releaseWrite: async () => ({
+          status: "error" as const,
+          error: { code: "unsupported" as const },
+        }),
         ready: async () =>
           wire(
             pageEditorReadyResultCodec.serialize(
@@ -1429,6 +1487,10 @@ describe("content-script readiness ordering", () => {
           );
         },
         getReceipt: async () => ({ status: "ok" as const, value: null }),
+        resolveImage: async () => ({
+          status: "error" as const,
+          error: { code: "unsupported" as const },
+        }),
         setCoverFromBody: async () => ({
           status: "error" as const,
           error: { code: "unsupported" as const },
@@ -1476,6 +1538,14 @@ describe("content-script readiness ordering", () => {
     let mainWrites = 0;
     const mainRuntime = new Nexus()
       .provide(token, {
+        acquireWrite: async () => ({
+          status: "error" as const,
+          error: { code: "unsupported" as const },
+        }),
+        releaseWrite: async () => ({
+          status: "error" as const,
+          error: { code: "unsupported" as const },
+        }),
         ready: async () =>
           wire(
             pageEditorReadyResultCodec.serialize(
@@ -1495,6 +1565,10 @@ describe("content-script readiness ordering", () => {
           );
         },
         getReceipt: async () => ({ status: "ok" as const, value: null }),
+        resolveImage: async () => ({
+          status: "error" as const,
+          error: { code: "unsupported" as const },
+        }),
         setCoverFromBody: async () => ({
           status: "error" as const,
           error: { code: "unsupported" as const },

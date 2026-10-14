@@ -15,6 +15,9 @@ import { hasPreparationVersion, type ContentAppMeta } from "../src/background-ru
 import type { AuthorizationPolicy } from "@nexus-js/core";
 import type { SerializedResult } from "better-result";
 import { pageEditorReadyResultCodec, pageEditorToken } from "../src/page-contracts";
+import { documentWriteResultCodec, documentWriteReleaseResultCodec } from "../src/page-contracts";
+import { documentWritesFor } from "../src/mp/document-writes";
+import { hashBody } from "../src/mp/body-hash";
 import {
   contentStatusToken,
   contentStatusResultCodec,
@@ -62,6 +65,7 @@ import {
 } from "../src/mp/editor";
 import { draftPageToken } from "../src/background-contracts";
 import { appmsgRouteIdentity, classifyAppmsgUrl } from "../src/mp/routes";
+import { createEditorRouteValidator } from "../src/mp/editor-route";
 import {
   countVisibleAppmsgItems,
   hasUniqueObservedCurrentItem,
@@ -553,11 +557,19 @@ export default defineContentScript({
     chromeRuntime.provide(draftPageToken, createDraftPageService(document));
     chromeRuntime.provide(
       articleFieldsToken,
-      createArticleFieldsService(document, () => fieldsActive && validateTarget()),
+      createArticleFieldsService(
+        document,
+        () => fieldsActive && validateTarget(),
+        () => existingEditor?.(),
+      ),
     );
     chromeRuntime.provide(
       materialPageToken,
-      createMaterialPageService(document, () => fieldsActive && validateTarget()),
+      createMaterialPageService(
+        document,
+        () => fieldsActive && validateTarget(),
+        () => existingEditor?.(),
+      ),
     );
     chromeRuntime.provide(
       articleCoverPageToken,
@@ -680,7 +692,6 @@ export function createContentStatusService(
   loginExpired: () => boolean = () => false,
 ) {
   const route = classifyAppmsgUrl(document.location.href);
-  const routeIdentity = appmsgRouteIdentity(document.location.href) ?? "unsupported";
   return {
     async status() {
       const outcome = Result.try({
@@ -700,7 +711,11 @@ export function createContentStatusService(
                     ((route.kind === "new" || route.kind === "saved-editor") && validateTarget()))
                 ? ("ready" as const)
                 : ("loading" as const);
-          return { state, route: routeIdentity, documentReady: domReady };
+          return {
+            state,
+            route: appmsgRouteIdentity(document.location.href) ?? "unsupported",
+            documentReady: domReady,
+          };
         },
         catch: () => ({ code: "page_failed" as const }),
       });
@@ -709,7 +724,34 @@ export function createContentStatusService(
   };
 }
 
-export function createArticleFieldsService(document: Document, validateTarget: () => boolean) {
+type EditorAccess = () =>
+  | Remote<import("../src/page-contracts").PageEditorService, PageBridgeAdapterModel>
+  | undefined;
+async function acquireDocument(document: Document, access: EditorAccess | undefined, id: string) {
+  if (!access) {
+    const writes = documentWritesFor(document);
+    const acquired = writes.acquire(id);
+    return acquired.isErr() ? acquired : Result.ok(async () => writes.release(acquired.value));
+  }
+  const editor = access?.();
+  if (!editor) return Result.err({ code: "target_unavailable" as const });
+  const response = await Nexus.safeCall(editor.acquireWrite(id));
+  if (response.isErr()) return Result.err({ code: "page_failed" as const });
+  const acquired = await documentWriteResultCodec.deserialize(response.value);
+  if (acquired.isErr()) return acquired;
+  const token = acquired.value;
+  return Result.ok(async () => {
+    const released = await Nexus.safeCall(editor.releaseWrite(token));
+    if (released.isErr()) return Result.err({ code: "page_failed" as const });
+    return documentWriteReleaseResultCodec.deserialize(released.value);
+  });
+}
+
+export function createArticleFieldsService(
+  document: Document,
+  validateTarget: () => boolean,
+  editorAccess?: EditorAccess,
+) {
   const executorId = crypto.randomUUID();
   const entries = new Map<
     string,
@@ -724,14 +766,12 @@ export function createArticleFieldsService(document: Document, validateTarget: (
       receipt?: FieldsReceipt;
     }
   >();
-  const originalRoute = appmsgRouteIdentity(document.location.href);
-  let updateQueue = Promise.resolve();
+  const sameRoute = createEditorRouteValidator(document);
   const guardedRead = (): import("better-result").Result<
     import("../src/mp/article-fields").ArticleFields,
     { code: string }
   > => {
-    if (!originalRoute || appmsgRouteIdentity(document.location.href) !== originalRoute)
-      return Result.err({ code: "route_changed" as const });
+    if (!sameRoute()) return Result.err({ code: "route_changed" as const });
     if (detectLoginTimeout(document).state === "not_logged_in")
       return Result.err({ code: "not_logged_in" as const });
     if (!validateTarget()) return Result.err({ code: "target_unavailable" as const });
@@ -739,7 +779,7 @@ export function createArticleFieldsService(document: Document, validateTarget: (
     if (Result.isError(fields)) return fields;
     if (detectLoginTimeout(document).state === "not_logged_in")
       return Result.err({ code: "not_logged_in" as const });
-    if (!validateTarget() || appmsgRouteIdentity(document.location.href) !== originalRoute)
+    if (!validateTarget() || !sameRoute())
       return Result.err({ code: "target_unavailable" as const });
     return fields;
   };
@@ -799,16 +839,11 @@ export function createArticleFieldsService(document: Document, validateTarget: (
           }),
         };
       entries.set(id, entry);
-      const previous = updateQueue;
-      let release!: () => void;
-      const node = new Promise<void>((done) => {
-        release = done;
-      });
-      updateQueue = previous.then(() => node);
       void run().then(resolve);
       return entry.task;
       async function run() {
         let receipt: FieldsReceipt | undefined;
+        let release: (() => Promise<unknown>) | undefined;
         try {
           const requestDigest = await fieldsRequestDigest(validated.unwrap(), expectedHash);
           receipt = {
@@ -819,7 +854,13 @@ export function createArticleFieldsService(document: Document, validateTarget: (
             ended: false,
           };
           entry.receipt = receipt;
-          await previous;
+          const acquired = await acquireDocument(document, editorAccess, id);
+          if (acquired.isErr()) {
+            receipt.ended = true;
+            receipt.result = { status: "error", error: acquired.error };
+            return encodeServiceResult(articleFieldUpdateResultCodec, Result.ok(receipt));
+          }
+          release = acquired.value;
           const refuse = (code: Failure["code"]) => {
             receipt!.ended = true;
             receipt!.result = {
@@ -848,11 +889,7 @@ export function createArticleFieldsService(document: Document, validateTarget: (
                     document,
                     validated.unwrap(),
                     () => {
-                      if (
-                        !originalRoute ||
-                        appmsgRouteIdentity(document.location.href) !== originalRoute
-                      )
-                        return Result.err({ code: "route_changed" as const });
+                      if (!sameRoute()) return Result.err({ code: "route_changed" as const });
                       if (detectLoginTimeout(document).state === "not_logged_in")
                         return Result.err({ code: "not_logged_in" as const });
                       if (!validateTarget())
@@ -879,14 +916,18 @@ export function createArticleFieldsService(document: Document, validateTarget: (
           };
           return encodeServiceResult(articleFieldUpdateResultCodec, Result.ok(receipt));
         } finally {
-          release();
+          if (receipt?.ended) await release?.();
         }
       }
     },
   };
 }
 
-export function createMaterialPageService(document: Document, validateTarget: () => boolean) {
+export function createMaterialPageService(
+  document: Document,
+  validateTarget: () => boolean,
+  editorAccess?: EditorAccess,
+) {
   const executorId = crypto.randomUUID();
   const entries = new Map<
     string,
@@ -901,10 +942,9 @@ export function createMaterialPageService(document: Document, validateTarget: ()
       receipt?: import("../src/background-contracts").UploadReceipt;
     }
   >();
-  const route = appmsgRouteIdentity(document.location.href);
+  const sameRoute = createEditorRouteValidator(document);
   const guard = () => {
-    if (!route || appmsgRouteIdentity(document.location.href) !== route)
-      return Result.err({ code: "route_changed" as const });
+    if (!sameRoute()) return Result.err({ code: "route_changed" as const });
     if (detectLoginTimeout(document).state === "not_logged_in")
       return Result.err({ code: "not_logged_in" as const });
     if (!validateTarget()) return Result.err({ code: "target_unavailable" as const });
@@ -912,7 +952,18 @@ export function createMaterialPageService(document: Document, validateTarget: ()
   };
   return {
     async list() {
+      const acquired = await acquireDocument(
+        document,
+        editorAccess,
+        `op:${crypto.randomUUID()}:${crypto.randomUUID()}`,
+      );
+      if (acquired.isErr())
+        return encodeServiceResult(
+          materialListResultCodec,
+          Result.err({ code: "library_open_unknown" }),
+        );
       const result = await listMaterials(document, guard);
+      if (result.isOk() || result.error.ended) await acquired.value();
       return encodeServiceResult(materialListResultCodec, result);
     },
     identity() {
@@ -975,9 +1026,16 @@ export function createMaterialPageService(document: Document, validateTarget: ()
           return reject(v.isValiError(error) ? "invalid_asset" : "hash_failed");
         }
         entry.receipt = receipt;
+        const acquired = await acquireDocument(document, editorAccess, id);
+        if (acquired.isErr()) {
+          receipt.ended = true;
+          receipt.result = { status: "error", error: acquired.error };
+          return encodeServiceResult(materialUploadResultCodec, Result.ok(receipt));
+        }
         await uploadMaterial(document, payload, guard, (observation) =>
           Object.assign(receipt, observation),
         );
+        if (receipt.ended) await acquired.value();
         return encodeServiceResult(materialUploadResultCodec, Result.ok(receipt));
       }
     },
@@ -996,13 +1054,12 @@ export function createArticleCoverPageService(
     string,
     { signature: string; task: Promise<unknown>; receipt?: CoverReceipt | SaveReceipt }
   >();
-  const route = appmsgRouteIdentity(document.location.href);
+  const sameRoute = createEditorRouteValidator(document);
   const guard = (): import("better-result").Result<
     void,
     { code: "route_changed" | "not_logged_in" | "target_unavailable" }
   > => {
-    if (!route || appmsgRouteIdentity(document.location.href) !== route)
-      return Result.err({ code: "route_changed" });
+    if (!sameRoute()) return Result.err({ code: "route_changed" });
     if (detectLoginTimeout(document).state === "not_logged_in")
       return Result.err({ code: "not_logged_in" });
     if (!validateTarget()) return Result.err({ code: "target_unavailable" });
@@ -1115,9 +1172,16 @@ export function createArticleCoverPageService(
           ended: false,
         };
         entry.receipt = receipt;
+        const acquired = await acquireDocument(document, existingEditor, execution.operationId);
+        if (acquired.isErr()) {
+          receipt.ended = true;
+          receipt.result = { status: "error", error: acquired.error };
+          return encodeServiceResult(coverWriteResultCodec, Result.ok(receipt));
+        }
         await setArticleCover(document, candidate, expectedHash, guard, (observation) =>
           Object.assign(receipt, observation),
         );
+        if (receipt.ended) await acquired.value();
         return encodeServiceResult(coverWriteResultCodec, Result.ok(receipt));
       }
     },
@@ -1157,9 +1221,52 @@ export function createArticleCoverPageService(
           ended: false,
         };
         entry.receipt = receipt;
+        const acquired = await acquireDocument(document, existingEditor, execution.operationId);
+        if (acquired.isErr()) {
+          receipt.ended = true;
+          receipt.result = { status: "error", error: acquired.error };
+          return encodeServiceResult(saveWriteResultCodec, Result.ok(receipt));
+        }
+        // The BG snapshot precedes this reservation. Recheck at the actual
+        // document owner so intervening BODY/fields/cover edits cannot be saved.
+        const editor = existingEditor?.();
+        if (editor) {
+          const contentWire = await Nexus.safeCall(editor.getContent());
+          const content = contentWire.isOk()
+            ? await (
+                await import("../src/page-contracts")
+              ).pageEditorContentResultCodec.deserialize(contentWire.value)
+            : Result.err({ code: "page_failed" as const });
+          const fields = readArticleFields(document);
+          const image = await read();
+          const bodyHash = content.isOk() ? await hashBody(content.value) : content;
+          const fieldsHash = fields.isOk() ? await hashArticleFields(fields.value) : fields;
+          if (
+            bodyHash.isErr() ||
+            fieldsHash.isErr() ||
+            image.isErr() ||
+            bodyHash.value !== execution.expectedBodyHash ||
+            fieldsHash.value !== execution.expectedFieldsHash ||
+            image.value !== execution.expectedCoverHash
+          ) {
+            receipt.ended = true;
+            receipt.result = {
+              status: "error",
+              error: {
+                code:
+                  bodyHash.isErr() || fieldsHash.isErr() || image.isErr()
+                    ? "page_failed"
+                    : "content_conflict",
+              },
+            };
+            await acquired.value();
+            return encodeServiceResult(saveWriteResultCodec, Result.ok(receipt));
+          }
+        }
         await saveNativeArticle(document, guard, {
           publish: (observation) => Object.assign(receipt, observation),
         });
+        if (receipt.ended) await acquired.value();
         return encodeServiceResult(saveWriteResultCodec, Result.ok(receipt));
       }
     },

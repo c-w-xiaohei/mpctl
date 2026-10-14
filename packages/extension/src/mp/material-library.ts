@@ -166,7 +166,19 @@ export async function readMaterialLibrary(
   if (Result.isError(beforeSnapshot)) return beforeSnapshot;
   if (beforeSnapshot.value !== current || !isBodyDialog(current))
     return Result.err({ code: "dialog_unavailable" });
-  const cards = readMaterialCards(current, maxVisibleCards);
+  let cards = readMaterialCards(current, maxVisibleCards);
+  // The native dialog mounts before its first file-page response. Do not
+  // close it immediately and report that transient empty view as the list.
+  const deadline = Date.now() + 1_500;
+  while (cards.isOk() && cards.value.length === 0 && Date.now() < deadline) {
+    const checked = guard();
+    if (checked.isErr()) return checked;
+    const observed = observeDialog(document);
+    if (observed.isErr()) return observed;
+    if (observed.value !== current) return Result.err({ code: "dialog_unavailable" });
+    await delay(50);
+    cards = readMaterialCards(current, maxVisibleCards);
+  }
   if (Result.isError(cards)) return Result.err({ code: cards.error.code });
   const afterRead = guard();
   if (Result.isError(afterRead)) return Result.err(afterRead.error);

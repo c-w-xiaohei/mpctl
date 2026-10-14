@@ -15,6 +15,7 @@ function makePage(
     newCardFilename?: string;
     newCardUntitledThenNamedAfterMs?: number;
     createCardOnChange?: boolean;
+    replaceInputOnChange?: boolean;
     onNewCardTitleRead?: () => void;
     setter?: (file: TestFile) => void;
   } = {},
@@ -86,6 +87,7 @@ function makePage(
             setTimeout(() => card.setTitle?.(filename), options.newCardUntitledThenNamedAfterMs);
         }
         assigned = undefined; // The page may clear the control after handling the file.
+        if (options.replaceInputOnChange) input.isConnected = false;
       }
       return true;
     },
@@ -179,6 +181,16 @@ const payload = (filename = "new-image.png") => ({
 });
 
 describe("uploadAsset", () => {
+  test("observes the uploaded card after WebUploader consumes and replaces its input", async () => {
+    const page = makePage({ replaceInputOnChange: true, newCardUntitledThenNamedAfterMs: 10 });
+    const result = await uploadAsset(page.document, payload(), guard, { timeoutMs: 200 });
+    expect(result).toMatchObject({
+      effect: { outcome: "confirmed", filename: "new-image.png" },
+      ended: true,
+    });
+    expect(page.input.isConnected).toBe(false);
+    expect(page.changeCount).toBe(1);
+  });
   test("confirms the new filename card even when the page clears input.files after change", async () => {
     const page = makePage();
     const published: import("../src/mp/asset-upload").AssetUploadObservation[] = [];
@@ -301,7 +313,7 @@ describe("uploadAsset", () => {
     expect(page.changeCount).toBe(1);
   });
 
-  test("returns unknown promptly if the file input disconnects while a post-dispatch card is malformed", async () => {
+  test("keeps observing a malformed card after the consumed input disconnects", async () => {
     let input: ReturnType<typeof makePage>["input"] | undefined;
     const page = makePage({
       newCardFilename: "",
@@ -318,7 +330,8 @@ describe("uploadAsset", () => {
         status: "error",
         error: {
           code: "asset_upload_unknown",
-          cause: { at: "content.upload_confirm", code: "dialog_or_input_changed" },
+          cause: { at: "content.upload_confirm", code: "card_title_empty" },
+          confirmationTimedOut: true,
         },
       },
       effect: { outcome: "unknown" },

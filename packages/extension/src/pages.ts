@@ -1,7 +1,7 @@
 import { chromeTarget } from "@nexus-js/chrome";
 import { Nexus, NexusError, type Connection, type RemoteValue } from "@nexus-js/core";
 import { Result, type Result as BetterResult } from "better-result";
-import { type ArticleNavigationStage } from "@mpctl/contracts";
+import { assetUploadTimeouts, type ArticleNavigationStage } from "@mpctl/contracts";
 import { backgroundNexus, hasPreparationVersion } from "./background-runtime";
 
 import {
@@ -9,6 +9,7 @@ import {
   pageEditorReadyResultCodec,
   pageEditorContentResultCodec,
   pageEditorWriteResultCodec,
+  assetImagePageResultCodec,
   type PageEditorService,
 } from "./page-contracts";
 import { pageEditorReceiptResultCodec, type BodyReceipt } from "./page-contracts";
@@ -1774,6 +1775,11 @@ export function createPageManager(
           if (!current.value || classifyAppmsgUrl(source.url).kind !== "draft-list")
             return pageErr({ code: "target_unavailable" });
 
+          const sourceStatus = await this.pageStatus(source);
+          if (sourceStatus.isErr()) return pageErr(sourceStatus.error);
+          if (sourceStatus.value.state === "not_logged_in")
+            return this.ensureDraftList({}, progress);
+
           const reloaded = await reloadObservedSource(
             "draft-list",
             group.value,
@@ -1810,7 +1816,7 @@ export function createPageManager(
             const stillCurrent = await this.isCurrent(binding);
             if (Result.isError(stillCurrent)) return pageErr(stillCurrent.error);
             if (!stillCurrent.value) return pageErr({ code: "target_unavailable" });
-            if (status.value.state === "not_logged_in") return pageErr({ code: "not_logged_in" });
+            if (status.value.state === "not_logged_in") return this.ensureDraftList({}, progress);
             if (status.value.state === "ready" && status.value.documentReady) {
               progress?.sourceReady(binding);
               return pageOk(binding);
@@ -3155,6 +3161,16 @@ export function createPageManager(
         });
       }
     },
+    async resolveImage(
+      binding: PageBinding,
+      candidate: { filename: string; thumbnailUrl: string },
+    ) {
+      const connected = await this.connectContent(binding);
+      if (connected.isErr()) return connected;
+      return decodeRemote(assetImagePageResultCodec, () =>
+        connected.value.get(pageEditorToken).resolveImage(candidate),
+      );
+    },
     async listMaterials(binding: PageBinding, onInvoke?: () => void) {
       const connected = await this.connectContent(binding);
       if (Result.isError(connected)) return pageErr({ ...connected.error, ended: true });
@@ -3180,11 +3196,13 @@ export function createPageManager(
         return mutationReply(
           materialUploadResultCodec,
           () => {
-            const acquired = connected.value.safeGet(materialPageToken, { callTimeout: 20_000 });
+            const acquired = connected.value.safeGet(materialPageToken, {
+              callTimeout: assetUploadTimeouts.page,
+            });
             if (acquired.isErr()) throw acquired.error;
             return acquired.value.upload(payload, execution);
           },
-          20_000,
+          assetUploadTimeouts.page,
         );
       } catch (error) {
         return Result.err({

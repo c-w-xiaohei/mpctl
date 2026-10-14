@@ -60,18 +60,18 @@ for (const completed of [false, true])
             if (completed) f.manager.observe({ ...list, documentId: "docC" });
           };
           const reply = await f.workspace.listArticles();
-          const pending = (await f.operations.pending()).unwrap();
           const counts = { ...f.counters };
           const reopened = (await createOperations(f.database)).unwrap();
-          const snapshot = pending[0]
-            ? (await reopened.get(pending[0].snapshot.operationId)).unwrap().snapshot
-            : undefined;
-          const blocked = await reopened.maintenance(async () => {});
+          const admitted = await reopened.claim({
+            operationId: f.id(),
+            operation: "body",
+            requestDigest: "a".repeat(64),
+            localRequestDigest: "b".repeat(64),
+            effect: { outcome: "not_dispatched" },
+          });
           return {
             reply,
-            pending: pending.length,
-            snapshot,
-            blocked: blocked.isErr(),
+            admitted: admitted.isOk() && admitted.value.acquired,
             counts,
             after: f.counters,
           };
@@ -79,8 +79,7 @@ for (const completed of [false, true])
           f.dispose();
         }
       }, completed);
-      expect(result.pending).toBe(completed ? 0 : 1);
-      expect(result.blocked).toBe(!completed);
+      expect(result.admitted).toBe(true);
       expect(result.counts).toEqual({
         create: 0,
         group: 1,
@@ -90,7 +89,7 @@ for (const completed of [false, true])
         set: 0,
       });
       if (!completed) {
-        expect(result.snapshot.state).toBe("unresolved");
+        expect(result.reply.status).toBe("error");
         expect(result.after).toEqual(result.counts);
       } else expect(result.reply.status).toBe("ok");
     } finally {
@@ -183,7 +182,6 @@ for (const saved of [false, true])
           blocked,
           cleanupQueries,
           counts,
-          pending: (await f.operations.pending()).unwrap().length,
           realOpen: state.realOpen,
           clicks: state.clicks,
         };
@@ -192,7 +190,6 @@ for (const saved of [false, true])
         state: "settled",
         effect: { pageCreated: true, targetBound: true, bodyHash: expect.any(String) },
       });
-      expect(before.pending).toBe(0);
       expect(before.realOpen).toBe(0);
       expect(before.clicks).toBe(0);
       expect(before.blocked.status).toBe("ok");
@@ -270,14 +267,12 @@ test("F1 saved valid href is actual zero-dispatch end positive control", async (
             await f.workspace.openArticle({ operationId: f.id(), candidate: "A" }),
           ),
           clicks,
-          pending: (await f.operations.pending()).unwrap().length,
         };
       } finally {
         f.dispose();
       }
     });
     expect(reply.clicks).toBe(0);
-    expect(reply.pending).toBe(0);
     expect(reply.reply.snapshot).toMatchObject({ state: "settled", result: { status: "ok" } });
   } finally {
     await browser.close();
@@ -458,25 +453,27 @@ test("F2 native IDB original list reload remains unresolved across HOME fallback
         const before = { ...f.counters };
         const reopened = (await createOperations(f.database)).unwrap();
         const status = (await reopened.get(input.operationId)).unwrap();
-        const blocked = await reopened.maintenance(async () => {
-          throw new Error("must not reload");
+        const admitted = await reopened.claim({
+          operationId: f.id(),
+          operation: "body",
+          requestDigest: "a".repeat(64),
+          localRequestDigest: "b".repeat(64),
+          effect: { outcome: "not_dispatched" },
         });
         return {
           first,
           status,
           before,
           after: f.counters,
-          blocked: blocked.isErr(),
-          pending: (await reopened.pending()).unwrap().length,
+          admitted: admitted.isOk() && admitted.value.acquired,
         };
       } finally {
         f.dispose();
       }
     });
-    expect(result.first.snapshot.state).toBe("unresolved");
+    expect(result.first.snapshot.state).toBe("settled");
     expect(result.status.snapshot).toEqual(result.first.snapshot);
-    expect(result.pending).toBe(1);
-    expect(result.blocked).toBe(true);
+    expect(result.admitted).toBe(true);
     expect(result.before).toEqual({ create: 0, group: 1, capture: 0, reload: 1, read: 0, set: 0 });
     expect(result.after).toEqual(result.before);
   } finally {

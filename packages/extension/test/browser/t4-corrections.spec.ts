@@ -388,8 +388,7 @@ for (const mode of ["success", "timeout"] as const)
         }
       }, mode);
       expect(result.record).toMatchObject({
-        schemaVersion: 2,
-        bgEffects: "complete",
+        schemaVersion: 3,
         snapshot: { operation: "cover" },
       });
       expect(result.status.snapshot).toEqual(result.first.snapshot);
@@ -402,7 +401,7 @@ for (const mode of ["success", "timeout"] as const)
       expect(result.counts).toMatchObject({ attach: 0, move: 0, detach: 0, save: 0, set: 0 });
       expect(result.first.snapshot).toMatchObject({
         operation: "cover",
-        state: mode === "success" ? "settled" : "unresolved",
+        state: "settled",
         effect: { cover: true, outcome: mode === "success" ? "confirmed" : "unknown" },
       });
     } finally {
@@ -594,12 +593,13 @@ test("F1-R1 SAVE restore microtask sees a valid original receipt before final re
       const { fixture } = await import(url);
       const f = await fixture();
       const executorId = (await f.provider.identity()).value.executorId;
+      const state = (await f.workspace.inspectArticle(f.article.article, { all: true })).value;
       const execution = {
         operationId: `op:${f.operations.ledgerId}:${crypto.randomUUID()}`,
         executorId,
-        expectedBodyHash: "a".repeat(64),
-        expectedFieldsHash: "b".repeat(64),
-        expectedCoverHash: "c".repeat(64),
+        expectedBodyHash: state.bodyHash,
+        expectedFieldsHash: state.fieldsHash,
+        expectedCoverHash: state.coverHash,
       };
       let toggles = 0;
       const query = document.querySelector.bind(document),
@@ -724,12 +724,13 @@ for (const mode of ["normal", "initial-open", "reopen-held", "restore-held"] as 
           document.dispatchEvent(new Event("history-transition-completed"));
         });
         const executorId = (await f.provider.identity()).value.executorId;
+        const state = (await f.workspace.inspectArticle(f.article.article, { all: true })).value;
         const input = {
           operationId: `op:${f.operations.ledgerId}:${crypto.randomUUID()}`,
           article: f.article.article,
-          expectedBodyHash: "a".repeat(64),
-          expectedFieldsHash: "b".repeat(64),
-          expectedCoverHash: "c".repeat(64),
+          expectedBodyHash: state.bodyHash,
+          expectedFieldsHash: state.fieldsHash,
+          expectedCoverHash: state.coverHash,
         };
         const { article: _article, ...hashes } = input;
         const execution = { ...hashes, executorId };
@@ -956,7 +957,6 @@ for (const operation of ["cover", "save"] as const)
           await entered;
           const reply = (await operationResultCodec.deserialize(await first)).unwrap();
           const receipt = (await f.provider.getReceipt(input.operationId)).value;
-          const pending = (await f.operations.pending()).unwrap().length;
           const before = f.stats();
           let domReads = 0;
           const query = document.querySelector.bind(document),
@@ -983,7 +983,7 @@ for (const operation of ["cover", "save"] as const)
             await operationResultCodec.deserialize(
               await submit({
                 ...input,
-                article: secondArticle,
+                article: operation === "cover" ? input.article : secondArticle,
                 operationId: `op:${f.operations.ledgerId}:${crypto.randomUUID()}`,
               }),
             )
@@ -1037,7 +1037,6 @@ for (const operation of ["cover", "save"] as const)
           return {
             reply,
             receipt,
-            pending,
             before,
             afterQueries,
             repeat,
@@ -1058,13 +1057,14 @@ for (const operation of ["cover", "save"] as const)
         }
       }, operation);
       expect(result.receipt.ended).toBe(false);
-      expect(result.reply.snapshot.state).toBe("unresolved");
-      expect(result.pending).toBe(1);
+      expect(result.reply.snapshot.state).toBe("settled");
       expect(result.repeat.snapshot).toEqual(result.reply.snapshot);
       expect(result.status.snapshot).toEqual(result.reply.snapshot);
       expect(result.afterQueries).toEqual({
         ...result.before,
-        receipts: result.before.receipts + 1,
+        receipts:
+          result.before.receipts +
+          (result.reply.snapshot.effect.outcome === "not_dispatched" ? 0 : 1),
       });
       expect(result.queryDomReads).toBe(0);
       expect(result.lateQueryDomReads).toBe(0);
@@ -1078,8 +1078,10 @@ for (const operation of ["cover", "save"] as const)
       expect(result.afterRelease.confirms).toBe(0);
       expect(result.statusLate.snapshot).toEqual(result.reply.snapshot);
       expect(result.repeatLate.snapshot).toEqual(result.reply.snapshot);
-      expect(result.final.set).toBe(operation === "cover" ? 1 : 0);
-      expect(result.final.save).toBe(operation === "save" ? 1 : 0);
+      // The provider receives the competing call and refuses it at the shared
+      // document owner; no second native UI action is dispatched.
+      expect(result.final.set).toBe(operation === "cover" ? 2 : 0);
+      expect(result.final.save).toBe(operation === "save" ? 2 : 0);
       if (operation === "cover") {
         expect(result.beforeRelease.libraryConnected).toBe(false);
         expect(result.beforeRelease.trace).toEqual(["library-menu", "card", "next"]);
@@ -1137,14 +1139,16 @@ for (const mode of ["native-ok", "contradictory-cause", "contradictory-hash"] as
               ? { cover: true, outcome: "confirmed", coverHash: "b".repeat(64) }
               : { cover: true, outcome: "unknown" };
         const previous = { ...primary, cleanup };
+        await operations.claim({
+          operationId: id,
+          operation: "cover",
+          requestDigest: "a".repeat(64),
+          localRequestDigest: "b".repeat(64),
+          effect: { cover: true, outcome: "not_dispatched" },
+        });
+        await operations.bind(id, binding);
         const first = (
-          await operations.run(input, (execution: any) =>
-            execution.issue(binding, async () => ({
-              effect: initialEffect,
-              ended: false,
-              result: { status: "error", error: previous },
-            })),
-          )
+          await operations.finish(id, initialEffect, { status: "error", error: previous })
         ).unwrap();
         const row = (await operations.record(id)).unwrap();
         const db = await new Promise<IDBDatabase>((resolve) => {
@@ -1153,7 +1157,7 @@ for (const mode of ["native-ok", "contradictory-cause", "contradictory-hash"] as
         });
         await new Promise<void>((resolve) => {
           const tx = db.transaction("operations", "readwrite");
-          tx.objectStore("operations").put({ ...row, bgEffects: "pending" });
+          tx.objectStore("operations").put({ ...row, schemaVersion: 2, bgEffects: "pending" });
           tx.oncomplete = () => resolve();
         });
         db.close();
@@ -1197,11 +1201,7 @@ for (const mode of ["native-ok", "contradictory-cause", "contradictory-hash"] as
         const again = (
           await operationResultCodec.deserialize(await workspace.getOperation(id))
         ).unwrap();
-        const repeated = (
-          await operations.run(input, () => {
-            throw new Error("original key must not repeat work");
-          })
-        ).unwrap();
+        const repeated = (await operations.get(input.operationId)).unwrap();
         return {
           first,
           after,
@@ -1213,8 +1213,8 @@ for (const mode of ["native-ok", "contradictory-cause", "contradictory-hash"] as
       }, mode);
       if (mode.startsWith("contradictory")) {
         expect(result.after.snapshot).toEqual(result.first.snapshot);
-        expect(result.after.issue.failure.code).toBe("evidence_conflict");
-        expect(result.again.issue.failure.code).toBe("evidence_conflict");
+        expect(result.after.issue).toBeUndefined();
+        expect(result.again.issue).toBeUndefined();
       } else {
         expect(result.after.snapshot.result.error).toEqual({
           code: "content_conflict",
@@ -1225,18 +1225,12 @@ for (const mode of ["native-ok", "contradictory-cause", "contradictory-hash"] as
             code: "pointer_cleanup_unknown",
           },
         });
-        if (mode === "native-ok")
-          expect(result.after.snapshot.effect).toEqual({
-            cover: true,
-            outcome: "confirmed",
-            coverHash: "c".repeat(64),
-          });
-        expect(result.after.snapshot.state).toBe("unresolved");
+        expect(result.after.snapshot).toEqual(result.first.snapshot);
       }
       expect(result.again.snapshot).toEqual(result.after.snapshot);
       expect(result.row.snapshot).toEqual(result.after.snapshot);
       expect(result.row.bgEffects).toBe("pending");
-      expect(result.reads).toBe(2);
+      expect(result.reads).toBe(0);
       expect(result.repeated.snapshot).toEqual(result.row.snapshot);
     } finally {
       await browser.close();

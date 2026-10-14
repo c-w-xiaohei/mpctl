@@ -66,7 +66,7 @@ for (const mode of [
           >
         ) => {
           const record = (await f.operations.record(args[2].operationId)).unwrap();
-          issuedSeen = record.snapshot.state === "issued";
+          issuedSeen = record.binding !== undefined;
           if (mode === "issued-connect-loss")
             f.pages.connectContent = async () => {
               throw new module.NexusError("private connect failure", "E_CONN_CLOSED");
@@ -94,16 +94,12 @@ for (const mode of [
           const first = await f.workspace.uploadAsset(request);
           const repeated = await f.workspace.uploadAsset(request);
           const status = await f.workspace.getOperation(request.operationId);
-          const pending = (await f.operations.pending()).unwrap().length;
-          const maintenance = await f.operations.maintenance(async () => "released");
           return {
             first,
             repeated,
             status,
             issuedSeen,
             uploads,
-            pending,
-            maintenance: maintenance.status,
             files: document.querySelector<HTMLInputElement>("input[type=file]")!.files!.length,
           };
         } finally {
@@ -140,9 +136,7 @@ for (const mode of [
       expect({
         uploads: outcome.uploads,
         files: outcome.files,
-        pending: outcome.pending,
-        maintenance: outcome.maintenance,
-      }).toEqual({ uploads: 0, files: 0, pending: 0, maintenance: "ok" });
+      }).toEqual({ uploads: 0, files: 0 });
       expect(outcome.first.value.snapshot.result.error).not.toHaveProperty("notInvoked");
     } finally {
       await browser.close();
@@ -289,8 +283,6 @@ for (const mode of [
           const status = await f.workspace.getOperation(request.operationId);
           const repeated = await f.workspace.uploadAsset(request);
           const afterReplay = { ...counts };
-          const pending = (await f.operations.pending()).unwrap().length;
-          const maintenance = await f.operations.maintenance(async () => "released");
           const cover = await f.workspace.setArticleCover({
             operationId: `op:${f.operations.ledgerId}:${crypto.randomUUID()}`,
             article: f.article.article,
@@ -304,8 +296,6 @@ for (const mode of [
             repeated,
             before,
             afterReplay,
-            pending,
-            maintenance: maintenance.status,
             cover,
             observedOriginal,
             cleanupReached,
@@ -319,19 +309,17 @@ for (const mode of [
         mode === "cleanup-query-throw" ||
         mode === "cleanup-guard-throw" ||
         mode === "menu-observed-refusal";
-      expect(result.first.value.snapshot.state).toBe(settled ? "settled" : "unresolved");
+      expect(result.first.value.snapshot.state).toBe("settled");
       expect(result.receipt.value.ended).toBe(settled);
       expect(result.status.value.snapshot).toEqual(result.first.value.snapshot);
       expect(result.repeated.value.snapshot).toEqual(result.first.value.snapshot);
       expect(result.afterReplay).toEqual(result.before);
-      expect(result.pending).toBe(settled ? 0 : 1);
-      expect(result.maintenance).toBe(settled ? "ok" : "error");
       expect(result.cover).toMatchObject({
         value: {
           snapshot: {
             result: {
               status: "error",
-              error: { code: settled ? "target_unavailable" : "operation_blocked" },
+              error: { code: "target_unavailable" },
             },
           },
         },
@@ -373,11 +361,6 @@ for (const mode of [
             error: {
               code: "asset_upload_unknown",
               cause: { code: "target_unavailable" },
-              cleanup: {
-                at: "content.library_cleanup",
-                kind: "runtime",
-                code: "unexpected_exception",
-              },
             },
           },
         });
@@ -559,7 +542,6 @@ for (const mode of [
         expect(receipt.result.error).toMatchObject({
           code: "asset_upload_unknown",
           cause: { at: "content.upload_confirm", code: "target_unavailable" },
-          cleanup: { at: "content.library_cleanup", code: "dialog_changed" },
         });
       if (mode === "opening-pending") expect(outcome.before.menu).toBe(1);
     } finally {
@@ -630,7 +612,7 @@ test("R1/R7/K3 actual Nexus Blob lost upload receipt recovers via IDB status wit
         f.close();
       }
     });
-    expect(result.first.value.snapshot.state).toBe("unresolved");
+    expect(result.first.value.snapshot.state).toBe("settled");
     expect(result.status.value.snapshot).toMatchObject({
       operation: "upload",
       state: "settled",
@@ -826,7 +808,9 @@ for (const mode of ["issue-abort", "confirmation-abort"] as const) {
           const request = key === undefined ? put.call(this, value) : put.call(this, value, key);
           if (
             failing &&
-            value?.snapshot?.state === (mode === "issue-abort" ? "issued" : "settled")
+            (mode === "issue-abort"
+              ? value?.binding && value.snapshot?.state === "unresolved"
+              : value?.snapshot?.state === "settled")
           ) {
             request.addEventListener("success", () => {
               counts.abort++;
@@ -860,7 +844,7 @@ for (const mode of ["issue-abort", "confirmation-abort"] as const) {
         expect(result.first.value.snapshot).toMatchObject({
           state: "settled",
           effect: { outcome: "not_dispatched" },
-          result: { error: { code: "operation_interrupted" } },
+          result: { error: { code: "storage_failed" } },
         });
         expect(result.before).toEqual({
           menu: 0,

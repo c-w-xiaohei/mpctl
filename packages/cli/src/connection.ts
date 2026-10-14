@@ -21,6 +21,7 @@ import {
   type ArticleOpenInput,
   type ArticleCurrentInput,
   articleNavigationTimeoutMs,
+  assetUploadTimeouts,
   type OperationReply,
   type InteractionIssue,
   articleFieldsResultCodec,
@@ -97,7 +98,14 @@ type DecodedWorkspace = {
   ): Promise<Outcome<import("@mpctl/contracts").ArticleInspection>>;
   updateArticleFields(input: UpdateFieldsInput): Promise<Outcome<OperationReply>>;
   checkArticle(article: string): Promise<Outcome<import("@mpctl/contracts").ArticleCheckResult>>;
-  listAssets(article: string): Promise<Outcome<import("@mpctl/contracts").AssetList>>;
+  listAssets(
+    article: string,
+    options?: { operation: string },
+  ): Promise<Outcome<import("@mpctl/contracts").AssetList>>;
+  resolveAsset(
+    article: string,
+    asset: string,
+  ): Promise<Outcome<import("@mpctl/contracts").AssetImage>>;
   uploadAsset(input: AssetUploadInput): Promise<Outcome<OperationReply>>;
   readArticleCover(article: string): Promise<Outcome<{ coverHash: string }>>;
   setArticleCover(input: ArticleCoverSetInput): Promise<Outcome<OperationReply>>;
@@ -304,7 +312,8 @@ export async function withBroker<T>(
           return {
             cleanupWorkspace: () =>
               decode(cleanupWorkspaceResultCodec, () => workspace.cleanupWorkspace()),
-            listArticles: () => decode(listArticlesResultCodec, () => workspace.listArticles()),
+            listArticles: () =>
+              decode(listArticlesResultCodec, () => workspace.listArticles(), true),
             openArticle: (input) =>
               decodeOperation(() => workspace.openArticle(input), input.operationId),
             newArticle: (input) =>
@@ -328,8 +337,14 @@ export async function withBroker<T>(
               decodeOperation(() => workspace.updateArticleFields(input), input.operationId),
             checkArticle: (article) =>
               decode(articleCheckResultCodec, () => workspace.checkArticle(article), true),
-            listAssets: (article) =>
-              decode(assetListResultCodec, () => workspace.listAssets(article), true),
+            listAssets: (article, options) =>
+              decode(assetListResultCodec, () => workspace.listAssets(article, options), true),
+            resolveAsset: async (article, asset) =>
+              decode(
+                (await import("@mpctl/contracts")).assetImageResultCodec,
+                () => workspace.resolveAsset(article, asset),
+                true,
+              ),
             uploadAsset: (input) =>
               decodeOperation(() => workspace.uploadAsset(input), input.operationId),
             readArticleCover: (article) =>
@@ -568,10 +583,19 @@ async function decodeOperation(
     const diagnostic: InteractionIssue =
       "failure" in decoded.error ? decoded.error : { operationId, failure: decoded.error };
     return Result.err(
-      cliError(diagnostic.failure.code, `查询 operation status '${operationId}'；不要换键重做。`, {
-        operationId,
-        issue: diagnostic,
-      }),
+      cliError(
+        diagnostic.failure.code,
+        operationInstruction(
+          diagnostic.failure.code,
+          operationId,
+          diagnostic.uncommitted?.effect.outcome,
+          diagnostic.failure.blockingOperationId,
+        ),
+        {
+          operationId,
+          issue: diagnostic,
+        },
+      ),
     );
   } catch (error) {
     return Result.err(
@@ -603,12 +627,55 @@ export function operationOutcome(reply: OperationReply, query: boolean): Outcome
       ? snapshot.result.error.code
       : (reply.issue?.failure.code ?? "operation_unresolved");
   return Result.err(
-    cliError(code, `查询 operation status '${snapshot.operationId}'；不要换键重做。`, {
-      operationId: snapshot.operationId,
-      snapshot,
-      ...(reply.issue ? { issue: reply.issue } : {}),
-    }),
+    cliError(
+      code,
+      operationInstruction(
+        code,
+        snapshot.operationId,
+        snapshot.effect.outcome,
+        "result" in snapshot && snapshot.result.status === "error"
+          ? snapshot.result.error.blockingOperationId
+          : undefined,
+      ),
+      {
+        operationId: snapshot.operationId,
+        snapshot,
+        ...(reply.issue ? { issue: reply.issue } : {}),
+      },
+    ),
   );
+}
+
+function operationInstruction(
+  code: string,
+  id: string,
+  outcome?: string,
+  blocker?: string,
+): string {
+  if (outcome === "confirmed") return "操作效果已确认；检查附带错误或清理诊断，不要重复执行。";
+  if (outcome === "unknown" || outcome === "partial")
+    return `查询 operation status '${id}' 核对原操作；不要换键重做。`;
+  if (code === "content_conflict")
+    return "本次未写入。重新读取对应正文、字段或封面，核对差异后使用新版本提交。";
+  if (
+    [
+      "invalid_operation",
+      "invalid_payload",
+      "invalid_asset",
+      "invalid_fields",
+      "asset_too_large",
+    ].includes(code)
+  )
+    return "修正输入后再提交；不要用原操作 ID 提交不同输入。";
+  if (code === "operation_conflict")
+    return "原操作 ID 已绑定其他输入；核对原请求，不要修改同一请求的输入。";
+  if (code === "operation_blocked")
+    return blocker
+      ? `本次未执行。查询 operation status '${blocker}' 核对阻塞操作；确认相关执行结束后再提交。`
+      : "本次未执行。等待当前文档的冲突操作结束后再提交。";
+  if (outcome === "not_dispatched")
+    return "本次未执行。按错误检查目标、登录状态或页面控件，修复后再提交。";
+  return `查询 operation status '${id}' 核对原操作；不要换键重做。`;
 }
 
 async function submitOperation(
@@ -695,7 +762,7 @@ export async function submitAsset(
   return submitOperation(
     providedId,
     (workspace, operationId) => workspace.uploadAsset({ ...input, operationId }),
-    20_000,
+    assetUploadTimeouts.cli,
   );
 }
 
