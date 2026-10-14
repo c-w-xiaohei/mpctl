@@ -13,8 +13,13 @@ import { createWorkspace } from "../src/workspace";
 import { createPageManager, restorePagesOnStartup } from "../src/pages";
 import { createReloadControl } from "../src/reload";
 import { createOperations } from "../src/operations";
+import { configureNexusDebug } from "@mpctl/contracts/nexus-debug";
 
 export default defineBackground(() => {
+  configureNexusDebug(
+    "background",
+    import.meta.env.DEV && import.meta.env.VITE_MPCTL_NEXUS_DEBUG !== "0",
+  );
   const reportResult = (scope: string, result: { isErr(): boolean; error?: { code?: string } }) => {
     if (result.isErr()) console.error(`mpctl ${scope} failed: ${result.error?.code ?? "unknown"}`);
   };

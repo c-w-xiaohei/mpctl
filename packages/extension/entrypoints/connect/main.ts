@@ -9,6 +9,12 @@ import {
 } from "@mpctl/contracts";
 import { createPopupControl } from "../../src/popup-control";
 import { connectFromPage, connectionFailureMessage } from "../../src/connection-page";
+import { configureNexusDebug } from "@mpctl/contracts/nexus-debug";
+
+configureNexusDebug(
+  "connect",
+  import.meta.env.DEV && import.meta.env.VITE_MPCTL_NEXUS_DEBUG !== "0",
+);
 
 const report = (scope: string, code: string) => console.error(`mpctl ${scope} failed: ${code}`);
 let activeEndpoint: ReturnType<typeof createPopupConfig>["endpoint"];

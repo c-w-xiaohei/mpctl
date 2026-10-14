@@ -6,6 +6,7 @@ import { Result } from "better-result";
 import { chromeTarget } from "@nexus-js/chrome";
 import { backgroundControlToken } from "../../src/background-contracts";
 import { createPopupControl } from "../../src/popup-control";
+import { configureNexusDebug } from "@mpctl/contracts/nexus-debug";
 import {
   connectResultCodec,
   connectionConfig,
@@ -17,6 +18,8 @@ import {
   saveConnectionSettings,
   type ConnectionSettings,
 } from "../../src/connection";
+
+configureNexusDebug("popup", import.meta.env.DEV && import.meta.env.VITE_MPCTL_NEXUS_DEBUG !== "0");
 
 function Popup() {
   const [settings, setSettings] = useState<ConnectionSettings>({

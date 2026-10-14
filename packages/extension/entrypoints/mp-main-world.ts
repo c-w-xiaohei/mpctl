@@ -7,6 +7,7 @@ import { createEditorTargetValidator } from "../src/mp/editor";
 import { pageEditorToken } from "../src/page-contracts";
 import { createPageEndpoint } from "../src/transport/page-bridge";
 import { Result } from "better-result";
+import { configureNexusDebug } from "@mpctl/contracts/nexus-debug";
 
 type MainBootstrapError = {
   code: "main_startup_failed" | "main_cleanup_failed";
@@ -117,6 +118,10 @@ export async function mountMainWorldBridge(
 }
 
 export default defineUnlistedScript(() => {
+  configureNexusDebug(
+    "main",
+    import.meta.env.DEV && import.meta.env.VITE_MPCTL_NEXUS_DEBUG !== "0",
+  );
   const script = document.currentScript;
   if (script instanceof HTMLScriptElement) {
     void mountMainWorldBridge(script).then(

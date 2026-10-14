@@ -239,7 +239,12 @@ export async function withBroker<T>(
             MPCTL_BROKER_STARTUP_NONCE: startupNonce,
           },
           detached: true,
-          stdio: ["ignore", "ignore", "ignore", "pipe"],
+          stdio: [
+            "ignore",
+            "ignore",
+            process.env.MPCTL_NEXUS_DEBUG === "1" ? "inherit" : "ignore",
+            "pipe",
+          ],
         }),
       catch: () => cliError("broker_start_failed"),
     });

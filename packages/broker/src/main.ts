@@ -4,6 +4,7 @@ import path from "node:path";
 import { Result } from "better-result";
 import type { Result as BetterResult } from "better-result";
 import { createBroker, type Broker } from "./server";
+import { configureNexusDebug } from "@mpctl/contracts/nexus-debug";
 
 export type BrokerStartupError = {
   code:
@@ -111,6 +112,9 @@ async function signalStartupNonce(nonce: string): Promise<Outcome<void>> {
 }
 
 if (import.meta.main) {
+  configureNexusDebug("broker", process.env.MPCTL_NEXUS_DEBUG === "1", (line) => {
+    process.stderr.write(`${line}\n`);
+  });
   const started = await main();
   if (Result.isError(started)) {
     process.stderr.write(

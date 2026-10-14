@@ -13,3 +13,11 @@
 /packages/extension/.data/
 /packages/extension/test-results/
 /packages/extension/playwright-report/
+
+# Root-level generated output and local execution artifacts
+/.output/
+/.wxt/
+/test-results/
+/playwright-report/
+/.superpowers/
+/reporttmp/

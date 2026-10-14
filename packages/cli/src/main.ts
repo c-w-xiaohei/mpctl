@@ -13,6 +13,11 @@ import { connectCommand } from "./connect.js";
 import { protocolVersion } from "@mpctl/contracts";
 import { Result } from "better-result";
 import { assetCommand } from "./asset.js";
+import { configureNexusDebug } from "@mpctl/contracts/nexus-debug";
+
+configureNexusDebug("cli", process.env.MPCTL_NEXUS_DEBUG === "1", (line) => {
+  process.stderr.write(`${line}\n`);
+});
 
 const program = new Command()
   .name("mpctl")

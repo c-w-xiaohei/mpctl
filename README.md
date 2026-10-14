@@ -143,6 +143,12 @@ Help/version are text; success is one JSON object on stdout; failures are JSON o
 
 ## Verification limits and tests
 
+### Nexus development diagnostics
+
+- CLI / broker: set `MPCTL_NEXUS_DEBUG=1` to enable Nexus's internal DEBUG logger. Logs go to stderr; CLI stdout remains JSON. A broker started by that CLI inherits stderr so its logs are visible. An already-running broker must be started with the flag separately; it is not restarted automatically.
+- Extension: WXT development builds enable Nexus logging in background, CONTENT, MAIN, popup and connection-page contexts. Set `VITE_MPCTL_NEXUS_DEBUG=0` before starting WXT to disable it. Production builds disable these logs. Inspect the matching browser DevTools console (background via the extensions page).
+- Lines include runtime, severity and Nexus scope. Argument payloads, identities, URLs and error stacks are omitted; only typed Nexus error codes are retained. This uses the library's existing log events, not a new trace system, and does not guarantee a log for every successful call. Do not share unreviewed browser/server console output.
+
 The supported saved-editor shape is exactly one visible current index-0 article. Native navigation and body/field operations recheck route, document, login and saved-item facts; editor changes between checks and mutation can still race. No private MP HTTP API or bare authenticated editor URL is used. This does not establish support for every account/page variant.
 
 Historical live body/field checks and an older independently reopened SAVE are recorded under `tmp/reports/`; they do not establish the current native-only SAVE's cloud persistence. Current native-only SAVE, official body-image cover and fresh upload still lack completed real-write acceptance. Historical unknown uploads/SAVE remain unchanged and were not replayed. Other drafts are read-only; any future live write acceptance requires an authorized dedicated article. Never publish, delete drafts, scan QR codes or send previews as verification.

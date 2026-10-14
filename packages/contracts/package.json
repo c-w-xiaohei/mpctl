@@ -6,7 +6,8 @@
     ".": {
       "types": "./src/index.ts",
       "import": "./src/index.ts"
-    }
+    },
+    "./nexus-debug": "./src/nexus-debug.ts"
   },
   "scripts": {
     "build": "bun --eval 'console.log(\"@mpctl/contracts has no standalone build artifact\")'",
