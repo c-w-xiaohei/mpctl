@@ -1,21 +1,18 @@
 import { expect, test } from "bun:test";
-import { connectResultCodec } from "@mpctl/contracts";
+import { requestConnectResultCodec } from "@mpctl/contracts";
 import { Result } from "better-result";
-import { connectFromPage, connectionFailureMessage } from "../src/connection-page";
-import { encodeControlResult } from "../src/connection";
+import { connectFromPage } from "../src/connection-page";
 
-test("the CLI connection page retries transient background acquisition then connects once", async () => {
+test("the CLI connection page retries acquisition then hands off once without waiting for a socket", async () => {
   let acquisitions = 0;
   let connections = 0;
   const result = await connectFromPage(async () => {
     acquisitions++;
     if (acquisitions === 1) return Result.err({ code: "background_unavailable" as const });
     return Result.ok({
-      connect: async () => {
+      requestConnect: async () => {
         connections++;
-        return connectResultCodec.deserialize(
-          await encodeControlResult(connectResultCodec, Result.ok({ connected: true })),
-        );
+        return requestConnectResultCodec.deserialize({ status: "ok" });
       },
     });
   }, 300);
@@ -29,11 +26,9 @@ test("does not retry a failed pairing once background control was acquired", asy
   const result = await connectFromPage(
     async () =>
       Result.ok({
-        connect: async () => {
+        requestConnect: async () => {
           connections++;
-          return connectResultCodec.deserialize(
-            await encodeControlResult(connectResultCodec, Result.err({ code: "connect_failed" })),
-          );
+          return Result.err({ code: "connect_failed" as const });
         },
       }),
     300,
@@ -45,14 +40,11 @@ test("does not retry a failed pairing once background control was acquired", asy
 test("preserves a published pairing failure as a domain Result for the entrypoint", async () => {
   const result = await connectFromPage(async () =>
     Result.ok({
-      connect: async () =>
-        connectResultCodec.deserialize(
-          await encodeControlResult(connectResultCodec, Result.err({ code: "connect_failed" })),
-        ),
+      requestConnect: async () => Result.err({ code: "connect_failed" as const }),
     }),
   );
   expect(result.isErr()).toBe(true);
-  expect(connectionFailureMessage(result)).toContain("连接失败");
+  expect(result).toEqual(Result.err({ code: "connect_failed" }));
 });
 
 test("bounds background acquisition and reports its failure", async () => {
@@ -68,11 +60,9 @@ test("bounds background acquisition and reports its failure", async () => {
 test("does not connect a control that arrives after the acquisition deadline", async () => {
   let connections = 0;
   const control = Result.ok({
-    connect: async () => {
+    requestConnect: async () => {
       connections++;
-      return connectResultCodec.deserialize(
-        await encodeControlResult(connectResultCodec, Result.ok({ connected: true })),
-      );
+      return Result.ok(undefined);
     },
   });
   await expect(
@@ -97,7 +87,7 @@ test("converts acquisition and remote Promise rejection into page Results", asyn
 
   const remote = await connectFromPage(async () =>
     Result.ok({
-      connect: async () => Promise.reject(new Error("remote rejected")),
+      requestConnect: async () => Promise.reject(new Error("remote rejected")),
     }),
   );
   expect(remote.isErr()).toBe(true);

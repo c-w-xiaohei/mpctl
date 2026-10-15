@@ -1,232 +1,188 @@
-import React, { useEffect, useRef, useState } from "react";
+import React, { useEffect, useState } from "react";
 import { createRoot } from "react-dom/client";
-import { createPopupConfig } from "@nexus-js/chrome";
-import { Nexus } from "@nexus-js/core";
-import { Result } from "better-result";
-import { chromeTarget } from "@nexus-js/chrome";
-import { backgroundControlToken } from "../../src/background-contracts";
-import { createPopupControl } from "../../src/popup-control";
 import { configureNexusDebug } from "@mpctl/contracts/nexus-debug";
-import {
-  connectResultCodec,
-  connectionConfig,
-  controlStatusResultCodec,
-  disconnectResultCodec,
-} from "@mpctl/contracts";
+import { connectionConfig } from "@mpctl/contracts";
+import { createBackgroundControlClient } from "../../src/popup-control";
 import {
   readConnectionSettings,
   saveConnectionSettings,
   type ConnectionSettings,
 } from "../../src/connection";
+import "../../src/connection-ui.css";
 
-configureNexusDebug("popup", import.meta.env.DEV && import.meta.env.VITE_MPCTL_NEXUS_DEBUG !== "0");
+configureNexusDebug(
+  "popup",
+  Boolean(import.meta.env.DEV) && import.meta.env.VITE_MPCTL_NEXUS_DEBUG !== "0",
+);
+const controlClient = createBackgroundControlClient();
+window.addEventListener("pagehide", () => {
+  controlClient.dispose();
+});
 
 function Popup() {
+  const [state, setState] = useState<
+    "loading" | "idle" | "sending" | "requested" | "connected" | "error"
+  >("loading");
+  const [diagnostic, setDiagnostic] = useState("");
   const [settings, setSettings] = useState<ConnectionSettings>({
     websocketUrl: connectionConfig.websocketUrl,
     pairingCredential: "",
   });
-  const [connected, setConnected] = useState(false);
-  const [connecting, setConnecting] = useState(false);
-  const [message, setMessage] = useState("");
-  const operation = useRef(0);
-  const editedSettings = useRef({ websocketUrl: false, pairingCredential: false });
+  const [settingsReady, setSettingsReady] = useState(!import.meta.env.DEV);
+  const [settingsEdited, setSettingsEdited] = useState(false);
   useEffect(() => {
-    void readConnectionSettings()
-      .then((saved) => {
-        if (saved.isErr()) {
-          setMessage("连接设置读取失败");
-          return;
-        }
-        setSettings((current) => ({
-          websocketUrl: editedSettings.current.websocketUrl
-            ? current.websocketUrl
-            : saved.value.websocketUrl,
-          pairingCredential: editedSettings.current.pairingCredential
-            ? current.pairingCredential
-            : saved.value.pairingCredential,
-        }));
-      })
-      .catch(() => setMessage("连接设置读取失败"));
-    void getControl()
+    let active = true;
+    void controlClient
+      .get()
       .then(async (control) => {
-        if (operation.current !== 0) return;
-        if (control.isErr()) {
-          setMessage(
-            `后台暂不可用，请点击重试${"cleanupFailed" in control.error && control.error.cleanupFailed ? "（连接清理失败）" : ""}`,
-          );
-          return;
-        }
-        const status = await control.value.getStatus();
-        if (status.isErr()) setMessage("后台暂不可用，请点击重试");
-        else setConnected(status.value.connected);
+        const result = control.isErr() ? control : await control.value.getStatus();
+        if (!active) return;
+        if (result.isErr()) {
+          setDiagnostic(result.error.code);
+          setState("error");
+        } else setState(result.value.connected ? "connected" : "idle");
       })
-      .catch(() => setMessage("后台暂不可用，请点击重试"));
+      .catch(() => {
+        if (active) setState("error");
+      });
+    if (import.meta.env.DEV) {
+      void readConnectionSettings()
+        .then((result) => {
+          if (!active) return;
+          if (result.isOk()) {
+            setSettings(result.value);
+            setSettingsReady(true);
+          } else {
+            setDiagnostic(result.error.code);
+            setState("error");
+          }
+        })
+        .catch(() => {
+          if (active) {
+            setDiagnostic("settings_failed");
+            setState("error");
+          }
+        });
+    }
+    return () => {
+      active = false;
+    };
   }, []);
-  const update = (patch: Partial<ConnectionSettings>) => {
-    if (patch.websocketUrl !== undefined) editedSettings.current.websocketUrl = true;
-    if (patch.pairingCredential !== undefined) editedSettings.current.pairingCredential = true;
-    setSettings((old) => ({ ...old, ...patch }));
-  };
-  async function toggle() {
-    const currentOperation = ++operation.current;
-    const cancelling = connecting;
-    if (cancelling || connected) setConnecting(false);
-    else setConnecting(true);
-    const acquired = await getControl();
-    if (operation.current !== currentOperation) return;
-    if (acquired.isErr()) {
-      setMessage(
-        `后台暂不可用，请点击重试${"cleanupFailed" in acquired.error && acquired.error.cleanupFailed ? "（连接清理失败）" : ""}`,
-      );
-      setConnecting(false);
-      return;
-    }
-    const control = acquired.value;
-    if (cancelling || connected) {
-      const decoded = await control.disconnect();
-      if (operation.current !== currentOperation) return;
-      if (decoded.isErr()) setMessage("操作失败，请重试");
-      else {
-        setConnected(decoded.value.connected);
-        setMessage("已断开");
+
+  async function connect() {
+    setState("sending");
+    setDiagnostic("");
+    if (import.meta.env.DEV && settingsEdited) {
+      const saved = await saveConnectionSettings(settings);
+      if (saved.isErr()) {
+        setDiagnostic(saved.error.code);
+        setState("error");
+        return;
       }
-      setConnecting(false);
-      return;
+      setSettingsEdited(false);
     }
-    const saved = await saveConnectionSettings(settings);
-    if (operation.current !== currentOperation) return;
-    if (saved.isErr()) {
-      setMessage("设置保存失败，请重试");
-      setConnecting(false);
-      return;
-    }
-    const status = await control.connect();
-    if (operation.current !== currentOperation) return;
-    if (status.isErr()) setMessage("操作失败，请重试");
-    else {
-      setConnected(status.value.connected);
-      setMessage(status.value.connected ? "已连接" : "已断开");
-    }
-    if (operation.current === currentOperation) setConnecting(false);
+    const control = await controlClient.get();
+    const result = control.isErr() ? control : await control.value.requestConnect();
+    if (result.isErr()) {
+      setDiagnostic(result.error.code);
+      setState("error");
+    } else setState("requested");
   }
+
+  const messages = {
+    loading: "正在准备连接…",
+    idle: "连接后，返回终端继续编辑。",
+    sending: "正在发起连接…",
+    requested: "已发起连接，请返回终端继续操作。",
+    connected: "已连接，可以返回终端继续操作。",
+    error: "暂时无法发起连接，请重试。",
+  };
+  const busy = state === "loading" || state === "sending";
   return (
-    <main>
-      <h1>mpctl</h1>
-      <label>
-        Broker WebSocket 地址
-        <input
-          value={settings.websocketUrl}
-          onChange={(event) => update({ websocketUrl: event.target.value })}
-        />
-      </label>
-      <label>
-        配对凭证
-        <input
-          type="password"
-          autoComplete="off"
-          value={settings.pairingCredential}
-          onChange={(event) => update({ pairingCredential: event.target.value })}
-        />
-      </label>
-      <p role="status">
-        {connected ? "已连接" : "未连接"} {message}
+    <main className="connection-panel popup-panel">
+      <header>
+        <h1>mpctl</h1>
+        <p className="subtitle">连接你的编辑工具</p>
+      </header>
+      <p className="connection-status" role="status" aria-live="polite" data-state={state}>
+        {messages[state]}
       </p>
       <button
+        className="primary-button"
         type="button"
-        onClick={() =>
-          void toggle().catch(() => {
-            setMessage("操作失败，请重试");
-            setConnecting(false);
-          })
-        }
+        disabled={busy || !settingsReady}
+        aria-busy={busy}
+        onClick={() => {
+          void connect().catch(() => {
+            setDiagnostic("unexpected_failure");
+            setState("error");
+          });
+        }}
       >
-        {connecting ? "取消连接" : connected ? "断开" : "显式连接"}
+        {state === "sending" ? "正在发起…" : state === "error" ? "重试连接" : "发起连接"}
       </button>
+      {import.meta.env.DEV && (
+        <details className="developer-settings">
+          <summary>开发调试</summary>
+          <label htmlFor="broker-url">Broker WebSocket 地址</label>
+          <input
+            id="broker-url"
+            type="url"
+            value={settings.websocketUrl}
+            disabled={busy || !settingsReady}
+            onChange={(event) => {
+              setSettings({ ...settings, websocketUrl: event.target.value });
+              setSettingsEdited(true);
+            }}
+          />
+          <label htmlFor="pairing-credential">配对凭证</label>
+          <input
+            id="pairing-credential"
+            type="password"
+            autoComplete="off"
+            value={settings.pairingCredential}
+            disabled={busy || !settingsReady}
+            onChange={(event) => {
+              setSettings({ ...settings, pairingCredential: event.target.value });
+              setSettingsEdited(true);
+            }}
+          />
+          <p className="developer-note">修改后点击“发起连接”保存。已有连接需先断开。</p>
+          {diagnostic && (
+            <p className="developer-note" role="status">
+              诊断：{diagnostic}
+            </p>
+          )}
+          <button
+            className="secondary-button"
+            type="button"
+            disabled={busy}
+            onClick={() => {
+              setState("sending");
+              void controlClient
+                .get()
+                .then(async (control) => {
+                  const result = control.isErr() ? control : await control.value.disconnect();
+                  if (result.isErr()) {
+                    setDiagnostic(result.error.code);
+                    setState("error");
+                  } else {
+                    setDiagnostic("");
+                    setState("idle");
+                  }
+                })
+                .catch(() => {
+                  setDiagnostic("unexpected_failure");
+                  setState("error");
+                });
+            }}
+          >
+            断开连接
+          </button>
+        </details>
+      )}
     </main>
   );
 }
-
-const popupControl = createPopupControl(() => {
-  const runtimeResult = Result.try({
-    try: () => new Nexus(),
-    catch: () => ({ code: "runtime_unavailable" as const }),
-  });
-  if (runtimeResult.isErr()) return runtimeResult;
-  const runtime = runtimeResult.value;
-  const configResult = Result.try({
-    try: () => createPopupConfig(),
-    catch: () => ({ code: "runtime_unavailable" as const }),
-  });
-  if (configResult.isErr()) return configResult;
-  const config = configResult.value;
-  const endpoint = config.endpoint?.implementation;
-  if (!endpoint) return Result.err({ code: "runtime_unavailable" as const });
-  const configured = Result.try({
-    try: () => runtime.configure(config),
-    catch: () => ({ code: "runtime_unavailable" as const }),
-  });
-  if (configured.isErr()) {
-    const cleanup = Result.try({
-      try: () => endpoint.close(),
-      catch: () => ({ code: "runtime_unavailable" as const }),
-    });
-    return cleanup.isErr()
-      ? Result.err({ ...configured.error, cleanupFailed: true as const })
-      : configured;
-  }
-  return Result.ok({
-    runtime: {
-      ready: () => runtime.ready(),
-      connect: async () => {
-        const connection = await Result.tryPromise({
-          try: () =>
-            runtime.connect({
-              target: chromeTarget.background(),
-              timeout: 2_000,
-            }),
-          catch: () => ({ code: "background_unavailable" as const }),
-        });
-        if (connection.isErr()) return connection;
-        return Result.try({
-          try: () => connection.value.get(backgroundControlToken),
-          catch: () => ({ code: "background_unavailable" as const }),
-        });
-      },
-    },
-    endpoint,
-  });
-});
-const getControl = async () => {
-  const acquired = await popupControl.get();
-  if (acquired.isErr()) return acquired;
-  const remote = acquired.value;
-  const connect = async () => {
-    const wire = await Result.tryPromise({
-      try: async () => await remote.connect(),
-      catch: () => ({ code: "connect_failed" as const }),
-    });
-    return wire.isErr() ? wire : connectResultCodec.deserialize(wire.value);
-  };
-  const disconnect = async () => {
-    const wire = await Result.tryPromise({
-      try: async () => await remote.disconnect(),
-      catch: () => ({ code: "disconnect_failed" as const }),
-    });
-    return wire.isErr() ? wire : disconnectResultCodec.deserialize(wire.value);
-  };
-  const getStatus = async () => {
-    const wire = await Result.tryPromise({
-      try: async () => await remote.getStatus(),
-      catch: () => ({ code: "status_failed" as const }),
-    });
-    return wire.isErr() ? wire : controlStatusResultCodec.deserialize(wire.value);
-  };
-  return Result.ok({
-    connect,
-    disconnect,
-    getStatus,
-  });
-};
 
 createRoot(document.getElementById("root")!).render(<Popup />);

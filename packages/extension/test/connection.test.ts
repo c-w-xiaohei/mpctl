@@ -1,4 +1,4 @@
-import { describe, expect, test } from "bun:test";
+import { describe, expect, test, spyOn } from "bun:test";
 import { Result } from "better-result";
 
 const ledgerId = crypto.randomUUID();
@@ -9,10 +9,62 @@ import {
   controlStatusResultCodec,
   disconnectResultCodec,
   reloadResultCodec,
+  requestConnectResultCodec,
 } from "@mpctl/contracts";
 import { createBackgroundControl, createConnectionController } from "../src/connection";
 
 describe("explicit plugin connection", () => {
+  test("a background handoff consumes a late failure without leaking private error details", async () => {
+    const logged = spyOn(console, "error").mockImplementation(() => {});
+    try {
+      const service = createBackgroundControl({
+        controller: () => ({
+          connect: async () => {
+            throw new Error("private pairing credential");
+          },
+          disconnect: () => Result.ok({ connected: false as const }),
+          status: () => Result.ok({ connected: false }),
+        }),
+        reload: async () => Result.ok(undefined),
+      });
+      expect(await requestConnectResultCodec.deserialize(await service.requestConnect())).toEqual(
+        Result.ok(undefined),
+      );
+      expect(logged.mock.calls).toEqual([["mpctl background connect failed: unexpected_failure"]]);
+    } finally {
+      logged.mockRestore();
+    }
+  });
+  test("acknowledges connection handoff while the background dial is still pending", async () => {
+    let finish!: (value: Result<void, { code: "dial_failed" }>) => void;
+    let calls = 0;
+    let connected = false;
+    const service = createBackgroundControl({
+      controller: () => ({
+        connect() {
+          calls++;
+          return new Promise((resolve) => {
+            finish = resolve;
+          });
+        },
+        disconnect: () => Result.ok({ connected: false as const }),
+        status: () => Result.ok({ connected }),
+      }),
+      reload: async () => Result.ok(undefined),
+    });
+    const reply = await requestConnectResultCodec.deserialize(await service.requestConnect());
+    expect(reply).toEqual(Result.ok(undefined));
+    expect(calls).toBe(1);
+    expect(await controlStatusResultCodec.deserialize(await service.getStatus())).toEqual(
+      Result.ok({ connected: false }),
+    );
+    connected = true;
+    finish(Result.ok(undefined));
+    await Promise.resolve();
+    expect(await controlStatusResultCodec.deserialize(await service.getStatus())).toEqual(
+      Result.ok({ connected: true }),
+    );
+  });
   test("G1 ledger initialization must finish before a WS dial publishes metadata", async () => {
     let release!: (result: Result<{ ledgerId: string }, { code: string }>) => void;
     const ledger = new Promise<Result<{ ledgerId: string }, { code: string }>>((done) => {

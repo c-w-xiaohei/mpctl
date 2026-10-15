@@ -40,12 +40,12 @@ test("closeConnectPageTab returns lookup and close failures as Results", async (
   expect(closeFailure).toEqual(Result.err({ code: "tab_close_failed" }));
 });
 
-test("the real attempt finalizer closes the tab after a successful connection", async () => {
+test("the real attempt finalizer closes the tab after background handoff", async () => {
   const events: string[] = [];
   const result = await runConnectPageAttempt(
     async () => {
-      events.push("connect");
-      return Result.ok({ connected: true });
+      events.push("handoff");
+      return Result.ok(undefined);
     },
     {
       getCurrent: async () => ({ id: 42 }),
@@ -56,11 +56,11 @@ test("the real attempt finalizer closes the tab after a successful connection", 
     (scope, code) => events.push(`${scope}:${code}`),
   );
 
-  expect(result).toEqual(Result.ok({ connected: true }));
-  expect(events).toEqual(["connect", "remove:42"]);
+  expect(result).toEqual(Result.ok(undefined));
+  expect(events).toEqual(["handoff", "remove:42"]);
 });
 
-test("the real attempt finalizer reports connection Err before closing and preserves Err if close fails", async () => {
+test("a failed handoff keeps the page open for retry", async () => {
   const events: string[] = [];
   const result = await runConnectPageAttempt(
     async () => {
@@ -78,15 +78,10 @@ test("the real attempt finalizer reports connection Err before closing and prese
   );
 
   expect(result).toEqual(Result.err({ code: "connect_failed" }));
-  expect(events).toEqual([
-    "connect",
-    "connect page:connect_failed",
-    "remove",
-    "connect page tab close:tab_close_failed",
-  ]);
+  expect(events).toEqual(["connect", "connect page:connect_failed"]);
 });
 
-test("the real attempt finalizer also closes after acquisition failure", async () => {
+test("background acquisition failure does not close the page", async () => {
   const events: string[] = [];
   const result = await runConnectPageAttempt(
     async () => {
@@ -103,5 +98,21 @@ test("the real attempt finalizer also closes after acquisition failure", async (
   );
 
   expect(result).toEqual(Result.err({ code: "background_unavailable" }));
-  expect(events).toEqual(["acquire", "connect page:background_unavailable", "remove:44"]);
+  expect(events).toEqual(["acquire", "connect page:background_unavailable"]);
+});
+
+test("tab close failure is reported without changing a successful handoff", async () => {
+  const errors: string[] = [];
+  const result = await runConnectPageAttempt(
+    async () => Result.ok(undefined),
+    {
+      getCurrent: async () => ({ id: 44 }),
+      remove: async () => {
+        throw new Error("cannot close");
+      },
+    },
+    (_scope, code) => errors.push(code),
+  );
+  expect(result).toEqual(Result.ok(undefined));
+  expect(errors).toEqual(["tab_close_failed"]);
 });

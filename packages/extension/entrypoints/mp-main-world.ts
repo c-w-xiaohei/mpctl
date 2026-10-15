@@ -120,7 +120,7 @@ export async function mountMainWorldBridge(
 export default defineUnlistedScript(() => {
   configureNexusDebug(
     "main",
-    import.meta.env.DEV && import.meta.env.VITE_MPCTL_NEXUS_DEBUG !== "0",
+    Boolean(import.meta.env.DEV) && import.meta.env.VITE_MPCTL_NEXUS_DEBUG !== "0",
   );
   const script = document.currentScript;
   if (script instanceof HTMLScriptElement) {

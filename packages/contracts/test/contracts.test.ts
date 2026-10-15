@@ -724,7 +724,7 @@ describe("preparation operation error codecs", () => {
   } as const;
 
   test("advertises the coordinated breaking wire version", () => {
-    expect(protocolVersion).toBe("0.18.0");
+    expect(protocolVersion).toBe("0.19.0");
   });
 
   test("current mutation errors reject the retired top-level forwarding shapes", async () => {

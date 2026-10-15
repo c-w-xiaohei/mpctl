@@ -9,6 +9,7 @@ import {
   workspaceToken,
   protocolVersion,
   reloadResultCodec,
+  requestConnectResultCodec,
   ledgerIdSchema,
   hasProtocolVersion,
 } from "@mpctl/contracts";
@@ -266,6 +267,27 @@ export function createBackgroundControl(options: {
   reload(): Promise<BetterResult<void, { code: string }>>;
 }): BackgroundControlService {
   return {
+    async requestConnect() {
+      try {
+        // The background owns this task; closing the caller must not cancel it.
+        void options
+          .controller()
+          .connect()
+          .then(
+            (result) => {
+              if (result.isErr())
+                console.error("mpctl background connect failed:", result.error.code);
+            },
+            () => console.error("mpctl background connect failed: unexpected_failure"),
+          );
+        return encodeControlResult(requestConnectResultCodec, Result.ok(undefined));
+      } catch {
+        return encodeControlResult(
+          requestConnectResultCodec,
+          Result.err({ code: "connect_failed" }),
+        );
+      }
+    },
     async connect() {
       const result = await options.controller().connect();
       const status: BetterResult<{ connected: boolean }, ControlFailure> = result.isOk()

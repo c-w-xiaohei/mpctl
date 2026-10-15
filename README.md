@@ -14,7 +14,7 @@ bun run build
 export MPCTL_PAIRING_CREDENTIAL='replace-with-a-private-token'
 ```
 
-Keep the pairing credential private. In Chrome, enable Developer mode at `chrome://extensions`, load `packages/extension/.output/chrome-mv3`, and configure the same broker address and credential in the extension popup. The default broker address is `ws://127.0.0.1:17381/bridge`.
+Keep the pairing credential private. In Chrome, enable Developer mode at `chrome://extensions` and load the extension. Provision the matching broker address and credential through the WXT development popup's “开发调试” section; production UI deliberately has no configuration fields and uses the saved settings. The default broker address is `ws://127.0.0.1:17381/bridge`. A fresh production installation still needs those settings provisioned; automatic credential exchange is not implemented.
 
 The examples below use the built `mpctl` bin (Bun required). During source development, replace `mpctl` with `bun run packages/cli/src/main.ts`.
 
@@ -22,7 +22,9 @@ The examples below use the built `mpctl` bin (Bun required). During source devel
 mpctl connect --extension '<installed-extension-id>'
 ```
 
-Already connected: returns `connected:true`. Otherwise: exits nonzero with an instruction and, when the extension ID is known, `connectionPageUrl`. Open that URL in the browser/profile where the extension is installed. CLI does not launch a browser, choose an account, or log in. Set `MPCTL_EXTENSION_ID` to omit `--extension`. The connection page closes after success or failure.
+Already connected: returns `connected:true`. Otherwise: exits nonzero with an instruction and, when the extension ID is known, `connectionPageUrl`. Open that URL in the browser/profile where the extension is installed. CLI does not launch a browser, choose an account, or log in. Set `MPCTL_EXTENSION_ID` to omit `--extension`. The connection page closes as soon as the background acknowledges ownership of the connection attempt; it does not wait for the WebSocket handshake. A failed handoff leaves a retry button. Use `mpctl status` afterward to check the actual connection result.
+
+Popup and connection pages follow the system light/dark theme. Production UI only initiates connections and shows brief status; address, credential and disconnect controls are development-only. Protocol `0.19.0` adds the acknowledged `requestConnect()` handoff; update CLI, broker and extension together. Closing either UI page never disconnects the background's WebSocket.
 
 Commands start/reuse the broker on demand. Do not run `status`, `broker start` or `connect --reload` before every edit.
 

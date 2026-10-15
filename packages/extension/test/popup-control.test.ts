@@ -166,6 +166,7 @@ function service(overrides: Partial<BackgroundControlService> = {}): BackgroundC
   return {
     getStatus: async () =>
       encodeControlResult(controlStatusResultCodec, Result.ok({ connected: false })),
+    requestConnect: async () => ({ status: "ok" as const, value: undefined }),
     connect: async () => encodeControlResult(connectResultCodec, Result.ok({ connected: true })),
     disconnect: async () =>
       encodeControlResult(disconnectResultCodec, Result.ok({ connected: false })),

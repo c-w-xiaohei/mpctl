@@ -782,6 +782,7 @@ describe("broker relay integration", () => {
         async connect() {
           return encode(connectResultCodec, Result.ok({ connected: true }));
         },
+        requestConnect: async () => ({ status: "ok" as const, value: undefined }),
         async disconnect() {
           return encode(disconnectResultCodec, Result.ok({ connected: false as const }));
         },
@@ -1772,6 +1773,7 @@ function createPlugin(
 
 function connectedControlService(onStatus?: () => Promise<boolean>): BackgroundControlService {
   return {
+    requestConnect: async () => ({ status: "ok" as const, value: undefined }),
     async connect() {
       return encode(connectResultCodec, Result.ok({ connected: true }));
     },

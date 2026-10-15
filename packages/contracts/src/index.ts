@@ -6,7 +6,7 @@ import {
   type SerializedResult,
 } from "better-result";
 import * as v from "valibot";
-export const protocolVersion = "0.18.0";
+export const protocolVersion = "0.19.0";
 export function hasProtocolVersion(identity: unknown): boolean {
   if (typeof identity !== "object" || identity === null || !("app" in identity)) return false;
   const app = identity.app;
@@ -910,8 +910,11 @@ export const controlStatusResultCodec = backgroundControlResultCodec(
   v.strictObject({ connected: v.boolean(), keyLedgerId: v.optional(ledgerIdSchema) }),
 );
 export const reloadResultCodec = backgroundControlResultCodec(reloadResultSchema);
+// Acknowledges BG ownership of the attempt, not a successful WebSocket connection.
+export const requestConnectResultCodec = backgroundControlResultCodec(v.undefined());
 
 export interface BackgroundControlService {
+  requestConnect(): Promise<BackgroundControlWireResult<void>>;
   connect(): Promise<BackgroundControlWireResult<{ connected: boolean }>>;
   disconnect(): Promise<BackgroundControlWireResult<{ connected: false }>>;
   getStatus(): Promise<BackgroundControlWireResult<{ connected: boolean; keyLedgerId?: string }>>;

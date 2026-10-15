@@ -523,7 +523,7 @@ export default defineContentScript({
   async main(ctx) {
     configureNexusDebug(
       "content",
-      import.meta.env.DEV && import.meta.env.VITE_MPCTL_NEXUS_DEBUG !== "0",
+      Boolean(import.meta.env.DEV) && import.meta.env.VITE_MPCTL_NEXUS_DEBUG !== "0",
     );
     const route = classifyAppmsgUrl(location.href);
     const routeIdentity = appmsgRouteIdentity(location.href) ?? "unsupported";

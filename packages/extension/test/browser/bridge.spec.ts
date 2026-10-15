@@ -42,7 +42,6 @@ test("real CLI, broker, extension and page bridge pull/push UTF-8 HTML on exact 
   const bodyFile = path.join(temp, "unicode body.html");
   const wsPort = await reservePort();
   const httpsPort = await reservePort();
-  const wsUrl = `ws://127.0.0.1:${wsPort}/bridge`;
   const allowedWebSocketPorts = new Set([String(wsPort)]);
   const imageRequests: string[] = [];
   const imageFailures: string[] = [];
@@ -395,8 +394,8 @@ test("real CLI, broker, extension and page bridge pull/push UTF-8 HTML on exact 
         }),
       )
       .toEqual({ intercepted: 1, restored: true });
-    await expect(popup.getByRole("status")).toContainText("未连接");
-    await expect(popup.getByRole("status")).toContainText("请点击重试");
+    await expect(popup.getByRole("status")).toContainText("请重试");
+    await expect(popup.getByRole("textbox")).toHaveCount(0);
     await expect
       .poll(() =>
         popup.evaluate(
@@ -406,17 +405,18 @@ test("real CLI, broker, extension and page bridge pull/push UTF-8 HTML on exact 
         ),
       )
       .toBe(1);
-    await popup
-      .getByLabel("Broker WebSocket 地址")
-      .fill(`ws://127.0.0.1:${proxyAddress.port}/bridge`);
-    await popup.getByLabel("配对凭证").fill("wrong-credential");
+    await popup.evaluate(
+      (websocketUrl) =>
+        chrome.storage.local.set({ websocketUrl, pairingCredential: "wrong-credential" }),
+      `ws://127.0.0.1:${proxyAddress.port}/bridge`,
+    );
     await popup.evaluate(() => {
       const fault = (globalThis as unknown as { __mpctlPopupConnectFault?: PopupConnectFault })
         .__mpctlPopupConnectFault;
       fault?.arm();
     });
-    await popup.getByRole("button", { name: "显式连接" }).click();
-    await expect(popup.getByRole("status")).toContainText("点击重试");
+    await popup.getByRole("button", { name: "重试连接" }).click();
+    await expect(popup.getByRole("status")).toContainText("请重试");
     expect(await popup.locator("body").innerText()).not.toContain("synthetic-private-credential");
     expect(await popup.locator("body").innerText()).not.toContain("wrong-credential");
     const clickFault = await popup.evaluate(
@@ -428,13 +428,14 @@ test("real CLI, broker, extension and page bridge pull/push UTF-8 HTML on exact 
     expect(clickFault?.restored).toBe(true);
     expect(await popup.locator("body").innerText()).not.toContain("synthetic-private-credential");
 
-    await popup
-      .getByLabel("Broker WebSocket 地址")
-      .fill(`ws://127.0.0.1:${directProxy.port}/bridge`);
-    await popup.getByLabel("配对凭证").fill("wrong-credential");
+    await popup.evaluate(
+      (websocketUrl) =>
+        chrome.storage.local.set({ websocketUrl, pairingCredential: "wrong-credential" }),
+      `ws://127.0.0.1:${directProxy.port}/bridge`,
+    );
     directProxy.resetAttempt();
     const failedAttempt = directProxy.waitForFailedAttempt();
-    await popup.getByRole("button", { name: "显式连接" }).click();
+    await popup.getByRole("button", { name: "重试连接" }).click();
     const failedAttemptEvidence = await failedAttempt;
     expect(failedAttemptEvidence.clientCount).toBe(1);
     expect(failedAttemptEvidence.upstreamConnectionCount).toBe(1);
@@ -443,16 +444,21 @@ test("real CLI, broker, extension and page bridge pull/push UTF-8 HTML on exact 
       failedAttemptEvidence.upstreamEndCount + failedAttemptEvidence.upstreamCloseCount,
     ).toBeGreaterThan(0);
     expect(failedAttemptEvidence.upstreamCloseCount).toBe(1);
-    await expect(popup.getByRole("status")).toContainText("请重试");
+    await expect(popup.getByRole("status")).toContainText("已发起连接");
     expect(await popup.locator("body").innerText()).not.toContain("wrong-credential");
     const rejectedStatus = await cli(temp, socketPath, "status");
     expect(rejectedStatus.code).toBe(0);
     expect(JSON.parse(rejectedStatus.stdout).connected).toBe(false);
     expect(directProxy.attempt).toEqual(failedAttemptEvidence);
 
-    await popup.getByLabel("配对凭证").fill(credential);
-    await popup.getByRole("button", { name: "显式连接" }).click();
-    await expect(popup.getByRole("status")).toContainText("已连接", { timeout: 15_000 });
+    await popup.evaluate(
+      (pairingCredential) => chrome.storage.local.set({ pairingCredential }),
+      credential,
+    );
+    await popup.getByRole("button", { name: "发起连接" }).click();
+    await expect
+      .poll(async () => JSON.parse((await cli(temp, socketPath, "status")).stdout).connected)
+      .toBe(true);
     const acceptedStatus = await cli(temp, socketPath, "status");
     expect(acceptedStatus.code).toBe(0);
     expect(JSON.parse(acceptedStatus.stdout).connected).toBe(true);
@@ -1475,285 +1481,42 @@ test("real CLI, broker, extension and page bridge pull/push UTF-8 HTML on exact 
       localStorage.setItem("mpctl-fixture-saved-state", JSON.stringify(saved));
     });
 
-    await popup.getByRole("button", { name: "断开" }).click();
-    await expect(popup.getByRole("status")).toContainText("未连接");
+    await popup.evaluate(() => chrome.runtime.reload());
+    await expect
+      .poll(async () => JSON.parse((await cli(temp, socketPath, "status")).stdout).connected)
+      .toBe(false);
+    await popup.reload();
     const disconnectedStatus = await cli(temp, socketPath, "status");
     expect(disconnectedStatus.code).toBe(0);
     expect(JSON.parse(disconnectedStatus.stdout).connected).toBe(false);
 
-    await popup
-      .getByLabel("Broker WebSocket 地址")
-      .fill(`ws://127.0.0.1:${proxyAddress.port}/bridge`);
-    await popup.getByRole("button", { name: "显式连接" }).click();
-    await expect(popup.getByRole("button", { name: "取消连接" })).toBeVisible();
-    await popup.getByRole("button", { name: "取消连接" }).click();
-    await expect(popup.getByRole("status")).toContainText("未连接");
+    await popup.evaluate(
+      (websocketUrl) => chrome.storage.local.set({ websocketUrl }),
+      `ws://127.0.0.1:${proxyAddress.port}/bridge`,
+    );
+    const pendingConnectPage = await context.newPage();
+    await pendingConnectPage.goto(`chrome-extension://${extensionId}/connect.html`);
+    await expect.poll(() => pendingConnectPage.isClosed()).toBe(true);
+    expect(JSON.parse((await cli(temp, socketPath, "status")).stdout).connected).toBe(false);
     releaseHandshake();
     await proxyReachedBrokerPromise;
-    await expect(popup.getByRole("status")).toContainText("未连接");
-    await popup.getByLabel("Broker WebSocket 地址").fill(wsUrl);
-    await popup.getByRole("button", { name: "显式连接" }).click();
-    await expect(popup.getByRole("status")).toContainText("已连接", { timeout: 15_000 });
+    await expect
+      .poll(async () => JSON.parse((await cli(temp, socketPath, "status")).stdout).connected)
+      .toBe(true);
 
-    await popup.getByRole("button", { name: "断开" }).click();
-    await expect(popup.getByRole("status")).toContainText("未连接");
-    const selectedUrl = `ws://127.0.0.1:${directProxy.port}/bridge`;
-    const staleSettings = {
-      websocketUrl: "ws://127.0.0.1:1/stale",
-      pairingCredential: "stale-wrong-synthetic-credential",
-    };
-    await popup.evaluate(async (settings) => {
-      await chrome.storage.local.set(settings);
-      const stored = await chrome.storage.local.get(["websocketUrl", "pairingCredential"]);
-      if (
-        stored.websocketUrl !== settings.websocketUrl ||
-        stored.pairingCredential !== settings.pairingCredential
-      )
-        throw new Error("Could not verify synthetic popup settings seed");
-    }, staleSettings);
-    const settingsPopup = await context.newPage();
-    const settingsPageErrors: string[] = [];
-    settingsPopup.on("pageerror", (error) => settingsPageErrors.push(error.name));
-    await settingsPopup.addInitScript(installSettingsReadGate);
-    await settingsPopup.goto(`chrome-extension://${extensionId}/popup.html`);
-    await expect
-      .poll(() =>
-        settingsPopup.evaluate(
-          () =>
-            (globalThis as unknown as { __mpctlSettingsGate?: { intercepted: number } })
-              .__mpctlSettingsGate?.intercepted,
-        ),
-      )
-      .toBe(1);
-    expect(JSON.parse((await cli(temp, socketPath, "status")).stdout).connected).toBe(false);
-    const proxyBeforeSelectedConnect = directProxy.attempt.clientCount;
-    await settingsPopup.getByLabel("Broker WebSocket 地址").fill(selectedUrl);
-    await settingsPopup.getByLabel("配对凭证").fill(credential);
-    await settingsPopup.getByRole("button", { name: "显式连接" }).click();
-    await expect
-      .poll(
-        async () => ({
-          statusText: await settingsPopup.getByRole("status").innerText(),
-          proxyClients: directProxy!.attempt.clientCount,
-        }),
-        {
-          timeout: 15_000,
-          message: `settings-popup boundary: ${JSON.stringify({
-            proxy: directProxy.attempt,
-            broker: JSON.parse((await cli(temp, socketPath, "status")).stdout),
-            pageErrors: settingsPageErrors,
-          })}`,
-        },
-      )
-      .toMatchObject({
-        statusText: expect.stringMatching(/^已连接/),
-        proxyClients: proxyBeforeSelectedConnect + 1,
-      });
-    expect(JSON.parse((await cli(temp, socketPath, "status")).stdout).connected).toBe(true);
-    expect(directProxy.attempt.clientCount).toBe(proxyBeforeSelectedConnect + 1);
-    await settingsPopup.evaluate(async () => {
-      const gate = (
-        globalThis as unknown as {
-          __mpctlSettingsGate?: { release(): Promise<void> };
-        }
-      ).__mpctlSettingsGate;
-      await gate?.release();
-    });
-    await settingsPopup.getByRole("button", { name: "断开" }).click();
-    await expect(settingsPopup.getByRole("status")).toContainText("已断开");
+    await popup.evaluate(() => chrome.runtime.reload());
     await expect
       .poll(async () => JSON.parse((await cli(temp, socketPath, "status")).stdout).connected)
       .toBe(false);
-    await expect(settingsPopup.getByLabel("Broker WebSocket 地址")).toHaveValue(selectedUrl);
-    await expect(settingsPopup.getByLabel("配对凭证")).toHaveValue(credential);
-    expect(await settingsPopup.locator("body").innerText()).not.toContain(credential);
-    expect(JSON.parse((await cli(temp, socketPath, "status")).stdout).connected).toBe(false);
-    expect(directProxy.attempt.clientCount).toBe(proxyBeforeSelectedConnect + 1);
-    await settingsPopup.getByRole("button", { name: "显式连接" }).click();
-    await expect(settingsPopup.getByRole("status")).toContainText("已连接", { timeout: 15_000 });
-    await expect.poll(() => directProxy!.attempt.clientCount).toBe(proxyBeforeSelectedConnect + 2);
-    expect(JSON.parse((await cli(temp, socketPath, "status")).stdout).connected).toBe(true);
-    await settingsPopup.getByRole("button", { name: "断开" }).click();
-    await expect(settingsPopup.getByRole("status")).toContainText("已断开");
-    expect(JSON.parse((await cli(temp, socketPath, "status")).stdout).connected).toBe(false);
-
-    for (const scenario of ["url", "credential", "clear"] as const) {
-      const variantStale = {
-        websocketUrl: `ws://127.0.0.1:1/${scenario}-stale`,
-        pairingCredential: `${scenario}-stale-wrong-synthetic-credential`,
-      };
-      await popup.evaluate(async (settings) => {
-        await chrome.storage.local.set(settings);
-        const stored = await chrome.storage.local.get(["websocketUrl", "pairingCredential"]);
-        if (
-          stored.websocketUrl !== settings.websocketUrl ||
-          stored.pairingCredential !== settings.pairingCredential
-        )
-          throw new Error("Could not verify variant popup settings seed");
-      }, variantStale);
-      const variant = await context.newPage();
-      await variant.addInitScript(installSettingsReadGate);
-      await variant.goto(`chrome-extension://${extensionId}/popup.html`);
-      await expect
-        .poll(() =>
-          variant.evaluate(
-            () =>
-              (globalThis as unknown as { __mpctlSettingsGate?: { intercepted: number } })
-                .__mpctlSettingsGate?.intercepted,
-          ),
-        )
-        .toBe(1);
-      if (scenario === "url") {
-        await variant.getByLabel("Broker WebSocket 地址").fill("ws://127.0.0.1:12345/user");
-      } else if (scenario === "credential") {
-        await variant.getByLabel("配对凭证").fill("user-synthetic-credential");
-      } else {
-        await variant.getByLabel("配对凭证").fill("temporary-synthetic-credential");
-        await variant.getByLabel("配对凭证").fill("");
-      }
-      await variant.evaluate(async () => {
-        const gate = (
-          globalThis as unknown as {
-            __mpctlSettingsGate?: { release(): Promise<void> };
-          }
-        ).__mpctlSettingsGate;
-        await gate?.release();
-      });
-      if (scenario === "url") {
-        await expect(variant.getByLabel("配对凭证")).toHaveValue(variantStale.pairingCredential);
-        await expect(variant.getByLabel("Broker WebSocket 地址")).toHaveValue(
-          "ws://127.0.0.1:12345/user",
-        );
-      } else if (scenario === "credential") {
-        await expect(variant.getByLabel("Broker WebSocket 地址")).toHaveValue(
-          variantStale.websocketUrl,
-        );
-        await expect(variant.getByLabel("配对凭证")).toHaveValue("user-synthetic-credential");
-      } else {
-        await expect(variant.getByLabel("Broker WebSocket 地址")).toHaveValue(
-          variantStale.websocketUrl,
-        );
-        await expect(variant.getByLabel("配对凭证")).toHaveValue("");
-      }
-      await variant.close();
-    }
-    const rejectedPopup = await context.newPage();
-    await rejectedPopup.addInitScript(() => {
-      const storage = chrome.storage.local;
-      const nativeGet = storage.get.bind(storage);
-      let rejectRead: ((reason: unknown) => void) | undefined;
-      let acknowledgeRejection: (() => void) | undefined;
-      const rejected = new Promise<void>((resolve) => (acknowledgeRejection = resolve));
-      let unhandledRejections = 0;
-      addEventListener("unhandledrejection", () => {
-        unhandledRejections++;
-      });
-      const state = {
-        intercepted: 0,
-        unhandledRejections: () => unhandledRejections,
-        reject: async () => {
-          await rejected;
-          rejectRead?.(new Error("synthetic-rejected-private-credential"));
-        },
-      };
-      storage.get = ((keys: string | string[] | Record<string, unknown> | null) => {
-        if (
-          Array.isArray(keys) &&
-          keys.length === 2 &&
-          keys.includes("websocketUrl") &&
-          keys.includes("pairingCredential")
-        ) {
-          state.intercepted++;
-          return new Promise((_, reject) => {
-            rejectRead = reject;
-            acknowledgeRejection?.();
-          }) as unknown as ReturnType<typeof storage.get>;
-        }
-        return nativeGet(keys as never);
-      }) as typeof storage.get;
-      Object.defineProperty(globalThis, "__mpctlRejectedSettings", { value: state });
+    await popup.reload();
+    const selectedUrl = `ws://127.0.0.1:${directProxy.port}/bridge`;
+    await authenticatedHome.reload();
+    await popup.evaluate((settings) => chrome.storage.local.set(settings), {
+      websocketUrl: selectedUrl,
+      pairingCredential: credential,
     });
-    await rejectedPopup.goto(`chrome-extension://${extensionId}/popup.html`);
-    await expect
-      .poll(() =>
-        rejectedPopup.evaluate(
-          () =>
-            (globalThis as unknown as { __mpctlRejectedSettings?: { intercepted: number } })
-              .__mpctlRejectedSettings?.intercepted,
-        ),
-      )
-      .toBe(1);
-    const rejectedUrl = "ws://127.0.0.1:1/rejected";
-    const rejectedCredential = "rejected-popup-synthetic-credential";
-    await rejectedPopup.getByLabel("Broker WebSocket 地址").fill(rejectedUrl);
-    await rejectedPopup.getByLabel("配对凭证").fill(rejectedCredential);
-    await rejectedPopup.evaluate(async () => {
-      const gate = (
-        globalThis as unknown as {
-          __mpctlRejectedSettings?: { reject(): Promise<void> };
-        }
-      ).__mpctlRejectedSettings;
-      await gate?.reject();
-    });
-    await expect(rejectedPopup.getByLabel("Broker WebSocket 地址")).toHaveValue(rejectedUrl);
-    await expect(rejectedPopup.getByLabel("配对凭证")).toHaveValue(rejectedCredential);
-    expect(
-      await rejectedPopup.evaluate(() =>
-        (
-          globalThis as unknown as { __mpctlRejectedSettings?: { unhandledRejections(): number } }
-        ).__mpctlRejectedSettings?.unhandledRejections(),
-      ),
-    ).toBe(0);
-    expect(await rejectedPopup.locator("body").innerText()).not.toContain(
-      "synthetic-rejected-private-credential",
-    );
-    expect(JSON.parse((await cli(temp, socketPath, "status")).stdout).connected).toBe(false);
-    const attemptsBeforeRejectedClick = directProxy.attempt.clientCount;
-    await rejectedPopup.getByRole("button", { name: "显式连接" }).click();
-    await expect(rejectedPopup.getByRole("status")).toContainText("操作失败，请重试");
-    await expect(rejectedPopup.getByLabel("Broker WebSocket 地址")).toHaveValue(rejectedUrl);
-    await expect(rejectedPopup.getByLabel("配对凭证")).toHaveValue(rejectedCredential);
-    expect(await rejectedPopup.locator("body").innerText()).not.toContain(rejectedCredential);
-    expect(
-      await rejectedPopup.evaluate(() =>
-        (
-          globalThis as unknown as { __mpctlRejectedSettings?: { unhandledRejections(): number } }
-        ).__mpctlRejectedSettings?.unhandledRejections(),
-      ),
-    ).toBe(0);
-    expect(directProxy.attempt.clientCount).toBe(attemptsBeforeRejectedClick);
-    expect(JSON.parse((await cli(temp, socketPath, "status")).stdout).connected).toBe(false);
-    await rejectedPopup.close();
 
-    const nativeFailurePopup = await context.newPage();
-    await nativeFailurePopup.addInitScript(installSettingsReadGate, { rejectNativeRead: true });
-    await nativeFailurePopup.goto(`chrome-extension://${extensionId}/popup.html`);
-    await expect
-      .poll(() =>
-        nativeFailurePopup.evaluate(
-          () =>
-            (globalThis as unknown as { __mpctlSettingsGate?: { intercepted: number } })
-              .__mpctlSettingsGate?.intercepted,
-        ),
-      )
-      .toBe(1);
-    await expect(
-      nativeFailurePopup.evaluate(async () => {
-        const gate = (
-          globalThis as unknown as {
-            __mpctlSettingsGate?: { release(): Promise<void> };
-          }
-        ).__mpctlSettingsGate;
-        await gate?.release();
-      }),
-    ).rejects.toThrow("synthetic-native-storage-read-failure");
-    await nativeFailurePopup.close();
-
-    await popup.getByRole("button", { name: "显式连接" }).click();
-    await expect(popup.getByRole("status")).toContainText("已连接", { timeout: 15_000 });
-
-    await popup.getByRole("button", { name: "断开" }).click();
-    await expect(popup.getByRole("status")).toContainText("未连接");
+    // Connection settings are provisioned outside production UI; it only hands off.
     expect(JSON.parse((await cli(temp, socketPath, "status")).stdout).connected).toBe(false);
     await popup.evaluate(
       (websocketUrl) =>
@@ -1771,13 +1534,6 @@ test("real CLI, broker, extension and page bridge pull/push UTF-8 HTML on exact 
     failedConnectPage.on("pageerror", (error) => failedConnectConsole.push(error.message));
     const failedConnectEvidence = directProxy.waitForFailedAttempt();
     await failedConnectPage.goto(`chrome-extension://${extensionId}/connect.html`);
-    await expect
-      .poll(() =>
-        failedConnectConsole.some((line) =>
-          line.includes("mpctl connect page failed: connect_failed"),
-        ),
-      )
-      .toBe(true);
     const failedConnectAttempt = await failedConnectEvidence;
     expect(failedConnectAttempt.clientCount - failedConnectBaseline.clientCount).toBe(1);
     expect(
@@ -1813,7 +1569,9 @@ test("real CLI, broker, extension and page bridge pull/push UTF-8 HTML on exact 
     const connectPage = await context.newPage();
     await connectPage.goto(connectionInstruction.connectionPageUrl);
     await expect.poll(() => connectPage.isClosed(), { timeout: 15_000 }).toBe(true);
-    expect(JSON.parse((await cli(temp, socketPath, "status")).stdout).connected).toBe(true);
+    await expect
+      .poll(async () => JSON.parse((await cli(temp, socketPath, "status")).stdout).connected)
+      .toBe(true);
 
     // Earlier fault cases deliberately left editor tabs; isolate current's unique-target case.
     for (const page of context.pages()) {
@@ -2681,13 +2439,15 @@ test("real CLI, broker, extension and page bridge pull/push UTF-8 HTML on exact 
     const reconnectPopup = await context.newPage();
     await reconnectPopup.goto(`chrome-extension://${extensionId}/popup.html`);
     await expect(reconnectPopup.getByRole("status")).toContainText("已连接");
-    await reconnectPopup.getByRole("button", { name: "断开" }).click();
-    await expect(reconnectPopup.getByRole("status")).toContainText("未连接");
+    await reconnectPopup.evaluate(() => chrome.runtime.reload());
     await expect
       .poll(() => cli(temp, socketPath, "status").then((result) => result.stdout))
       .toContain('"connected":false');
-    await reconnectPopup.getByRole("button", { name: "显式连接" }).click();
-    await expect(reconnectPopup.getByRole("status")).toContainText("已连接", { timeout: 15_000 });
+    await reconnectPopup.reload();
+    await reconnectPopup.getByRole("button", { name: "发起连接" }).click();
+    await expect
+      .poll(async () => JSON.parse((await cli(temp, socketPath, "status")).stdout).connected)
+      .toBe(true);
     await authenticatedHome.goto(homeUrl);
     await expect(authenticatedHome.locator("div.new-creation__menu-item")).toHaveText("文章");
     const pagesBeforeReconnect = new Set(context.pages());
@@ -3313,58 +3073,6 @@ async function savedEditorPage(
     })
     .toBe(groupId);
   return created!;
-}
-
-function installSettingsReadGate(options: { rejectNativeRead?: boolean } = {}) {
-  const storage = chrome.storage.local;
-  const nativeGet = storage.get.bind(storage);
-  const nativeReadFailure = new Error("synthetic-native-storage-read-failure");
-  const nativeRead = (keys: string | string[] | Record<string, unknown> | null) =>
-    options.rejectNativeRead ? Promise.reject(nativeReadFailure) : nativeGet(keys as never);
-  let releaseRead: (() => void) | undefined;
-  let acknowledgePrepared: (() => void) | undefined;
-  const prepared = new Promise<void>((resolve) => (acknowledgePrepared = resolve));
-  let acknowledgeDelivery: (() => void) | undefined;
-  const delivered = new Promise<void>((resolve) => (acknowledgeDelivery = resolve));
-  let readFailure: unknown;
-  const state = {
-    intercepted: 0,
-    release: async () => {
-      await prepared;
-      if (readFailure !== undefined) throw readFailure;
-      if (!releaseRead) throw new Error("Settings read was not prepared");
-      releaseRead();
-      await delivered;
-    },
-  };
-  storage.get = ((keys: string | string[] | Record<string, unknown> | null) => {
-    if (
-      Array.isArray(keys) &&
-      keys.length === 2 &&
-      keys.includes("websocketUrl") &&
-      keys.includes("pairingCredential")
-    ) {
-      state.intercepted++;
-      return new Promise((resolve, reject) => {
-        void nativeRead(keys).then(
-          (values) => {
-            releaseRead = () => {
-              resolve(values as never);
-              acknowledgeDelivery?.();
-            };
-            acknowledgePrepared?.();
-          },
-          (error) => {
-            readFailure = error;
-            reject(error);
-            acknowledgePrepared?.();
-          },
-        );
-      }) as unknown as ReturnType<typeof storage.get>;
-    }
-    return nativeGet(keys as never);
-  }) as typeof storage.get;
-  Object.defineProperty(globalThis, "__mpctlSettingsGate", { value: state });
 }
 
 type FixtureWindow = Window & {

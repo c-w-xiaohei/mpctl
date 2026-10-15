@@ -10,29 +10,32 @@ export type PageConnectError = {
     | "status_failed";
 };
 type PageControl = {
-  connect(): Promise<BetterResult<{ connected: boolean }, PageConnectError>>;
+  requestConnect(): Promise<BetterResult<void, PageConnectError>>;
 };
 
 export async function connectFromPage(
   getControl: () => Promise<BetterResult<PageControl, ConnectionPageError>>,
   timeoutMs = 5_000,
-): Promise<BetterResult<{ connected: boolean }, ConnectionPageError | PageConnectError>> {
+): Promise<BetterResult<void, ConnectionPageError | PageConnectError>> {
   const deadline = Date.now() + timeoutMs;
   let lastAcquisitionError: ConnectionPageError | undefined;
   while (Date.now() < deadline) {
     const remaining = deadline - Date.now();
+    let timer: ReturnType<typeof setTimeout> | undefined;
     const acquired = await Promise.race([
       Result.tryPromise({
         try: async () => await getControl(),
         catch: () => ({ code: "background_unavailable" as const }),
       }).then((result) => Result.flatten(result)),
       new Promise<BetterResult<never, ConnectionPageError>>((resolve) => {
-        setTimeout(() => resolve(Result.err({ code: "background_timeout" })), remaining);
+        timer = setTimeout(() => resolve(Result.err({ code: "background_timeout" })), remaining);
       }),
     ]);
+    clearTimeout(timer);
+    if (Date.now() >= deadline) return Result.err({ code: "background_timeout" });
     if (acquired.isOk()) {
       const connected = await Result.tryPromise({
-        try: async () => await acquired.value.connect(),
+        try: async () => await acquired.value.requestConnect(),
         catch: () => ({ code: "connect_failed" as const }),
       });
       return connected.isErr() ? connected : connected.value;
@@ -44,11 +47,9 @@ export async function connectFromPage(
   return Result.err(lastAcquisitionError ?? { code: "background_timeout" });
 }
 
-export function connectionFailureMessage(
-  result: BetterResult<{ connected: boolean }, { code: string }>,
-) {
+export function connectionFailureMessage(result: BetterResult<void, { code: string }>) {
   return result.match({
-    ok: ({ connected }) => (connected ? "已连接，可继续使用 CLI。" : "未连接，请检查配对配置。"),
-    err: () => "连接失败，请检查插件配对配置与本地 broker。",
+    ok: () => "已发起连接，可以关闭此页面。",
+    err: () => "暂时无法发起连接，请重试。",
   });
 }

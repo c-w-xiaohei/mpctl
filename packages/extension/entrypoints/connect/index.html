@@ -2,11 +2,22 @@
 <html lang="zh-CN">
   <head>
     <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <meta name="color-scheme" content="light dark" />
     <title>mpctl 连接</title>
   </head>
-  <body>
-    <h1>mpctl</h1>
-    <p id="status" role="status">正在连接本地 broker…</p>
+  <body class="connect-page">
+    <main class="connection-panel">
+      <header>
+        <h1>mpctl</h1>
+        <p class="subtitle">连接你的编辑工具</p>
+      </header>
+      <p id="status" class="connection-status" role="status" aria-live="polite">
+        正在发起连接，此页面将自动关闭。
+      </p>
+      <p id="diagnostic" class="developer-note" hidden></p>
+      <button id="retry" class="primary-button" type="button" hidden>重试连接</button>
+    </main>
     <script type="module" src="./main.ts"></script>
   </body>
 </html>
