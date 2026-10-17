@@ -14,6 +14,7 @@ import { protocolVersion } from "@mpctl/contracts";
 import { Result } from "better-result";
 import { assetCommand } from "./asset.js";
 import { configureNexusDebug } from "@mpctl/contracts/nexus-debug";
+import { version } from "../../../package.json";
 
 configureNexusDebug("cli", process.env.MPCTL_NEXUS_DEBUG === "1", (line) => {
   process.stderr.write(`${line}\n`);
@@ -22,7 +23,7 @@ configureNexusDebug("cli", process.env.MPCTL_NEXUS_DEBUG === "1", (line) => {
 const program = new Command()
   .name("mpctl")
   .description("用本地 HTML/JSON 编辑公众号正文和字段，管理图片、封面并显式保存草稿。")
-  .version(protocolVersion)
+  .version(version)
   .option("--quiet", "不输出交互终端的等待提示")
   .exitOverride()
   .configureOutput({ writeErr: () => {} })

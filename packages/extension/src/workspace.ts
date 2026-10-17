@@ -955,7 +955,7 @@ export function createWorkspace({
       });
       return (
         await assetImageResultCodec.serialize(
-          image.isErr() ? Result.err(readError(image.error)) : image,
+          image.isErr() ? Result.err(readError(image.error)) : Result.ok(image.value),
         )
       ).unwrap();
     },

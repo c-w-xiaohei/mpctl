@@ -11,7 +11,9 @@ import { createBroker } from "../../../broker/src/server";
 test("production UI hides developer controls, follows system theme, and closes before the socket handshake", async ({}, testInfo) => {
   test.setTimeout(40_000);
   const temp = await mkdtemp("/tmp/opencode/mpctl-connection-ui-");
-  const extension = path.resolve(import.meta.dirname, "../../.output/chrome-mv3");
+  const extension =
+    process.env.MPCTL_BROWSER_EXTENSION_PATH ??
+    path.resolve(import.meta.dirname, "../../.output/chrome-mv3");
   const sockets = new Set<Socket>();
   let release!: () => void;
   const gate = new Promise<void>((resolve) => {
@@ -77,6 +79,30 @@ test("production UI hides developer controls, follows system theme, and closes b
     await expect(popup.getByRole("textbox")).toHaveCount(0);
     await expect(popup.getByText("开发调试")).toHaveCount(0);
     await expect(popup.getByRole("button")).toHaveCount(1);
+    // Check the installed manifest and real packaged PNGs, not just the source config.
+    const icons = await popup.evaluate(async () => {
+      const manifest = chrome.runtime.getManifest();
+      const actionIcons = manifest.action?.default_icon;
+      if (!actionIcons || typeof actionIcons === "string")
+        throw new Error("Missing toolbar icon sizes");
+      return Promise.all(
+        Object.entries(manifest.icons ?? {}).map(async ([size, resource]) => {
+          if (actionIcons[size] !== resource) throw new Error("Toolbar and extension icons differ");
+          const response = await fetch(chrome.runtime.getURL(resource));
+          if (!response.ok) throw new Error("Packaged icon unavailable");
+          const bitmap = await createImageBitmap(await response.blob());
+          const dimensions = [Number(size), bitmap.width, bitmap.height];
+          bitmap.close();
+          return dimensions;
+        }),
+      );
+    });
+    expect(icons).toEqual([
+      [16, 16, 16],
+      [32, 32, 32],
+      [48, 48, 48],
+      [128, 128, 128],
+    ]);
     const light = await popup
       .locator("body")
       .evaluate((body) => getComputedStyle(body.parentElement!).backgroundColor);

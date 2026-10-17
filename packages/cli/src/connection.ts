@@ -226,12 +226,15 @@ export async function withBroker<T>(
     if (Result.isError(address)) return address;
     const startupNonce = randomUUID();
     const root = path.resolve(import.meta.dir, "../../..");
-    const entrypoint = path.join(root, "packages/broker/src/main.ts");
+    // npm 产物中的 broker 与 CLI 同目录；源码开发仍使用工作区入口。
+    const bundledBroker = path.join(import.meta.dir, "broker.js");
+    const packaged = existsSync(bundledBroker);
+    const entrypoint = packaged ? bundledBroker : path.join(root, "packages/broker/src/main.ts");
     if (!existsSync(entrypoint)) return Result.err(cliError("broker_unavailable"));
     const childResult = Result.try({
       try: () =>
         spawn(process.execPath, ["run", entrypoint], {
-          cwd: root,
+          cwd: packaged ? import.meta.dir : root,
           env: {
             ...process.env,
             MPCTL_BROKER_SOCKET: address.value,

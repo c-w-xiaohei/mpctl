@@ -1,21 +1,51 @@
 {
   "name": "mpctl",
-  "private": true,
+  "version": "0.1.0",
+  "description": "给 AI Agent 用的微信公众号草稿编辑工具",
+  "license": "UNLICENSED",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/c-w-xiaohei/mpctl.git"
+  },
+  "bin": {
+    "mpctl": "dist/cli.js"
+  },
   "workspaces": [
     "packages/cli",
     "packages/broker",
     "packages/contracts",
     "packages/extension"
   ],
+  "files": [
+    "dist",
+    "assets/brand/*.png"
+  ],
   "type": "module",
+  "publishConfig": {
+    "access": "public",
+    "registry": "https://registry.npmjs.org/"
+  },
   "scripts": {
     "build": "turbo run build",
-    "lint": "turbo run lint",
-    "format": "oxfmt --write package.json turbo.json tsconfig.base.json .oxlintrc.json .oxfmtrc.json 'packages/*/package.json' 'packages/*/tsconfig.json' packages/extension/wxt.config.ts",
-    "format:check": "oxfmt --check package.json turbo.json tsconfig.base.json .oxlintrc.json .oxfmtrc.json 'packages/*/package.json' 'packages/*/tsconfig.json' packages/extension/wxt.config.ts",
-    "typecheck": "turbo run typecheck",
+    "build:package": "bun run scripts/build-package.ts",
+    "lint": "oxlint --no-error-on-unmatched-pattern scripts test && turbo run lint",
+    "format": "oxfmt --write package.json turbo.json tsconfig.json tsconfig.base.json .release-it.json .oxlintrc.json .oxfmtrc.json scripts test 'packages/*/package.json' 'packages/*/tsconfig.json' packages/extension/wxt.config.ts",
+    "format:check": "oxfmt --check package.json turbo.json tsconfig.json tsconfig.base.json .release-it.json .oxlintrc.json .oxfmtrc.json scripts test 'packages/*/package.json' 'packages/*/tsconfig.json' packages/extension/wxt.config.ts",
+    "typecheck": "tsgo --noEmit -p tsconfig.json && turbo run typecheck",
     "test": "turbo run test",
-    "test:browser": "bun run --cwd packages/extension test:browser"
+    "test:browser": "bun run --cwd packages/extension test:browser",
+    "test:package": "bun test ./test/package.test.ts",
+    "prepack": "bun run build:package",
+    "release": "release-it"
+  },
+  "dependencies": {
+    "@nexus-js/core": "2.0.0-alpha.2",
+    "@nexus-js/node-ipc": "0.7.0-alpha.2",
+    "@nexus-js/websocket": "0.1.0-alpha.3",
+    "better-result": "3.0.1",
+    "commander": "15.0.0",
+    "valibot": "1.5.0",
+    "ws": "8.18.3"
   },
   "devDependencies": {
     "@playwright/test": "1.56.1",
@@ -24,8 +54,12 @@
     "@typescript/native-preview": "7.0.0-dev.20260707.2",
     "oxfmt": "0.63.0",
     "oxlint": "1.78.0",
+    "release-it": "20.2.1",
     "turbo": "2.8.10",
     "typescript": "7.0.2"
+  },
+  "engines": {
+    "bun": ">=1.3.14"
   },
   "packageManager": "bun@1.3.14"
 }

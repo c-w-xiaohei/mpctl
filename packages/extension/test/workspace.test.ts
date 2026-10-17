@@ -166,6 +166,7 @@ function fixture(
     html?: string;
     saved?: boolean;
     nativeSaveFailure?: boolean;
+    bodyWrite?: (complete: () => void) => void;
     setResult?:
       | { ok: true; bodyHash: string }
       | { ok: false; code: "content_conflict" | "write_unknown" | "page_failed" };
@@ -223,7 +224,8 @@ function fixture(
         body = ("content" in request.apiParam ? request.apiParam.content : "")
           .trim()
           .replace(/\s+/g, " ");
-        request.sucCb({ msg: "ok" });
+        if (options.bodyWrite) options.bodyWrite(() => request.sucCb({ msg: "ok" }));
+        else request.sucCb({ msg: "ok" });
       }
     },
   });
@@ -2898,7 +2900,17 @@ describe("workspace hash and article lifecycle", () => {
   });
 
   test("independent refs share MAIN serialization and cannot overwrite another caller's new version", async () => {
-    const f = fixture();
+    let entered!: () => void;
+    let complete!: () => void;
+    const writing = new Promise<void>((resolve) => {
+      entered = resolve;
+    });
+    const f = fixture({
+      bodyWrite: (finish) => {
+        complete = finish;
+        entered();
+      },
+    });
     await expectSnapshot(
       f.workspace.newArticle({ operationId: await operationId(f.operations) }),
       confirmedNavigation,
@@ -2912,26 +2924,27 @@ describe("workspace hash and article lifecycle", () => {
 
     const b = await readValue(f.workspace.currentArticle(), articleResultCodec);
     expect(a.article).not.toBe(b.article);
-    const results = await Promise.all([
-      decode(
-        f.workspace.writeBody({
-          operationId: await operationId(f.operations),
-          article: a.article,
-          html: "first",
-          expectedHash: a.bodyHash,
-        }),
-        operationResultCodec,
-      ),
-      decode(
-        f.workspace.writeBody({
-          operationId: await operationId(f.operations),
-          article: b.article,
-          html: "second",
-          expectedHash: b.bodyHash,
-        }),
-        operationResultCodec,
-      ),
-    ]);
+    const first = decode(
+      f.workspace.writeBody({
+        operationId: await operationId(f.operations),
+        article: a.article,
+        html: "first",
+        expectedHash: a.bodyHash,
+      }),
+      operationResultCodec,
+    );
+    // 确认 MAIN 仍持有首次原生写入，再测试另一引用的冲突准入。
+    await writing;
+    const second = await decode(
+      f.workspace.writeBody({
+        operationId: await operationId(f.operations),
+        article: b.article,
+        html: "second",
+        expectedHash: b.bodyHash,
+      }),
+      operationResultCodec,
+    ).finally(() => complete());
+    const results = [await first, second];
     const snapshots = results.map((result) => result.unwrap().snapshot);
     expect(
       snapshots.filter((snapshot) => "result" in snapshot && snapshot.result.status === "ok"),

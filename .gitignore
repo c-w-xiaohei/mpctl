@@ -15,9 +15,12 @@
 /packages/extension/playwright-report/
 
 # Root-level generated output and local execution artifacts
+/dist/
+/mpctl-*.tgz
 /.output/
 /.wxt/
 /test-results/
 /playwright-report/
 /.superpowers/
 /reporttmp/
+/templates/
