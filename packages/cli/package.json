@@ -1,6 +1,6 @@
 {
   "name": "mpctl",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "给 AI Agent 用的微信公众号草稿编辑工具",
   "license": "UNLICENSED",
   "repository": {
