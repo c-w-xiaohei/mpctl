@@ -33,7 +33,7 @@ export MPCTL_PAIRING_CREDENTIAL='replace-with-a-private-token'
 mpctl connect --extension '<扩展ID>'
 ```
 
-扩展随包提供：在 `chrome://extensions` 开启开发者模式，加载 `npm root -g` 输出目录下的 `mpctl/dist/extension`，即可取得扩展 ID。`connect` 会按需启动 broker；未连接时以非零状态返回连接指引。
+扩展从 [GitHub Releases](https://github.com/c-w-xiaohei/mpctl/releases/latest) 下载 `mpctl-extension-v<版本>.zip`，解压后在 `chrome://extensions` 开启开发者模式，选择“加载已解压的扩展程序”，即可取得扩展 ID。`connect` 会按需启动 broker；未连接时以非零状态返回连接指引。
 
 首次配对需要在该扩展的后台控制台写入配置，凭证与上面的环境变量保持一致：
 
@@ -86,15 +86,14 @@ bun run typecheck
 bun run lint
 bun run test
 bun run test:browser
-bun run build:package
+bun run build:cli
+bun run build:extension
 bun run test:package
 ```
 
 CLI／broker 日志可用 `MPCTL_NEXUS_DEBUG=1` 开启。扩展开发日志默认开启，启动 WXT 前设置 `VITE_MPCTL_NEXUS_DEBUG=0` 可关闭。
 
-发布使用 `bun run release`：检查通过后构建并发布 npm 包，不自动提交、打标签或推送 Git。
-
-GitHub Actions 中手动运行“发布 npm 包”，填写明确的目标版本（例如 `0.1.1`），即可通过 npm Trusted Publisher 发布，无需保存 npm token。CI 只发布 npm，不回写 Git 版本；本地发包时需自行同步版本变更。
+发布统一由 `Release` CI/CD 完成：改动时用 `bun run changeset` 记录受影响的 CLI／插件，合入 `main` 后自动生成版本 PR；合并版本 PR 后，CI 自动将 CLI 发布到 npm、插件 ZIP 发布到 GitHub Release。两者分别管理版本，无需手填版本、保存 npm token 或手动上传附件。broker 和 contracts 是内部包，不单独发布。
 
 ---
 

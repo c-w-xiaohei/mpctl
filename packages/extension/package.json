@@ -5,6 +5,7 @@
   "type": "module",
   "scripts": {
     "build": "wxt build",
+    "zip": "wxt zip",
     "lint": "oxlint --no-error-on-unmatched-pattern .",
     "format": "oxfmt --write .",
     "format:check": "oxfmt --check .",

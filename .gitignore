@@ -24,3 +24,7 @@
 /.superpowers/
 /reporttmp/
 /templates/
+
+# Generated CLI package documentation and branding
+/packages/cli/README.md
+/packages/cli/assets/

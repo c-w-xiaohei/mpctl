@@ -14,7 +14,7 @@ import { protocolVersion } from "@mpctl/contracts";
 import { Result } from "better-result";
 import { assetCommand } from "./asset.js";
 import { configureNexusDebug } from "@mpctl/contracts/nexus-debug";
-import { version } from "../../../package.json";
+import { version } from "../package.json";
 
 configureNexusDebug("cli", process.env.MPCTL_NEXUS_DEBUG === "1", (line) => {
   process.stderr.write(`${line}\n`);

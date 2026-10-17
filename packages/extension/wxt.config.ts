@@ -9,6 +9,10 @@ const icons = {
 
 export default defineConfig({
   modules: ["@wxt-dev/module-react"],
+  zip: {
+    artifactTemplate: "mpctl-extension-v{{versionName}}.zip",
+    zipSources: false,
+  },
   manifest: {
     name: "mpctl",
     description: "WeChat draft editing for AI agents.",

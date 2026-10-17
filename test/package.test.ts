@@ -4,7 +4,7 @@ import { mkdtemp, readFile, rm } from "node:fs/promises";
 import path from "node:path";
 import { Nexus } from "@nexus-js/core";
 import { usingNodeIpcClient, type NodeIpcAdapterModel } from "@nexus-js/node-ipc";
-import { version } from "../package.json";
+import { version } from "../packages/cli/package.json";
 import { protocolVersion } from "../packages/contracts/src";
 
 const root = path.resolve(import.meta.dir, "..");
@@ -58,27 +58,38 @@ test("npm tarball installs outside the repository and starts its packaged broker
   };
 
   try {
-    const packed = await run(
-      "npm",
-      ["pack", "--ignore-scripts", "--json", "--pack-destination", directory],
-      root,
-      env,
-    );
-    expect(packed.code, packed.stderr).toBe(0);
-    const [tarball] = JSON.parse(packed.stdout) as Array<{
-      filename: string;
-      files: Array<{ path: string }>;
-    }>;
-    if (!tarball) throw new Error("npm pack did not produce a tarball");
-    const files = tarball.files.map((file) => file.path);
+    let tarballPath = process.env.MPCTL_PACKAGE_TARBALL;
+    if (!tarballPath) {
+      const packed = await run(
+        "npm",
+        [
+          "pack",
+          "--workspace",
+          "mpctl",
+          "--ignore-scripts",
+          "--json",
+          "--pack-destination",
+          directory,
+        ],
+        root,
+        env,
+      );
+      expect(packed.code, packed.stderr).toBe(0);
+      const [tarball] = JSON.parse(packed.stdout) as Array<{ filename: string }>;
+      if (!tarball) throw new Error("npm pack did not produce a tarball");
+      tarballPath = path.join(directory, tarball.filename);
+    }
+    const archive = new Bun.Archive(await Bun.file(tarballPath).arrayBuffer());
+    const files = [...(await archive.files()).keys()].map((file) => file.replace(/^package\//, ""));
     expect(files).toContain("dist/cli.js");
     expect(files).toContain("dist/broker.js");
-    expect(files).toContain("dist/extension/manifest.json");
+    expect(files.some((file) => file.startsWith("dist/extension/"))).toBe(false);
     expect(
       files.every(
         (file) =>
           file === "package.json" ||
           file === "README.md" ||
+          file === "CHANGELOG.md" ||
           file.startsWith("dist/") ||
           /^assets\/brand\/[^/]+\.png$/.test(file),
       ),
@@ -94,7 +105,7 @@ test("npm tarball installs outside the repository and starts its packaged broker
         "--ignore-scripts",
         "--no-audit",
         "--no-fund",
-        path.join(directory, tarball.filename),
+        tarballPath,
       ],
       directory,
       env,
@@ -129,7 +140,7 @@ test("npm tarball installs outside the repository and starts its packaged broker
     const reused = await run(bin, ["status"], directory, env);
     expect(reused.code, reused.stderr).toBe(0);
     expect(JSON.parse(reused.stdout)).toEqual({ connected: false });
-    expect(existsSync(path.join(packageRoot, "dist/extension/icon/128.png"))).toBe(true);
+    expect(existsSync(path.join(packageRoot, "dist/extension"))).toBe(false);
   } finally {
     try {
       await stopBroker();
